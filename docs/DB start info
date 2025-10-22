@@ -1,0 +1,27 @@
+ chmod +x start_database.sh
+❯ ./start_database.sh
+🚀 Starting ChronoX TimescaleDB...
+
+⚠️  Docker requires sudo (you're not in docker group yet)
+   To fix permanently: sudo usermod -aG docker bitloop && newgrp docker
+
+📦 Starting TimescaleDB container on port 5433...
+[sudo] password for bitloop: 
+[+] Running 1/1
+ ✔ Container chronox-timescaledb  Started                                                         0.2s 
+
+⏳ Waiting for database to be ready...
+✅ Container is running
+⏳ Waiting for PostgreSQL to initialize...
+✅ Database is ready!
+
+📊 Connection details:
+   Host: localhost
+   Port: 5433
+   Database: chronox
+   User: postgres
+   Password: chronox_db_password
+
+🎯 Next steps:
+   1. Test connection: .venv/bin/python scripts/verify_implementation.py
+   2. Run backfill: .venv/bin/python main.py --action backfill --tickers AAPL,TSLA,NVDA --skip-minute

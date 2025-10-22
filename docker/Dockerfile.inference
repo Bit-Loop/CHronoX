@@ -1,0 +1,49 @@
+# Inference Docker image for ChronoX Trading Bot
+# Optimized for serving predictions with FastAPI
+
+FROM chronox-base:latest
+
+LABEL description="Inference API server with FastAPI"
+
+USER root
+
+# Install inference-specific packages
+COPY requirements/inference.txt /tmp/requirements-inference.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-inference.txt
+
+# Copy application code
+COPY --chown=chronox:chronox . /app/
+
+# Create directories for models and cache
+RUN mkdir -p /app/models/production /app/cache && \
+    chown -R chronox:chronox /app/models /app/cache
+
+USER chronox
+
+# Set environment for inference
+ENV CHRONOX_ENV=production \
+    MODEL_PATH=/app/models/production \
+    CACHE_DIR=/app/cache \
+    WORKERS=4 \
+    MAX_REQUESTS=1000 \
+    MAX_REQUESTS_JITTER=100
+
+# Expose API port
+EXPOSE 8000
+
+# Health check for API
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Run with gunicorn for production
+ENTRYPOINT ["gunicorn"]
+CMD ["api.main:app", \
+     "--bind", "0.0.0.0:8000", \
+     "--workers", "4", \
+     "--worker-class", "uvicorn.workers.UvicornWorker", \
+     "--timeout", "120", \
+     "--max-requests", "1000", \
+     "--max-requests-jitter", "100", \
+     "--access-logfile", "-", \
+     "--error-logfile", "-", \
+     "--log-level", "info"]

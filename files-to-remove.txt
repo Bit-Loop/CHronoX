@@ -1,0 +1,44 @@
+# Data files
+*.csv
+*.csv.gz
+*.parquet
+*.json
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment and virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Logs
+*.log
+logs/
+
+# Cache and temporary files
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Documentation (keeping only README files)
+TESTING_RESULTS.md
+TIME_CONVERSION_FIX.md
+VISUALIZER_IMPLEMENTATION_COMPLETE.md
+VISUALIZER_FIX_COMPLETE.md
+SYSTEM_DESIGN.md
+ARCHITECTURE.md
+
+# Test files
+test_*.py
+debug_*.py
+verify_*.py
+
+# Trash and temporary folders
+TRASH/
+TESTING/
+OLD/
+checkpoints/

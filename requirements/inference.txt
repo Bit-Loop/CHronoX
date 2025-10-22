@@ -1,0 +1,41 @@
+# Base requirements
+-r base.txt
+
+# Web framework
+fastapi==0.105.0
+uvicorn[standard]==0.25.0
+gunicorn==21.2.0
+
+# API utilities
+pydantic==2.5.2
+python-multipart==0.0.6
+orjson==3.9.10
+
+# Model serving
+torch==2.1.0  # CPU version for inference
+onnx==1.15.0
+onnxruntime==1.16.3
+
+# Caching
+aiocache==0.12.2
+redis==5.0.1
+
+# Rate limiting
+slowapi==0.1.9
+
+# Authentication
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# Monitoring
+prometheus-fastapi-instrumentator==6.1.0
+
+# HTTP client
+httpx==0.25.2
+aiohttp==3.9.1
+
+# Validation
+jsonschema==4.20.0
+
+# Documentation
+python-markdown==3.5.1

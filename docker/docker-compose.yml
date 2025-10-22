@@ -1,0 +1,281 @@
+version: '3.8'
+
+services:
+  # TimescaleDB - Time-series database for market data (PostgreSQL extension)
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: chronox-timescaledb
+    ports:
+      - "5433:5432"
+    environment:
+      - POSTGRES_USER=chronox
+      - POSTGRES_PASSWORD=chronox_db_pass_2024
+      - POSTGRES_DB=chronox_timeseries
+      - TIMESCALEDB_TELEMETRY=off
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+      - ./init-scripts/timescaledb:/docker-entrypoint-initdb.d
+    networks:
+      - chronox-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chronox -d chronox_timeseries"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: postgres -c shared_preload_libraries=timescaledb -c max_connections=200
+
+  # PostgreSQL - Metadata and application database
+  postgres:
+    image: postgres:15-alpine
+    container_name: chronox-postgres
+    ports:
+      - "5434:5432"
+    environment:
+      - POSTGRES_USER=chronox
+      - POSTGRES_PASSWORD=chronox_db_pass_2024
+      - POSTGRES_DB=chronox_metadata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    networks:
+      - chronox-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chronox"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis - Cache and message broker
+  redis:
+    image: redis:7-alpine
+    container_name: chronox-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --requirepass chronox_redis_2024
+    volumes:
+      - redis-data:/data
+    networks:
+      - chronox-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # Training Service
+  training:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.training
+    container_name: chronox-training
+    depends_on:
+      - timescaledb
+      - postgres
+      - redis
+    environment:
+      - CHRONOX_ENV=training
+      - TIMESCALE_URL=postgresql://chronox:chronox_db_pass_2024@timescaledb:5432/chronox_timeseries
+      - POSTGRES_URL=postgresql://chronox:chronox_db_pass_2024@postgres:5432/chronox_metadata
+      - REDIS_URL=redis://:chronox_redis_2024@redis:6379/0
+      - CUDA_VISIBLE_DEVICES=0
+    volumes:
+      - ../data:/app/data
+      - ../models:/app/models
+      - ../logs:/app/logs
+      - ../checkpoints:/app/checkpoints
+    networks:
+      - chronox-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: "no"  # Manual trigger via Airflow
+
+  # Inference API Service
+  inference:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.inference
+    container_name: chronox-inference
+    depends_on:
+      - timescaledb
+      - postgres
+      - redis
+    ports:
+      - "8000:8000"
+    environment:
+      - CHRONOX_ENV=production
+      - TIMESCALE_URL=postgresql://chronox:chronox_db_pass_2024@timescaledb:5432/chronox_timeseries
+      - POSTGRES_URL=postgresql://chronox:chronox_db_pass_2024@postgres:5432/chronox_metadata
+      - REDIS_URL=redis://:chronox_redis_2024@redis:6379/0
+      - MODEL_PATH=/app/models/production
+      - LOG_LEVEL=info
+    volumes:
+      - ../models:/app/models:ro
+      - ../cache:/app/cache
+      - ../logs:/app/logs
+    networks:
+      - chronox-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Apache Airflow - Workflow orchestration
+  airflow-webserver:
+    image: apache/airflow:2.7.3-python3.11
+    container_name: chronox-airflow-webserver
+    depends_on:
+      - postgres
+      - redis
+    ports:
+      - "8080:8080"
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://chronox:chronox_db_pass_2024@postgres:5432/airflow
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://chronox:chronox_db_pass_2024@postgres:5432/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://:chronox_redis_2024@redis:6379/1
+      - AIRFLOW__CORE__FERNET_KEY=81HqDtbqAywKSOumSha3BhWNOdQ26slT6K0YaZeZyPs=
+      - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth
+      - AIRFLOW__WEBSERVER__SECRET_KEY=chronox_webserver_secret_2024
+    volumes:
+      - ../pipelines/airflow_dags:/opt/airflow/dags
+      - ../logs/airflow:/opt/airflow/logs
+      - ../plugins:/opt/airflow/plugins
+      - airflow-logs:/opt/airflow/logs
+    networks:
+      - chronox-network
+    command: webserver
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  airflow-scheduler:
+    image: apache/airflow:2.7.3-python3.11
+    container_name: chronox-airflow-scheduler
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://chronox:chronox_db_pass_2024@postgres:5432/airflow
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://chronox:chronox_db_pass_2024@postgres:5432/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://:chronox_redis_2024@redis:6379/1
+      - AIRFLOW__CORE__FERNET_KEY=81HqDtbqAywKSOumSha3BhWNOdQ26slT6K0YaZeZyPs=
+      - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+    volumes:
+      - ../pipelines/airflow_dags:/opt/airflow/dags
+      - ../logs/airflow:/opt/airflow/logs
+      - ../plugins:/opt/airflow/plugins
+      - airflow-logs:/opt/airflow/logs
+    networks:
+      - chronox-network
+    command: scheduler
+    restart: unless-stopped
+
+  airflow-worker:
+    image: apache/airflow:2.7.3-python3.11
+    container_name: chronox-airflow-worker
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://chronox:chronox_db_pass_2024@postgres:5432/airflow
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://chronox:chronox_db_pass_2024@postgres:5432/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://:chronox_redis_2024@redis:6379/1
+      - AIRFLOW__CORE__FERNET_KEY=81HqDtbqAywKSOumSha3BhWNOdQ26slT6K0YaZeZyPs=
+    volumes:
+      - ../pipelines/airflow_dags:/opt/airflow/dags
+      - ../logs/airflow:/opt/airflow/logs
+      - ../plugins:/opt/airflow/plugins
+      - airflow-logs:/opt/airflow/logs
+    networks:
+      - chronox-network
+    command: celery worker
+    restart: unless-stopped
+
+  # Prometheus - Metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: chronox-prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml
+      - prometheus-data:/prometheus
+    networks:
+      - chronox-network
+    restart: unless-stopped
+
+  # Grafana - Visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: chronox-grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=chronox_grafana_2024
+      - GF_INSTALL_PLUGINS=
+    volumes:
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+      - grafana-data:/var/lib/grafana
+    networks:
+      - chronox-network
+    restart: unless-stopped
+
+  # Alertmanager - Alert routing
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: chronox-alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+      - alertmanager-data:/alertmanager
+    networks:
+      - chronox-network
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    restart: unless-stopped
+
+networks:
+  chronox-network:
+    driver: bridge
+
+volumes:
+  timescaledb-data:
+  postgres-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+  alertmanager-data:
+  airflow-logs:

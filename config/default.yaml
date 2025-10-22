@@ -1,0 +1,114 @@
+# ChronoX Trading Bot - Default Configuration
+# 
+# This file contains default settings for all subsystems.
+# Override these by:
+# 1. Setting environment variables (highest priority)
+# 2. Creating custom config files (config/production.yaml, config/development.yaml)
+# 3. Command-line arguments
+#
+# For production, copy this to production.yaml and customize.
+
+# Polygon.io API Configuration
+polygon:
+  api_key: "${POLYGON_API_KEY}"  # Set via environment variable
+  base_url: "https://api.polygon.io"
+  rate_limit_calls: 5
+  rate_limit_period: 1  # seconds
+  retry_attempts: 3
+  retry_backoff_multiplier: 1.0
+  retry_backoff_min: 4.0
+  retry_backoff_max: 10.0
+  timeout: 30
+
+# TimescaleDB Configuration
+timescale:
+  host: "${TIMESCALE_HOST:-localhost}"
+  port: 5433  # Changed from 5432 to avoid conflict with other PostgreSQL instances
+  database: "${TIMESCALE_DB:-chronox}"
+  user: "${TIMESCALE_USER:-postgres}"
+  password: "${TIMESCALE_PASSWORD:-chronox_db_password}"  # Set via environment variable or use default
+  min_connections: 1
+  max_connections: 20
+
+# ML Training Configuration
+training:
+  # Model architecture
+  batch_size: 256
+  learning_rate: 0.0001
+  epochs: 100
+  hidden_dim: 512
+  num_layers: 8
+  num_heads: 8
+  dropout: 0.1
+  gradient_clip: 1.0
+  
+  # Hardware optimization
+  use_amp: true  # Automatic Mixed Precision (35-40% VRAM savings)
+  use_gradient_checkpointing: false  # Enable for long sequences (>2K timesteps)
+  device: "cuda"
+  num_workers: 4
+  pin_memory: true
+  
+  # Multi-timescale settings
+  timescales:
+    - "1min"
+    - "15min"
+    - "1hour"
+    - "12hour"
+    - "daily"
+  
+  short_term_sequence_length: 1000  # ~1 week of 15min bars
+  long_term_sequence_length: 5000   # ~months of 12hr bars
+  
+  # Asset scaling (based on hardware analysis)
+  # Hardware: Ryzen 9 9950X + RTX 5070 (10 GB VRAM) + 96 GB RAM
+  max_symbols_short_term: 15  # For 15min/1hour training (FP16)
+  max_symbols_long_term: 10   # For 12hour/daily training (FP16 + gradient checkpointing)
+  max_symbols_inference: 30   # Real-time inference (no gradients)
+
+# Backtesting Configuration
+backtest:
+  initial_capital: 100000.0
+  commission_rate: 0.001  # 0.1% per trade
+  slippage_bps: 5.0  # 5 basis points
+  max_position_size: 0.1  # 10% of portfolio per position
+  risk_free_rate: 0.04  # 4% annual
+  
+  # Performance metrics
+  calculate_sharpe: true
+  calculate_sortino: true
+  calculate_max_drawdown: true
+  calculate_calmar: true
+
+# Trading Configuration
+trading:
+  mode: "paper"  # "paper" or "live" (⚠️ live trades real money!)
+  max_symbols: 10
+  position_sizing: "kelly"  # "equal", "kelly", "risk_parity"
+  rebalance_frequency: "daily"  # "daily", "weekly", "monthly"
+  
+  # Risk management
+  max_portfolio_risk: 0.02  # 2% max loss per trade
+  max_daily_loss: 0.05  # 5% max daily loss (circuit breaker)
+  max_positions: 20
+  
+  # Alpaca API (set via environment variables)
+  alpaca_api_key: "${ALPACA_API_KEY}"
+  alpaca_secret_key: "${ALPACA_SECRET_KEY}"
+  alpaca_base_url: "https://paper-api.alpaca.markets"  # or live: https://api.alpaca.markets
+
+# Monitoring & Alerting Configuration
+monitoring:
+  prometheus_port: 9090
+  grafana_port: 3000
+  mlflow_port: 5000
+  
+  # Alerting channels
+  enable_email_alerts: false
+  enable_slack_alerts: false
+  enable_telegram_alerts: false
+  
+  alert_email: "${ALERT_EMAIL}"
+  slack_webhook: "${SLACK_WEBHOOK}"
+  telegram_token: "${TELEGRAM_TOKEN}"
+  telegram_chat_id: "${TELEGRAM_CHAT_ID}"

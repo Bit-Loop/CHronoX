@@ -1,0 +1,83 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'chronox-production'
+    replica: 'prometheus-1'
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+# Load rules
+rule_files:
+  - 'alerts.yml'
+
+# Scrape configurations
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # ChronoX Inference API
+  - job_name: 'chronox-inference'
+    static_configs:
+      - targets: ['inference:8000']
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+
+  # ChronoX Training Service
+  - job_name: 'chronox-training'
+    static_configs:
+      - targets: ['training:9091']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+
+  # TimescaleDB
+  - job_name: 'timescaledb'
+    static_configs:
+      - targets: ['timescaledb-exporter:9187']
+
+  # PostgreSQL Exporter
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  # Redis Exporter
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  # Airflow
+  - job_name: 'airflow'
+    static_configs:
+      - targets: ['airflow-webserver:8080']
+    metrics_path: '/admin/metrics'
+
+  # Node Exporter (system metrics)
+  - job_name: 'node'
+    static_configs:
+      - targets: ['node-exporter:9100']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'chronox-host'
+
+  # cAdvisor (container metrics)
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'container_(cpu_usage_seconds_total|memory_usage_bytes|network_.*_bytes_total|fs_.*_bytes)'
+        action: keep
+
+  # NVIDIA GPU metrics (dcgm-exporter)
+  - job_name: 'nvidia-gpu'
+    static_configs:
+      - targets: ['dcgm-exporter:9400']
+    scrape_interval: 10s

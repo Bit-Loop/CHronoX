@@ -1,0 +1,65 @@
+# Training Docker image for ChronoX Trading Bot
+# Extends base image with GPU support and training dependencies
+
+FROM chronox-base:latest
+
+LABEL description="Training image with CUDA support for model training"
+
+# Switch to root for CUDA installation
+USER root
+
+# Install CUDA toolkit (for PyTorch GPU support)
+# Using CUDA 12.4 to match RTX 5070 requirements
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gnupg2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Add NVIDIA package repositories
+RUN wget https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb && \
+    dpkg -i cuda-keyring_1.1-1_all.deb && \
+    rm cuda-keyring_1.1-1_all.deb
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cuda-toolkit-12-4 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set CUDA environment variables
+ENV CUDA_HOME=/usr/local/cuda-12.4 \
+    PATH=/usr/local/cuda-12.4/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda-12.4/lib64:${LD_LIBRARY_PATH}
+
+# Install PyTorch with CUDA support
+COPY requirements/training.txt /tmp/requirements-training.txt
+RUN pip install --no-cache-dir \
+    torch==2.1.0 \
+    torchvision==0.16.0 \
+    torchaudio==2.1.0 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# Install training-specific packages
+RUN pip install --no-cache-dir -r /tmp/requirements-training.txt
+
+# Copy application code
+COPY --chown=chronox:chronox . /app/
+
+# Create model checkpoints directory
+RUN mkdir -p /app/checkpoints && \
+    chown -R chronox:chronox /app/checkpoints
+
+# Switch back to non-root user
+USER chronox
+
+# Set environment for training
+ENV CHRONOX_ENV=training \
+    TORCH_HOME=/app/models/.torch \
+    TRANSFORMERS_CACHE=/app/models/.transformers
+
+# Verify GPU availability
+RUN python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA version: {torch.version.cuda}'); print(f'GPU count: {torch.cuda.device_count()}')"
+
+# Expose TensorBoard port
+EXPOSE 6006
+
+# Default command: run training
+ENTRYPOINT ["python", "-m", "training.train"]
+CMD ["--config", "configs/training_config.yaml"]

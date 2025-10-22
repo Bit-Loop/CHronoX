@@ -1,0 +1,47 @@
+# Base Python packages
+# Using versions compatible with Python 3.13
+numpy>=1.26.0,<2.0.0
+pandas>=2.2.0
+scipy>=1.12.0
+
+# Data handling
+pyarrow>=14.0.0
+polars>=0.20.0
+
+# Database clients
+psycopg2-binary>=2.9.9
+asyncpg>=0.30.0  # Requires 0.30+ for Python 3.13 support
+redis>=5.0.0
+SQLAlchemy>=2.0.0
+
+# Technical indicators
+# Using TA (Technical Analysis) - pure Python, no compilation needed
+ta==0.11.0
+
+# Configuration
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+PyYAML>=6.0.0
+
+# Utilities
+python-dateutil>=2.8.0
+pytz>=2023.3
+requests>=2.31.0
+tenacity>=8.2.0
+
+# Logging & monitoring
+structlog>=23.2.0
+prometheus-client>=0.19.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+pytest-mock>=3.12.0
+
+# Code quality
+black>=23.12.0
+isort>=5.13.0
+flake8>=6.1.0
+mypy>=1.7.0

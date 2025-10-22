@@ -1,0 +1,200 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ChronoX Backfill Visualizer</title>
+    <meta http-equiv="refresh" content="2">
+    <style>
+        body {
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+            font-family: 'Segoe UI', monospace;
+            margin: 20px;
+        }
+        h1 { color: #007acc; }
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+        .card {
+            background: #252526;
+            border-left: 4px solid #007acc;
+            padding: 15px;
+            border-radius: 8px;
+        }
+        .card h3 { margin: 0 0 10px 0; font-size: 14px; color: #858585; }
+        .card .value { font-size: 28px; font-weight: bold; }
+        .tickers { margin: 20px 0; }
+        .ticker-link {
+            display: inline-block;
+            background: #007acc;
+            color: #fff;
+            padding: 10px 20px;
+            margin: 5px;
+            border-radius: 4px;
+            text-decoration: none;
+        }
+        .ticker-link:hover { background: #0098ff; }
+        .news { margin: 20px 0; }
+        .news-item {
+            background: #2d2d30;
+            padding: 12px;
+            margin: 8px 0;
+            border-left: 3px solid #4ec9b0;
+            border-radius: 6px;
+        }
+        .news-item h4 { margin: 0 0 5px 0; font-size: 14px; }
+        .news-item p { margin: 5px 0; font-size: 12px; color: #a0a0a0; }
+        .timestamp { color: #858585; font-size: 12px; }
+    </style>
+</head>
+<body>
+    <h1>ChronoX Backfill Visualizer</h1>
+    <p class="timestamp">Last updated: 2025-10-18 16:03:53</p>
+    
+    <div class="metrics">
+        <div class="card">
+            <h3>CPU Usage</h3>
+            <div class="value" style="color: #4ec9b0">
+                27.5%
+            </div>
+        </div>
+        <div class="card">
+            <h3>Memory Usage</h3>
+            <div class="value" style="color: #4ec9b0">
+                58.8%
+            </div>
+        </div>
+        <div class="card">
+            <h3>Download Queue</h3>
+            <div class="value" style="color: #007acc">
+                0/0
+            </div>
+        </div>
+        <div class="card">
+            <h3>Process Queue</h3>
+            <div class="value" style="color: #007acc">
+                0/0
+            </div>
+        </div>
+        <div class="card">
+            <h3>Files Processed</h3>
+            <div class="value" style="color: #4ec9b0">
+                0
+            </div>
+            <p style="font-size: 12px; color: #858585; margin: 5px 0 0 0;">
+                Downloaded: 0 | Failed: 0
+            </p>
+        </div>
+        <div class="card">
+            <h3>Throughput</h3>
+            <div class="value" style="color: #4ec9b0">
+                0.00
+            </div>
+            <p style="font-size: 12px; color: #858585; margin: 5px 0 0 0;">files/sec</p>
+        </div>
+        <div class="card">
+            <h3>Active Tasks</h3>
+            <div class="value" style="color: #42a5f5">
+                0
+            </div>
+        </div>
+        <div class="card">
+            <h3>WebSocket Status</h3>
+            <div class="value" style="font-size: 18px; color: #4ec9b0">
+                Connected
+            </div>
+        </div>
+    </div>
+    
+    <h2>Ticker Charts</h2>
+    <div class="tickers">
+        <a href="AMD_chart.html" class="ticker-link">AMD - Advanced Micro Devices</a>
+        <a href="NVDA_chart.html" class="ticker-link">NVDA - Nvidia Corp</a>
+        <a href="AVGO_chart.html" class="ticker-link">AVGO - Broadcom Inc. Common Stock</a>
+        <a href="BBAI_chart.html" class="ticker-link">BBAI - BigBear.ai Holdings, Inc.</a>
+
+    </div>
+    
+    <h2>Latest News</h2>
+    <div class="news">
+
+        <div class="news-item">
+            <h4>Meet the AI Stock That's Crushing Nvidia and Palantir in 2025</h4>
+            <p class="timestamp">NVDA | The Motley Fool | 2025-10-18 11:15</p>
+            <p>Nebius Group, a recently formed tech company specializing in neocloud AI services, has seen a remarkable 300% stock surge in 2023, outperforming established AI leaders like Nvidia and Palantir by offe...</p>
+            <a href="https://www.fool.com/investing/2025/10/18/meet-the-ai-stock-thats-crushing-nvidia-palantir/?source=iedfolrf0000001" target="_blank" style="color: #4ec9b0; text-decoration: none;">Read more →</a>
+        </div>
+
+        <div class="news-item">
+            <h4>Samsung Chairman Jay Y Lee's Family Plans To Offload $1.2 Billion In Shares To Pay Massive $8 Billion Inheritance Tax</h4>
+            <p class="timestamp">NVDA | Benzinga | 2025-10-18 09:37</p>
+            <p>Samsung Chairman Jay Y Lee's family plans to sell $1.2 billion in Samsung Electronics shares to cover an $8 billion inheritance tax bill from the late patriarch's estate, with the sale expected to con...</p>
+            <a href="https://www.benzinga.com/markets/tech/25/10/48291545/samsung-chairman-jay-y-lees-family-plans-to-offload-1-2-billion-in-shares-to-pay-massive-8-billion-i" target="_blank" style="color: #4ec9b0; text-decoration: none;">Read more →</a>
+        </div>
+
+        <div class="news-item">
+            <h4>Had You Invested $10,000 in the Vanguard S&P 500 Growth ETF 10 Years Ago, Here's How Much You'd Have Today</h4>
+            <p class="timestamp">NVDA | The Motley Fool | 2025-10-18 09:13</p>
+            <p>An investment of $10,000 in the Vanguard S&P 500 Growth ETF a decade ago would now be worth $50,100, representing a 400% total return, driven primarily by technology and growth stocks.</p>
+            <a href="https://www.fool.com/investing/2025/10/18/invested-10000-vanguard-sp-500-growth-etf-10-years/?source=iedfolrf0000001" target="_blank" style="color: #4ec9b0; text-decoration: none;">Read more →</a>
+        </div>
+
+        <div class="news-item">
+            <h4>3 Growth ETFs to Buy With $100 and Hold Forever</h4>
+            <p class="timestamp">NVDA | The Motley Fool | 2025-10-18 08:25</p>
+            <p>The article discusses three growth-focused ETFs that offer strong potential for long-term investors, particularly in the technology and AI sectors. These ETFs provide exposure to innovative companies ...</p>
+            <a href="https://www.fool.com/investing/2025/10/18/3-growth-etfs-to-buy-with-100-and-hold-forever/?source=iedfolrf0000001" target="_blank" style="color: #4ec9b0; text-decoration: none;">Read more →</a>
+        </div>
+
+        <div class="news-item">
+            <h4>3 Technology Stocks to Buy Now</h4>
+            <p class="timestamp">NVDA | The Motley Fool | 2025-10-18 08:20</p>
+            <p>The technology sector continues to be powered by artificial intelligence, with three key semiconductor and manufacturing companies positioned to benefit significantly from AI's expansion over the next...</p>
+            <a href="https://www.fool.com/investing/2025/10/18/3-technology-stocks-to-buy-now/?source=iedfolrf0000001" target="_blank" style="color: #4ec9b0; text-decoration: none;">Read more →</a>
+        </div>
+
+        <div class="news-item">
+            <h4>4 Magnificent 7 Themes to Watch This Earnings Season</h4>
+            <p class="timestamp">NVDA | Investing.com | 2025-10-18 06:12</p>
+            <p>The Magnificent 7 tech stocks are facing diverse challenges in Q3 2025, with key themes including AI capital expenditure, digital ad spending, enterprise vs consumer demand divergence, and regulatory ...</p>
+            <a href="https://www.investing.com/analysis/4-magnificent-7-themes-to-watch-this-earnings-season-200668677" target="_blank" style="color: #4ec9b0; text-decoration: none;">Read more →</a>
+        </div>
+
+        <div class="news-item">
+            <h4>Where Will Nvidia Stock Be in 2 Years?</h4>
+            <p class="timestamp">NVDA | The Motley Fool | 2025-10-17 23:15</p>
+            <p>Nvidia is positioned as a leading AI infrastructure company with over 90% GPU market share, significant revenue growth, and potential to expand its addressable market from $600 billion to $4 trillion ...</p>
+            <a href="https://www.fool.com/investing/2025/10/17/where-will-nvidia-stock-be-in-2-years/?source=iedfolrf0000001" target="_blank" style="color: #4ec9b0; text-decoration: none;">Read more →</a>
+        </div>
+
+        <div class="news-item">
+            <h4>Smart Money Turns to JEPQ for Income and Calm in a Volatile Market</h4>
+            <p class="timestamp">NVDA | The Motley Fool | 2025-10-17 18:08</p>
+            <p>Sheets Smith Investment Management disclosed a new $4.56 million position in JPMorgan Nasdaq Equity Premium Income ETF (JEPQ), representing 4.0% of their reportable assets under management. The ETF of...</p>
+            <a href="https://www.fool.com/coverage/filings/2025/10/17/smart-money-turns-to-jepq-for-income-and-calm-in-a-volatile-market/?source=iedfolrf0000001" target="_blank" style="color: #4ec9b0; text-decoration: none;">Read more →</a>
+        </div>
+
+        <div class="news-item">
+            <h4>2 Growth Stocks to Invest $1,000 in Right Now</h4>
+            <p class="timestamp">NVDA | The Motley Fool | 2025-10-17 16:14</p>
+            <p>Two technology companies, Broadcom and UiPath, are positioned for significant growth in AI-related markets through strategic partnerships and innovative chip/automation solutions.</p>
+            <a href="https://www.fool.com/investing/2025/10/17/2-growth-stocks-to-invest-1000-in-right-now/?source=iedfolrf0000001" target="_blank" style="color: #4ec9b0; text-decoration: none;">Read more →</a>
+        </div>
+
+        <div class="news-item">
+            <h4>Want Reliable Passive Income? 1 ETF to Buy Right Now</h4>
+            <p class="timestamp">AVGO | The Motley Fool | 2025-10-17 13:30</p>
+            <p>In a potentially overvalued stock market, the Vanguard High Dividend Yield ETF offers a defensive investment approach with stable, high-dividend stocks across multiple sectors, providing reliable pass...</p>
+            <a href="https://www.fool.com/investing/2025/10/17/want-reliable-passive-income-1-etf-to-buy-now/?source=iedfolrf0000001" target="_blank" style="color: #4ec9b0; text-decoration: none;">Read more →</a>
+        </div>
+
+    </div>
+    
+    <p style="text-align: center; color: #858585; margin-top: 40px;">
+        Auto-refreshing every 2 seconds
+    </p>
+</body>
+</html>

@@ -1,0 +1,236 @@
+groups:
+  - name: chronox_alerts
+    interval: 30s
+    rules:
+      # Inference API Alerts
+      - alert: InferenceAPIDown
+        expr: up{job="chronox-inference"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ChronoX Inference API is down"
+          description: "The inference API has been down for more than 2 minutes."
+
+      - alert: HighInferenceLatency
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job="chronox-inference"}[5m])) > 1.0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High inference latency detected"
+          description: "95th percentile latency is {{ $value }}s (threshold: 1.0s)"
+
+      - alert: HighInferenceErrorRate
+        expr: rate(http_requests_total{job="chronox-inference",status=~"5.."}[5m]) / rate(http_requests_total{job="chronox-inference"}[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate on inference API"
+          description: "Error rate is {{ $value | humanizePercentage }} (threshold: 5%)"
+
+      # Training Service Alerts
+      - alert: TrainingJobFailed
+        expr: increase(training_job_failures_total[1h]) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Multiple training job failures"
+          description: "{{ $value }} training jobs have failed in the last hour."
+
+      - alert: GPUUtilizationLow
+        expr: DCGM_FI_DEV_GPU_UTIL < 10
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "Low GPU utilization during training"
+          description: "GPU {{ $labels.gpu }} utilization is {{ $value }}% for 30 minutes."
+
+      - alert: GPUMemoryHigh
+        expr: DCGM_FI_DEV_FB_USED / DCGM_FI_DEV_FB_FREE > 0.95
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU memory usage critical"
+          description: "GPU {{ $labels.gpu }} memory usage is {{ $value | humanizePercentage }}."
+
+      - alert: GPUTemperatureHigh
+        expr: DCGM_FI_DEV_GPU_TEMP > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU temperature high"
+          description: "GPU {{ $labels.gpu }} temperature is {{ $value }}°C (threshold: 85°C)."
+
+      # Model Performance Alerts
+      - alert: ModelAccuracyDegraded
+        expr: model_accuracy < 0.65
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Model accuracy has degraded"
+          description: "Model {{ $labels.model_name }} accuracy is {{ $value }} (threshold: 0.65)"
+
+      - alert: ModelDriftDetected
+        expr: model_drift_score > 0.3
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Model drift detected"
+          description: "Model {{ $labels.model_name }} drift score is {{ $value }} (threshold: 0.3)"
+
+      # Database Alerts
+      - alert: TimescaleDBDown
+        expr: up{job="timescaledb"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "TimescaleDB is down"
+          description: "TimescaleDB has been down for more than 2 minutes."
+
+      - alert: PostgreSQLDown
+        expr: up{job="postgres"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL is down"
+          description: "PostgreSQL has been down for more than 2 minutes."
+
+      - alert: RedisDown
+        expr: up{job="redis"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis is down"
+          description: "Redis has been down for more than 2 minutes."
+
+      - alert: DatabaseConnectionPoolExhausted
+        expr: pg_stat_database_numbackends / pg_settings_max_connections > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL connection pool near exhaustion"
+          description: "Connection pool is {{ $value | humanizePercentage }} full."
+
+      # Airflow Alerts
+      - alert: AirflowSchedulerDown
+        expr: up{job="airflow",component="scheduler"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Airflow scheduler is down"
+          description: "Airflow scheduler has been down for more than 2 minutes."
+
+      - alert: AirflowDAGFailed
+        expr: increase(airflow_dag_run_failed_total[1h]) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Multiple Airflow DAG failures"
+          description: "{{ $value }} DAG runs have failed in the last hour."
+
+      # System Resource Alerts
+      - alert: HighCPUUsage
+        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage detected"
+          description: "CPU usage is {{ $value }}% on {{ $labels.instance }}."
+
+      - alert: HighMemoryUsage
+        expr: (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes > 0.85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage detected"
+          description: "Memory usage is {{ $value | humanizePercentage }} on {{ $labels.instance }}."
+
+      - alert: DiskSpaceLow
+        expr: (node_filesystem_avail_bytes / node_filesystem_size_bytes) < 0.15
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low disk space"
+          description: "Disk {{ $labels.mountpoint }} has {{ $value | humanizePercentage }} free on {{ $labels.instance }}."
+
+      # Container Alerts
+      - alert: ContainerHighCPU
+        expr: rate(container_cpu_usage_seconds_total{name=~"chronox-.*"}[5m]) > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container using high CPU"
+          description: "Container {{ $labels.name }} is using {{ $value | humanizePercentage }} CPU."
+
+      - alert: ContainerHighMemory
+        expr: container_memory_usage_bytes{name=~"chronox-.*"} / container_spec_memory_limit_bytes > 0.85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container using high memory"
+          description: "Container {{ $labels.name }} is using {{ $value | humanizePercentage }} memory."
+
+      - alert: ContainerRestarting
+        expr: rate(container_last_seen{name=~"chronox-.*"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container is restarting frequently"
+          description: "Container {{ $labels.name }} has restarted {{ $value }} times in 5 minutes."
+
+      # Trading Performance Alerts
+      - alert: LowSharpeRatio
+        expr: trading_sharpe_ratio < 1.0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low Sharpe ratio detected"
+          description: "Trading Sharpe ratio is {{ $value }} (threshold: 1.0)"
+
+      - alert: HighDrawdown
+        expr: trading_max_drawdown > 0.15
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High drawdown detected"
+          description: "Current drawdown is {{ $value | humanizePercentage }} (threshold: 15%)"
+
+      - alert: ExcessiveTradeFrequency
+        expr: rate(trading_total_trades[1h]) > 100
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Excessive trading frequency"
+          description: "Trade frequency is {{ $value }} per hour (threshold: 100)"
+
+      - alert: LowWinRate
+        expr: trading_win_rate < 0.45
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low win rate detected"
+          description: "Win rate is {{ $value | humanizePercentage }} (threshold: 45%)"

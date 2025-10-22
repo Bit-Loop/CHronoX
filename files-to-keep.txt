@@ -1,0 +1,28 @@
+# Python files
+*.py
+
+# Config files
+*.yaml
+*.yml
+*.conf
+*.sql
+
+# Documentation
+README.md
+LICENSE
+*.md
+
+# Docker files
+Dockerfile*
+docker-compose.yml
+.dockerignore
+
+# Requirements
+requirements.txt
+requirements/
+
+# Shell scripts
+*.sh
+
+# HTML templates
+*.html

@@ -1,0 +1,40 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: '15s'
+      queryTimeout: '60s'
+      httpMethod: 'POST'
+
+  - name: TimescaleDB
+    type: postgres
+    url: timescaledb:5432
+    database: chronox_timeseries
+    user: chronox
+    secureJsonData:
+      password: 'chronox_db_pass_2024'
+    jsonData:
+      sslmode: 'disable'
+      maxOpenConns: 10
+      maxIdleConns: 5
+      connMaxLifetime: 14400
+      timescaledb: true
+
+  - name: PostgreSQL
+    type: postgres
+    url: postgres:5432
+    database: chronox_metadata
+    user: chronox
+    secureJsonData:
+      password: 'chronox_db_pass_2024'
+    jsonData:
+      sslmode: 'disable'
+      maxOpenConns: 10
+      maxIdleConns: 5
+      connMaxLifetime: 14400

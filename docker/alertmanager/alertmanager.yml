@@ -1,0 +1,144 @@
+route:
+  receiver: 'default-receiver'
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Critical alerts - immediate notification
+    - receiver: 'critical-pager'
+      match:
+        severity: critical
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 30m
+
+    # Warning alerts - standard notification
+    - receiver: 'warning-slack'
+      match:
+        severity: warning
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+
+    # Info alerts - low priority
+    - receiver: 'info-email'
+      match:
+        severity: info
+      group_wait: 5m
+      group_interval: 30m
+      repeat_interval: 24h
+
+inhibit_rules:
+  # Inhibit warning if critical is firing
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'cluster', 'service']
+
+  # Inhibit API errors if API is down
+  - source_match:
+      alertname: 'InferenceAPIDown'
+    target_match_re:
+      alertname: 'HighInference.*'
+    equal: ['cluster']
+
+receivers:
+  # Default receiver (console logs)
+  - name: 'default-receiver'
+    webhook_configs:
+      - url: 'http://localhost:9093/api/v1/alerts'
+        send_resolved: true
+
+  # Critical alerts - PagerDuty integration
+  - name: 'critical-pager'
+    pagerduty_configs:
+      - service_key: 'YOUR_PAGERDUTY_SERVICE_KEY'
+        severity: 'critical'
+        description: '{{ .CommonAnnotations.summary }}'
+        details:
+          firing: '{{ .Alerts.Firing | len }}'
+          resolved: '{{ .Alerts.Resolved | len }}'
+    # Backup: Slack for critical alerts
+    slack_configs:
+      - api_url: 'YOUR_SLACK_WEBHOOK_URL'
+        channel: '#chronox-critical'
+        username: 'ChronoX Alertmanager'
+        icon_emoji: ':rotating_light:'
+        title: 'CRITICAL ALERT: {{ .CommonAnnotations.summary }}'
+        text: |
+          {{ range .Alerts }}
+          *Alert:* {{ .Annotations.summary }}
+          *Description:* {{ .Annotations.description }}
+          *Severity:* {{ .Labels.severity }}
+          *Started:* {{ .StartsAt }}
+          {{ end }}
+        send_resolved: true
+
+  # Warning alerts - Slack
+  - name: 'warning-slack'
+    slack_configs:
+      - api_url: 'YOUR_SLACK_WEBHOOK_URL'
+        channel: '#chronox-alerts'
+        username: 'ChronoX Alertmanager'
+        icon_emoji: ':warning:'
+        title: 'WARNING: {{ .CommonAnnotations.summary }}'
+        text: |
+          {{ range .Alerts }}
+          *Alert:* {{ .Annotations.summary }}
+          *Description:* {{ .Annotations.description }}
+          *Severity:* {{ .Labels.severity }}
+          *Started:* {{ .StartsAt }}
+          {{ end }}
+        send_resolved: true
+
+  # Info alerts - Email
+  - name: 'info-email'
+    email_configs:
+      - to: 'chronox-team@example.com'
+        from: 'alertmanager@chronox.ai'
+        smarthost: 'smtp.gmail.com:587'
+        auth_username: 'YOUR_EMAIL@gmail.com'
+        auth_password: 'YOUR_APP_PASSWORD'
+        headers:
+          subject: '[ChronoX] Info: {{ .CommonAnnotations.summary }}'
+        html: |
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <style>
+              body { font-family: Arial, sans-serif; }
+              .alert { background-color: #f0f0f0; padding: 15px; margin: 10px 0; border-left: 4px solid #3498db; }
+              .alert-critical { border-left-color: #e74c3c; }
+              .alert-warning { border-left-color: #f39c12; }
+              .alert-info { border-left-color: #3498db; }
+            </style>
+          </head>
+          <body>
+            <h2>ChronoX Alert Notification</h2>
+            {{ range .Alerts }}
+            <div class="alert alert-{{ .Labels.severity }}">
+              <h3>{{ .Annotations.summary }}</h3>
+              <p><strong>Description:</strong> {{ .Annotations.description }}</p>
+              <p><strong>Severity:</strong> {{ .Labels.severity }}</p>
+              <p><strong>Started:</strong> {{ .StartsAt }}</p>
+              {{ if .EndsAt }}
+              <p><strong>Ended:</strong> {{ .EndsAt }}</p>
+              {{ end }}
+            </div>
+            {{ end }}
+          </body>
+          </html>
+        send_resolved: true
+
+  # Webhook for custom integrations
+  - name: 'webhook-receiver'
+    webhook_configs:
+      - url: 'http://chronox-alert-processor:8080/alerts'
+        send_resolved: true
+        http_config:
+          bearer_token: 'YOUR_WEBHOOK_TOKEN'
+
+templates:
+  - '/etc/alertmanager/templates/*.tmpl'

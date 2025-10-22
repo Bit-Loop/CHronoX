@@ -1,0 +1,131 @@
+services:
+  # TimescaleDB - PostgreSQL extension for time-series data
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: chronox-timescaledb
+    restart: unless-stopped
+    ports:
+      - "5433:5432"  # Changed to 5433 to avoid conflict with existing PostgreSQL
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+      - ./scripts/init_timescale_schema.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    environment:
+      - POSTGRES_USER=${TIMESCALE_USER:-postgres}
+      - POSTGRES_PASSWORD=${TIMESCALE_PASSWORD:-chronox_db_password}
+      - POSTGRES_DB=${TIMESCALE_DB:-chronox}
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    networks:
+      - chronox-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d chronox"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for caching (Phase 2+)
+  redis:
+    image: redis:7-alpine
+    container_name: chronox-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - chronox-net
+    command: redis-server --appendonly yes
+    profiles:
+      - full
+
+  # Prometheus for monitoring (Phase 6+)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: chronox-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    networks:
+      - chronox-net
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    profiles:
+      - monitoring
+
+  # Grafana for dashboards (Phase 6+)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: chronox-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_INSTALL_PLUGINS=grafana-clock-panel
+    networks:
+      - chronox-net
+    depends_on:
+      - prometheus
+      - timescaledb
+    profiles:
+      - monitoring
+
+  # MLflow for experiment tracking (Phase 3+)
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: chronox-mlflow
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-data:/mlflow
+    environment:
+      - MLFLOW_BACKEND_STORE_URI=sqlite:///mlflow/mlflow.db
+      - MLFLOW_DEFAULT_ARTIFACT_ROOT=/mlflow/artifacts
+    networks:
+      - chronox-net
+    command: mlflow server --host 0.0.0.0 --port 5000
+    profiles:
+      - ml
+
+  # Airflow for orchestration (Phase 6+)
+  # Note: Full Airflow setup requires separate docker-compose file
+  # This is a minimal webserver for development
+  airflow-webserver:
+    image: apache/airflow:2.7.0
+    container_name: chronox-airflow
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./pipelines/airflow_dags:/opt/airflow/dags
+      - airflow-logs:/opt/airflow/logs
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=sqlite:////opt/airflow/airflow.db
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${AIRFLOW_SECRET_KEY:-changeme}
+    networks:
+      - chronox-net
+    command: webserver
+    profiles:
+      - orchestration
+
+networks:
+  chronox-net:
+    driver: bridge
+
+volumes:
+  timescaledb-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+  mlflow-data:
+  airflow-logs:

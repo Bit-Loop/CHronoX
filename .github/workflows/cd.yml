@@ -1,0 +1,347 @@
+name: CD - Continuous Deployment
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  PYTHON_VERSION: '3.11'
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository_owner }}/chronox
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    strategy:
+      matrix:
+        service: [base, training, inference]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.service }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.${{ matrix.service }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.service }}:buildcache
+          cache-to: type=registry,ref=${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.service }}:buildcache,mode=max
+          platforms: linux/amd64
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/develop' || github.event.inputs.environment == 'staging'
+    environment:
+      name: staging
+      url: https://staging.chronox.ai
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        uses: azure/setup-kubectl@v3
+      
+      - name: Set up Kubernetes context
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG_STAGING }}
+      
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl set image deployment/chronox-inference \
+            chronox-inference=${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_PREFIX }}-inference:${{ github.sha }} \
+            -n chronox-staging
+          
+          kubectl set image deployment/chronox-training \
+            chronox-training=${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_PREFIX }}-training:${{ github.sha }} \
+            -n chronox-staging
+          
+          kubectl rollout status deployment/chronox-inference -n chronox-staging
+          kubectl rollout status deployment/chronox-training -n chronox-staging
+      
+      - name: Run smoke tests
+        run: |
+          # Wait for services to be ready
+          kubectl wait --for=condition=ready pod \
+            -l app=chronox-inference \
+            -n chronox-staging \
+            --timeout=300s
+          
+          # Run health checks
+          INFERENCE_URL=$(kubectl get svc chronox-inference -n chronox-staging -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          curl -f http://${INFERENCE_URL}:8000/health || exit 1
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.environment == 'production'
+    environment:
+      name: production
+      url: https://chronox.ai
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        uses: azure/setup-kubectl@v3
+      
+      - name: Set up Kubernetes context
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG_PRODUCTION }}
+      
+      - name: Create deployment snapshot
+        run: |
+          kubectl get all -n chronox-production > deployment-snapshot-$(date +%Y%m%d-%H%M%S).yaml
+      
+      - name: Deploy with blue-green strategy
+        run: |
+          # Deploy green version
+          kubectl apply -f k8s/production/deployment-green.yaml
+          
+          # Wait for green to be ready
+          kubectl rollout status deployment/chronox-inference-green -n chronox-production
+          kubectl rollout status deployment/chronox-training-green -n chronox-production
+          
+          # Run health checks on green
+          kubectl wait --for=condition=ready pod \
+            -l app=chronox-inference,version=green \
+            -n chronox-production \
+            --timeout=300s
+      
+      - name: Switch traffic to green
+        run: |
+          # Update service selectors to point to green
+          kubectl patch svc chronox-inference -n chronox-production \
+            -p '{"spec":{"selector":{"version":"green"}}}'
+      
+      - name: Monitor for 5 minutes
+        run: |
+          echo "Monitoring green deployment for 5 minutes..."
+          sleep 300
+          
+          # Check for errors
+          ERROR_COUNT=$(kubectl logs -l app=chronox-inference,version=green \
+            -n chronox-production --since=5m | grep -c ERROR || echo 0)
+          
+          if [ $ERROR_COUNT -gt 10 ]; then
+            echo "Too many errors detected, rolling back..."
+            kubectl patch svc chronox-inference -n chronox-production \
+              -p '{"spec":{"selector":{"version":"blue"}}}'
+            exit 1
+          fi
+      
+      - name: Promote green to blue
+        run: |
+          # Delete old blue deployment
+          kubectl delete deployment chronox-inference-blue -n chronox-production --ignore-not-found
+          kubectl delete deployment chronox-training-blue -n chronox-production --ignore-not-found
+          
+          # Relabel green as blue
+          kubectl label deployment chronox-inference-green version=blue --overwrite -n chronox-production
+          kubectl label deployment chronox-training-green version=blue --overwrite -n chronox-production
+
+  update-airflow-dags:
+    name: Update Airflow DAGs
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: success()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Sync DAGs to Airflow
+        run: |
+          # Copy DAGs to Airflow DAGs folder
+          rsync -avz --delete \
+            pipelines/airflow_dags/ \
+            ${{ secrets.AIRFLOW_DAGS_PATH }}/
+      
+      - name: Trigger DAG validation
+        run: |
+          curl -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.AIRFLOW_API_TOKEN }}" \
+            http://${{ secrets.AIRFLOW_URL }}/api/v1/dags/validate
+
+  model-deployment:
+    name: Deploy ML Models
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: success()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 mlflow
+      
+      - name: Download latest models from MLflow
+        run: |
+          python scripts/download_models.py \
+            --mlflow-uri ${{ secrets.MLFLOW_TRACKING_URI }} \
+            --output-dir ./models/production
+        env:
+          MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_USERNAME }}
+          MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_PASSWORD }}
+      
+      - name: Upload models to S3
+        run: |
+          aws s3 sync ./models/production s3://${{ secrets.S3_MODEL_BUCKET }}/production/ \
+            --delete \
+            --exclude "*.pyc" \
+            --exclude "__pycache__/*"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+      
+      - name: Invalidate model cache
+        run: |
+          kubectl exec -n chronox-production \
+            deployment/chronox-inference \
+            -- python -c "import redis; r = redis.Redis(host='redis', port=6379); r.flushdb()"
+
+  performance-monitoring:
+    name: Setup Performance Monitoring
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: success()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Deploy Grafana dashboards
+        run: |
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.GRAFANA_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @docker/grafana/dashboards/main-dashboard.json \
+            http://${{ secrets.GRAFANA_URL }}/api/dashboards/db
+      
+      - name: Create Datadog synthetic tests
+        run: |
+          curl -X POST \
+            -H "DD-API-KEY: ${{ secrets.DATADOG_API_KEY }}" \
+            -H "DD-APPLICATION-KEY: ${{ secrets.DATADOG_APP_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @monitoring/datadog/synthetic-tests.json \
+            https://api.datadoghq.com/api/v1/synthetics/tests/api
+
+  notify-deployment:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: always()
+    
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "Deployment ${{ job.status }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Deployment Result*\n*Status:* ${{ job.status }}\n*Environment:* ${{ github.event.inputs.environment || 'auto' }}\n*Version:* ${{ github.ref }}\n*Deployer:* ${{ github.actor }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Deployment Log>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        continue-on-error: true
+      
+      - name: Create GitHub Release (for tags)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          draft: false
+          prerelease: false
+          body: |
+            ## ChronoX Release ${{ github.ref }}
+            
+            ### Changes
+            See [CHANGELOG.md](CHANGELOG.md) for details.
+            
+            ### Docker Images
+            - `${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_PREFIX }}-inference:${{ github.ref_name }}`
+            - `${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_PREFIX }}-training:${{ github.ref_name }}`
+            
+            ### Deployment
+            Deployed to production at $(date -u +'%Y-%m-%d %H:%M:%S UTC')
