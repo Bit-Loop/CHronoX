@@ -18,11 +18,18 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from chronox_finance.ai.opencode_client import CompletionResult, LLMProviderError, _TTLCache
+from chronox_finance.ai.opencode_client import (
+    CompletionResult,
+    LLMProviderError,
+    _TTLCache,
+    calculate_token_costs,
+    is_local_url,
+)
 from chronox_finance.security import validate_external_api_url
 
 logger = logging.getLogger(__name__)
@@ -102,6 +109,40 @@ def _extract_candidate_text(data: Dict[str, Any]) -> Tuple[str, str]:
             texts.append(text_val)
 
     return "".join(texts).strip(), finish_reason
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        if isinstance(value, bool):
+            return 0
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _extract_gemini_usage(data: Dict[str, Any]) -> Tuple[int, int, int]:
+    """
+    Extract `(input_tokens, output_tokens, cached_tokens)` from Gemini's `usageMetadata`.
+    Parses `promptTokenCount`, `candidatesTokenCount` (+ `thoughtsTokenCount`),
+    and `cachedContentTokenCount`.
+    """
+    meta = data.get("usageMetadata")
+    if not isinstance(meta, dict):
+        return (0, 0, 0)
+    input_tokens = _safe_int(meta.get("promptTokenCount"))
+    cand_tokens = _safe_int(meta.get("candidatesTokenCount"))
+    thought_tokens = _safe_int(meta.get("thoughtsTokenCount"))
+    if cand_tokens > 0 or thought_tokens > 0:
+        output_tokens = cand_tokens + thought_tokens
+    else:
+        total_tokens = _safe_int(meta.get("totalTokenCount"))
+        output_tokens = max(0, total_tokens - input_tokens) if total_tokens > 0 else 0
+    cached_tokens = _safe_int(meta.get("cachedContentTokenCount"))
+    if input_tokens > 0:
+        cached_tokens = min(cached_tokens, input_tokens)
+    else:
+        cached_tokens = 0
+    return (input_tokens, output_tokens, cached_tokens)
 
 
 class GeminiClient:
@@ -277,6 +318,12 @@ class GeminiClient:
                     protocol_used="gemini",
                     cached=True,
                     provider=self.provider_name,
+                    input_tokens=0,
+                    output_tokens=0,
+                    cached_tokens=0,
+                    cost_microdollars=0,
+                    saved_microdollars=int(cached.get("full_uncached_cost_microdollars", 0)),
+                    latency_ms=0,
                 )
 
         url = f"{self.base_url}/models/{target_model}:generateContent"
@@ -294,6 +341,7 @@ class GeminiClient:
             "generationConfig": generation_config,
         }
 
+        t0 = time.monotonic()
         try:
             with self._http_client() as client:
                 resp = client.post(url, headers=headers, json=body)
@@ -323,15 +371,31 @@ class GeminiClient:
         except ValueError as exc:
             raise GeminiError(f"Google Gemini returned invalid JSON payload: {exc}") from exc
 
+        latency_ms = max(0, int(round((time.monotonic() - t0) * 1000)))
+
         if not text:
             raise GeminiError(
                 f"Google Gemini returned empty message content (finishReason={finish_reason or 'unknown'})."
             )
 
+        in_tok, out_tok, cached_tok = _extract_gemini_usage(data if isinstance(data, dict) else {})
+        cost_ud, saved_ud, full_uncached_ud = calculate_token_costs(
+            model=target_model,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            cached_tokens=cached_tok,
+            provider=self.provider_name,
+            is_local_endpoint=is_local_url(self.base_url),
+        )
+
         if use_cache and self.cache_ttl_seconds > 0:
             self._cache.set(
                 cache_hash,
-                {"content": text, "model": target_model},
+                {
+                    "content": text,
+                    "model": target_model,
+                    "full_uncached_cost_microdollars": full_uncached_ud,
+                },
                 ttl_seconds=self.cache_ttl_seconds,
             )
 
@@ -341,6 +405,12 @@ class GeminiClient:
             protocol_used="gemini",
             cached=False,
             provider=self.provider_name,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            cached_tokens=cached_tok,
+            cost_microdollars=cost_ud,
+            saved_microdollars=saved_ud,
+            latency_ms=latency_ms,
         )
 
     def _check_status(self, resp: httpx.Response) -> None:

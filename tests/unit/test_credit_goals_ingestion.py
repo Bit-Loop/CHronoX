@@ -249,12 +249,15 @@ class TestGoalOptimizerAndEndToEndAPI:
         monkeypatch.delenv("OPENCODE_GO_API_KEY", raising=False)
         monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
         db_file = str(tmp_path / "credit_goals.sqlite3")
-        svc = FinanceService(db_path=db_file, secret_store_path=tmp_path / "secrets.json")
-        app = create_app(db_path=db_file, service=svc)
+        svc = FinanceService(db_path=db_file, secret_store_path=tmp_path / "secrets.enc")
+        app = create_app(db_path=db_file, service=svc, enforce_vault_lock=False)
         client = TestClient(app)
 
         try:
-            assert client.post("/api/demo/load").status_code == 200
+            from tests.fixtures.seed_workspace import seed_workspace
+
+            seed_workspace(svc)
+            assert client.post("/api/demo/load").status_code == 404
 
             # 1. Credit Report API
             rep = client.get("/api/credit/report?extra_monthly_cents=30000").json()

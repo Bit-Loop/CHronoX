@@ -16,7 +16,6 @@ BUILD_PACMAN=false
 BUILD_APPIMAGE=false
 WITH_BACKEND=false
 DEV_MODE=false
-DEMO_MODE=false
 LAUNCH_APP=false
 INSTALL_LAUNCHER=true
 
@@ -33,7 +32,6 @@ Usage:
 
 Options:
   --dev            Set up .venv, desktop deps, icons & user desktop launcher (default)
-  --demo           After setup, launch ChronoX Finance in 90-day ADHD demo mode
   --launch         After setup, launch ChronoX Finance desktop app
   --deb            Build Debian/Ubuntu .deb installer in desktop/dist/
   --pacman         Build Arch/CachyOS/EndeavourOS .pacman package in desktop/dist/
@@ -44,7 +42,7 @@ Options:
   -h, --help       Show this help text
 
 Examples:
-  ./scripts/install-linux.sh --dev --demo
+  ./scripts/install-linux.sh --dev --launch
   ./scripts/install-linux.sh --deb --with-backend
   ./scripts/install-linux.sh --pacman --with-backend
   ./scripts/install-linux.sh --appimage --with-backend
@@ -54,7 +52,6 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dev)           DEV_MODE=true ;;
-    --demo)          DEMO_MODE=true; LAUNCH_APP=true ;;
     --launch)        LAUNCH_APP=true ;;
     --deb)           BUILD_DEB=true ;;
     --pacman)        BUILD_PACMAN=true ;;
@@ -310,20 +307,15 @@ Version=1.5
 Type=Application
 Name=ChronoX Finance
 GenericName=Personal Finance & Auto-Budget
-Comment=Calm ADHD-friendly self-updating auto-budgeting, quant math & FICO/AZEO credit optimizer
+Comment=Industrial local-first personal finance command center with encrypted vault, quant analytics, credit simulator & AI coach
 Exec=${LOCAL_BIN}/chronox-finance %U
 Icon=chronox-finance
 Terminal=false
 Categories=Office;Finance;
-Keywords=budget;finance;adhd;credit;fico;azeo;cashflow;money;quant;
+Keywords=budget;finance;vault;credit;fico;azeo;portfolio;cashflow;money;quant;
 StartupNotify=true
 StartupWMClass=chronox-finance
 MimeType=text/csv;text/tab-separated-values;application/x-ofx;application/vnd.intu.qfx;application/x-qw;
-Actions=Demo;
-
-[Desktop Action Demo]
-Name=Open 90-Day ADHD Demo Workspace
-Exec=${LOCAL_BIN}/chronox-finance --demo
 EOF
 
   if command -v update-desktop-database >/dev/null 2>&1; then
@@ -339,13 +331,8 @@ fi
 
 # --- 10. Optional Immediate Launch ---
 if [[ "${LAUNCH_APP}" == true ]]; then
-  if [[ "${DEMO_MODE}" == true ]]; then
-    log "Launching ChronoX Finance Desktop (90-day ADHD demo workspace)..."
-    (cd "${DESKTOP_DIR}" && npm run demo)
-  else
-    log "Launching ChronoX Finance Desktop..."
-    (cd "${DESKTOP_DIR}" && npm start)
-  fi
+  log "Launching ChronoX Finance Desktop..."
+  (cd "${DESKTOP_DIR}" && npm start)
 else
-  log "Setup complete! Launch anytime with: make desktop (or: make desktop-demo)"
+  log "Setup complete! Launch anytime with: make desktop"
 fi

@@ -47,6 +47,7 @@ class TrayController {
       mode: "hybrid",
       theme: options.initialTheme === "light" ? "light" : "dark",
       shortcut: options.shortcut || "CommandOrControl+Shift+Space",
+      locked: true,
     };
   }
 
@@ -120,6 +121,7 @@ class TrayController {
       ...(partial.mode ? { mode: partial.mode } : {}),
       ...(partial.theme === "dark" || partial.theme === "light" ? { theme: partial.theme } : {}),
       ...(partial.shortcut ? { shortcut: partial.shortcut } : {}),
+      ...(typeof partial.locked === "boolean" ? { locked: partial.locked } : {}),
     };
 
     if (this.isAvailable) {
@@ -144,13 +146,18 @@ class TrayController {
 
     const safeStr = formatDailySafe(this.snapshot);
     const days = Number.isFinite(this.snapshot.daysUntilPayday) ? this.snapshot.daysUntilPayday : null;
-    const statusLabel = safeStr
-      ? `Safe Today: ${safeStr}${days !== null ? `  (${days}d to payday)` : ""}`
-      : "Safe Today: Syncing...";
+    const isLocked = Boolean(this.snapshot.locked);
+    const statusLabel = isLocked
+      ? "Vault Locked — Open ChronoX to Unlock"
+      : safeStr
+        ? `Safe Today: ${safeStr}${days !== null ? `  (${days}d to payday)` : ""}`
+        : "Safe Today: Syncing...";
 
-    const tooltip = safeStr
-      ? `ChronoX Finance — Safe Today: ${safeStr}${days !== null ? ` (${days}d until payday)` : ""}`
-      : "ChronoX Finance — Local Calm Money Vault";
+    const tooltip = isLocked
+      ? "ChronoX Finance — Vault Locked"
+      : safeStr
+        ? `ChronoX Finance — Safe Today: ${safeStr}${days !== null ? ` (${days}d until payday)` : ""}`
+        : "ChronoX Finance — Industrial Personal Finance Vault";
 
     try {
       this.tray.setToolTip(tooltip);
@@ -208,7 +215,7 @@ class TrayController {
         ],
       },
       {
-        label: nextTheme === "light" ? "Switch to Porcelain Light" : "Switch to Obsidian Dark",
+        label: nextTheme === "light" ? "Switch to Light Steel" : "Switch to Dark Industrial",
         click: () => this.callbacks.onSetTheme && this.callbacks.onSetTheme(nextTheme),
       },
       { type: "separator" },

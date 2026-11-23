@@ -100,7 +100,7 @@ function buildApplicationMenu(options) {
       label: "View",
       submenu: [
         {
-          label: currentTheme === "dark" ? "Switch to Porcelain Light" : "Switch to Obsidian Dark",
+          label: currentTheme === "dark" ? "Switch to Light Steel" : "Switch to Dark Industrial",
           accelerator: "CommandOrControl+Shift+T",
           click: () => cb.onSetTheme && cb.onSetTheme(currentTheme === "dark" ? "light" : "dark"),
         },
@@ -126,29 +126,29 @@ function buildApplicationMenu(options) {
       label: "Navigate",
       submenu: [
         {
-          label: "Today",
+          label: "Command",
           accelerator: "CommandOrControl+1",
           click: () => cb.onNavigateTab && cb.onNavigateTab("today"),
         },
         {
-          label: "Credit & Debt",
+          label: "Analytics & What-If",
           accelerator: "CommandOrControl+2",
+          click: () => cb.onNavigateTab && cb.onNavigateTab("analytics"),
+        },
+        {
+          label: "Portfolio",
+          accelerator: "CommandOrControl+3",
+          click: () => cb.onNavigateTab && cb.onNavigateTab("portfolio"),
+        },
+        {
+          label: "Credit & Debt",
+          accelerator: "CommandOrControl+4",
           click: () => cb.onNavigateTab && cb.onNavigateTab("credit"),
         },
         {
-          label: "Goals & Planner",
-          accelerator: "CommandOrControl+3",
-          click: () => cb.onNavigateTab && cb.onNavigateTab("goals"),
-        },
-        {
-          label: "Impulse Vault",
-          accelerator: "CommandOrControl+4",
-          click: () => cb.onNavigateTab && cb.onNavigateTab("impulse"),
-        },
-        {
-          label: "5-Min Reset",
+          label: "Goals & Rules",
           accelerator: "CommandOrControl+5",
-          click: () => cb.onNavigateTab && cb.onNavigateTab("reset"),
+          click: () => cb.onNavigateTab && cb.onNavigateTab("goals"),
         },
         {
           label: "Activity & Bills",
@@ -156,8 +156,13 @@ function buildApplicationMenu(options) {
           click: () => cb.onNavigateTab && cb.onNavigateTab("activity"),
         },
         {
-          label: "AI & Settings",
+          label: "AI Coach",
           accelerator: "CommandOrControl+7",
+          click: () => cb.onNavigateTab && cb.onNavigateTab("coach"),
+        },
+        {
+          label: "Vault & Connectors",
+          accelerator: "CommandOrControl+8",
           click: () => cb.onNavigateTab && cb.onNavigateTab("settings"),
         },
       ],

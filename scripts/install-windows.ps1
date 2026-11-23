@@ -18,14 +18,11 @@
 .PARAMETER Launch
     Launch ChronoX Finance Desktop immediately after setup.
 
-.PARAMETER Demo
-    Launch ChronoX Finance Desktop preloaded with the 90-day ADHD demo workspace.
-
 .PARAMETER Arch
     Target Windows architecture: auto (default), x64, or arm64.
 
 .EXAMPLE
-    .\scripts\install-windows.ps1 -Demo
+    .\scripts\install-windows.ps1 -Launch
 
 .EXAMPLE
     .\scripts\install-windows.ps1 -BuildInstaller
@@ -38,7 +35,6 @@ param(
     [switch]$BuildInstaller,
     [switch]$SkipBackend,
     [switch]$Launch,
-    [switch]$Demo,
     [ValidateSet('auto', 'x64', 'arm64')]
     [string]$Arch = 'auto',
     [switch]$Help
@@ -216,16 +212,12 @@ try {
     }
 
     # --- 6. Optional Immediate Launch ---
-    if ($Demo) {
-        Write-Info "Launching ChronoX Finance Desktop (90-day ADHD demo workspace)..."
-        & npm run demo
-    } elseif ($Launch) {
+    if ($Launch) {
         Write-Info "Launching ChronoX Finance Desktop..."
         & npm start
     } elseif (-not $BuildInstaller) {
         Write-Info "Setup complete! Start ChronoX Finance anytime with:"
-        Write-Host "  cd desktop; npm start          # Normal local vault"
-        Write-Host "  cd desktop; npm run demo       # 90-day ADHD demo workspace"
+        Write-Host "  cd desktop; npm start                            # Launch encrypted local vault"
         Write-Host "  .\scripts\install-windows.ps1 -BuildInstaller   # Build .exe installers"
     }
 } finally {

@@ -21,8 +21,8 @@ First-party Electron desktop shell for **ChronoX Finance** across **Windows (`x6
 # Set up .venv, Electron deps, icons, and desktop app launcher:
 ./scripts/install-linux.sh --dev
 
-# Set up and immediately launch the 90-day ADHD demo workspace:
-./scripts/install-linux.sh --dev --demo
+# Set up and immediately launch ChronoX Finance:
+./scripts/install-linux.sh --dev --launch
 ```
 
 ### Windows (`x64` & `ARM64` — PowerShell 5.1 / 7+)
@@ -31,8 +31,8 @@ First-party Electron desktop shell for **ChronoX Finance** across **Windows (`x6
 # Set up .venv, Electron deps, and Windows .ico icons:
 .\scripts\install-windows.ps1
 
-# Set up and immediately launch the 90-day ADHD demo workspace:
-.\scripts\install-windows.ps1 -Demo
+# Set up and immediately launch ChronoX Finance:
+.\scripts\install-windows.ps1 -Launch
 ```
 
 ### Or via `make`
@@ -40,8 +40,7 @@ First-party Electron desktop shell for **ChronoX Finance** across **Windows (`x6
 ```bash
 make dev
 make desktop-install
-make desktop         # Normal local vault
-make desktop-demo    # Preloaded 90-day ADHD demo workspace
+make desktop         # Launch ChronoX Finance Desktop (mandatory vault lock)
 ```
 
 ---

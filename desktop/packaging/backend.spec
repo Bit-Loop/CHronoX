@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
 SPEC_DIR = Path(SPECPATH).resolve()
 DESKTOP_DIR = SPEC_DIR.parent
@@ -31,10 +31,14 @@ ONEFILE = os.getenv("CHRONOX_PYINSTALLER_ONEFILE", "").strip().lower() in {
     "yes",
 }
 
+binaries = []
+binaries += collect_dynamic_libs("cryptography")
+
 datas = [
     (str(WEB_ASSETS_DIR), "chronox_finance/web"),
 ]
 datas += collect_data_files("certifi")
+datas += collect_data_files("cryptography")
 
 hiddenimports = [
     "uvicorn.logging",
@@ -68,8 +72,22 @@ hiddenimports = [
     "starlette.staticfiles",
     "email.mime.multipart",
     "email.mime.text",
+    "email.header",
+    "email.policy",
+    "imaplib",
+    "cryptography",
+    "cryptography.hazmat.bindings._rust",
+    "cryptography.hazmat.backends.openssl",
+    "cryptography.hazmat.primitives.ciphers.aead",
+    "cryptography.hazmat.primitives.asymmetric.ed25519",
+    "cryptography.hazmat.primitives.asymmetric.ec",
+    "cryptography.hazmat.primitives.serialization",
+    "cryptography.hazmat.primitives.hashes",
+    "cffi",
+    "_cffi_backend",
 ]
 hiddenimports += collect_submodules("chronox_finance")
+hiddenimports += collect_submodules("chronox_finance.connectors")
 
 # Exclude heavy optional trading / ML / test stacks not used by ChronoX Finance
 excludes = [
@@ -98,7 +116,7 @@ block_cipher = None
 a = Analysis(
     [str(ENTRY_SCRIPT)],
     pathex=[str(REPO_ROOT)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

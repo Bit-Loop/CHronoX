@@ -18,8 +18,6 @@ Launch from your application launcher (**ChronoX Finance**) or terminal:
 
 ```bash
 chronox-finance
-# Or launch preloaded with the 90-day ADHD demo workspace:
-chronox-finance --demo
 ```
 
 ---

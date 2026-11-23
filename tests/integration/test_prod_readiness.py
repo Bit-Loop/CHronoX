@@ -24,7 +24,9 @@ from fastapi.testclient import TestClient
 from chronox_finance.api import MAX_UPLOAD_BYTES, create_app
 from chronox_finance.cli import run_cli
 from chronox_finance.models import utc_now_iso
+from chronox_finance.security import CSRF_HEADER_NAME
 from chronox_finance.service import FinanceService
+from tests.fixtures.seed_workspace import seed_workspace
 
 
 def _clear_ai_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -33,6 +35,7 @@ def _clear_ai_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "OPENCODE_API_KEY",
         "GEMINI_API_KEY",
         "GOOGLE_API_KEY",
+        "OPENAI_API_KEY",
         "CHRONOX_INTELLIGENCE_MODE",
         "CHRONOX_AI_PROVIDER",
     ):
@@ -46,16 +49,17 @@ def _make_client(
     opencode_transport: Optional[httpx.BaseTransport] = None,
     gemini_transport: Optional[httpx.BaseTransport] = None,
     raise_server_exceptions: bool = True,
+    enforce_vault_lock: bool = False,
 ) -> Tuple[TestClient, FinanceService, str]:
     _clear_ai_env(monkeypatch)
     db_file = str(tmp_path / "prod_finance.sqlite3")
     svc = FinanceService(
         db_path=db_file,
-        secret_store_path=tmp_path / "secrets.json",
+        secret_store_path=tmp_path / "secrets.enc",
         opencode_transport=opencode_transport,
         gemini_transport=gemini_transport,
     )
-    app = create_app(db_path=db_file, service=svc)
+    app = create_app(db_path=db_file, service=svc, enforce_vault_lock=enforce_vault_lock)
     return TestClient(app, raise_server_exceptions=raise_server_exceptions), svc, db_file
 
 
@@ -75,7 +79,7 @@ class TestIntelligenceModesEndToEnd:
             gemini_transport=transport,
         )
         try:
-            assert client.post("/api/demo/load").status_code == 200
+            seed_workspace(svc)
             # Even with BOTH cloud API keys configured, deterministic_only MUST make 0 outbound calls
             r_cfg = client.patch(
                 "/api/settings/ai",
@@ -198,7 +202,7 @@ class TestIntelligenceModesEndToEnd:
             gemini_transport=httpx.MockTransport(gem_ok),
         )
         try:
-            assert client.post("/api/demo/load").status_code == 200
+            seed_workspace(svc)
             r_cfg = client.patch(
                 "/api/settings/ai",
                 json={
@@ -291,7 +295,7 @@ class TestIntelligenceModesEndToEnd:
             gemini_transport=httpx.MockTransport(gem_shaming),
         )
         try:
-            assert client.post("/api/demo/load").status_code == 200
+            seed_workspace(svc)
 
             # 1. Unconfigured in ai_standalone falls back gracefully with transparent notice
             client.patch("/api/settings/ai", json={"intelligence_mode": "ai_standalone"})
@@ -375,16 +379,23 @@ class TestGeminiProviderConfigAndSecurity:
             monkeypatch,
             opencode_transport=httpx.MockTransport(oc_handler),
             gemini_transport=httpx.MockTransport(gem_handler),
+            enforce_vault_lock=True,
         )
         try:
-            # 1. Save Gemini key via /api/settings/ai
+            # Initialize mandatory envelope-encrypted vault & capture per-boot CSRF token
+            r_setup = client.post("/api/v1/auth/setup", json={"password": "gemini-vault-pass-99"})
+            assert r_setup.status_code == 200
+            csrf_headers = {CSRF_HEADER_NAME: r_setup.json()["csrf_token"]}
+
+            # 1. Save Gemini key via /api/v1/settings/ai
             r_save = client.patch(
-                "/api/settings/ai",
+                "/api/v1/settings/ai",
                 json={
                     "gemini_api_key": secret_gem,
                     "gemini_model": "gemini-2.5-flash",
                     "ai_provider": "gemini",
                 },
+                headers=csrf_headers,
             )
             assert r_save.status_code == 200
             saved = r_save.json()
@@ -394,19 +405,21 @@ class TestGeminiProviderConfigAndSecurity:
             assert saved["active_provider_resolved"] == "gemini"
             assert secret_gem not in json.dumps(saved)
 
-            # Verify 0600 permissions on local secrets store
-            secrets_file = tmp_path / "secrets.json"
+            # Verify 0600 permissions & AES-256-GCM encryption on local secrets.enc store (no plaintext!)
+            secrets_file = tmp_path / "secrets.enc"
+            assert secrets_file.is_file()
             assert (os.stat(secrets_file).st_mode & 0o777) == 0o600
+            assert secret_gem not in secrets_file.read_text(encoding="utf-8")
 
             # 2. Verify plaintext key NEVER leaks in ANY GET endpoint or backup export!
-            for ep in ("/api/settings/ai", "/api/settings", "/api/dashboard", "/api/health", "/api/backup/export"):
+            for ep in ("/api/v1/settings/ai", "/api/v1/settings", "/api/v1/dashboard", "/api/v1/health", "/api/v1/backup/export"):
                 resp = client.get(ep)
                 assert resp.status_code == 200, f"GET {ep} failed"
                 raw_text = resp.text
                 assert secret_gem not in raw_text, f"Gemini key leaked in {ep}!"
 
             # 3. Verify live Gemini model discovery & connection test use x-goog-api-key header ONLY (never query params!)
-            r_models = client.get("/api/ai/models?provider=gemini&refresh=true")
+            r_models = client.get("/api/v1/ai/models?provider=gemini&refresh=true")
             assert r_models.status_code == 200
             models_body = r_models.json()
             assert models_body["live"] is True
@@ -414,7 +427,7 @@ class TestGeminiProviderConfigAndSecurity:
             assert "gemini-2.5-flash" in model_ids
             assert "text-embedding-004" not in model_ids  # embed-only filtered out
 
-            r_test = client.post("/api/ai/test?provider=gemini")
+            r_test = client.post("/api/v1/ai/test?provider=gemini", headers=csrf_headers)
             assert r_test.status_code == 200
             assert r_test.json()["ok"] is True
 
@@ -425,18 +438,26 @@ class TestGeminiProviderConfigAndSecurity:
                 assert secret_gem not in str(req.url)
 
             # 4. Provider switching between opencode_go, gemini, and auto
-            client.patch("/api/settings/ai", json={"opencode_api_key": secret_oc, "ai_provider": "opencode_go"})
-            assert client.get("/api/settings/ai").json()["active_provider_resolved"] == "opencode_go"
-            assert secret_oc not in client.get("/api/settings/ai").text
+            client.patch(
+                "/api/v1/settings/ai",
+                json={"opencode_api_key": secret_oc, "ai_provider": "opencode_go"},
+                headers=csrf_headers,
+            )
+            assert client.get("/api/v1/settings/ai").json()["active_provider_resolved"] == "opencode_go"
+            assert secret_oc not in client.get("/api/v1/settings/ai").text
 
-            client.patch("/api/settings/ai", json={"ai_provider": "gemini"})
-            assert client.get("/api/settings/ai").json()["active_provider_resolved"] == "gemini"
+            client.patch("/api/v1/settings/ai", json={"ai_provider": "gemini"}, headers=csrf_headers)
+            assert client.get("/api/v1/settings/ai").json()["active_provider_resolved"] == "gemini"
 
-            client.patch("/api/settings/ai", json={"ai_provider": "auto"})
-            assert client.get("/api/settings/ai").json()["active_provider_resolved"] == "opencode_go"
+            client.patch("/api/v1/settings/ai", json={"ai_provider": "auto"}, headers=csrf_headers)
+            assert client.get("/api/v1/settings/ai").json()["active_provider_resolved"] == "opencode_go"
 
             # 5. Clear Gemini key -> gemini_api_key_set=False
-            r_clr = client.patch("/api/settings/ai", json={"clear_gemini_key": True, "ai_provider": "gemini"})
+            r_clr = client.patch(
+                "/api/v1/settings/ai",
+                json={"clear_gemini_key": True, "ai_provider": "gemini"},
+                headers=csrf_headers,
+            )
             assert r_clr.status_code == 200
             cleared = r_clr.json()
             assert cleared["gemini_api_key_set"] is False
@@ -444,13 +465,18 @@ class TestGeminiProviderConfigAndSecurity:
             assert cleared["active_provider_resolved"] == "none"
 
             # 6. SSRF rejection on gemini_base_url (both PATCH and backup restore)
-            r_ssrf = client.patch("/api/settings/ai", json={"gemini_base_url": "http://169.254.169.254/v1beta"})
+            r_ssrf = client.patch(
+                "/api/v1/settings/ai",
+                json={"gemini_base_url": "http://169.254.169.254/v1beta"},
+                headers=csrf_headers,
+            )
             assert r_ssrf.status_code == 400
-            backup = client.get("/api/backup/export").json()
+            backup = client.get("/api/v1/backup/export").json()
             backup["settings"]["gemini_base_url"] = "http://evil.example.com/v1beta"
             r_bkp = client.post(
-                "/api/backup/import",
+                "/api/v1/backup/import",
                 files={"file": ("bad_gem.json", json.dumps(backup).encode("utf-8"), "application/json")},
+                headers=csrf_headers,
             )
             assert r_bkp.status_code == 400
         finally:
@@ -461,13 +487,13 @@ class TestQuantForecastTransactionPatchHealthAndHardening:
     def test_quant_forecast_endpoint_clamping_dashboard_parity_and_cent_conservation(self, tmp_path, monkeypatch):
         client, svc, _ = _make_client(tmp_path, monkeypatch)
         try:
-            assert client.post("/api/demo/load").status_code == 200
-            dash = client.get("/api/dashboard").json()
+            seed_workspace(svc)
+            dash = client.get("/api/v1/dashboard").json()
             assert dash["quant_forecast"] is not None
             assert dash["intelligence_mode"] == "hybrid"
             assert dash["active_ai_provider"] == "none"
 
-            f30 = client.get("/api/quant/forecast?days=30").json()
+            f30 = client.get("/api/v1/quant/forecast?days=30").json()
             assert f30["horizon_days"] == 30
             assert len(f30["daily_points"]) == 30
             assert f30["lowest_balance_cents"] == dash["quant_forecast"]["lowest_balance_cents"]
@@ -479,10 +505,10 @@ class TestQuantForecastTransactionPatchHealthAndHardening:
                 alloc_sum = sum(step["amount_cents"] for step in f30["optimal_allocations"])
                 assert alloc_sum == f30["monthly_surplus_cents"]
 
-            # Horizon clamping [7..90]
-            assert client.get("/api/quant/forecast?days=60").json()["horizon_days"] == 60
-            assert client.get("/api/quant/forecast?days=2").json()["horizon_days"] == 7
-            assert client.get("/api/quant/forecast?days=365").json()["horizon_days"] == 90
+            # Horizon clamping [7..90] in QuantMathEngine.build_forecast_report
+            assert client.get("/api/v1/quant/forecast?days=60").json()["horizon_days"] == 60
+            assert client.get("/api/v1/quant/forecast?days=2").json()["horizon_days"] == 7
+            assert client.get("/api/v1/quant/forecast?days=365").json()["horizon_days"] == 90
         finally:
             svc.close()
 
@@ -544,24 +570,35 @@ class TestQuantForecastTransactionPatchHealthAndHardening:
             svc.close()
 
     def test_health_endpoint_public_under_lock_and_zero_secrets(self, tmp_path, monkeypatch):
-        client, svc, _ = _make_client(tmp_path, monkeypatch)
+        client, svc, _ = _make_client(tmp_path, monkeypatch, enforce_vault_lock=True)
         try:
-            client.patch("/api/settings/ai", json={"gemini_api_key": "AIzaSyHealthSecret1234", "ai_provider": "gemini"})
-            assert client.post("/api/auth/setup", json={"passcode": "vault-lock-99"}).status_code == 200
-            client.post("/api/auth/logout")
+            r_setup = client.post("/api/v1/auth/setup", json={"password": "vault-lock-password-99"})
+            assert r_setup.status_code == 200
+            csrf_headers = {CSRF_HEADER_NAME: r_setup.json()["csrf_token"]}
 
-            # Private routes locked (401), but /api/health MUST stay public (200) and secret-free
-            assert client.get("/api/dashboard").status_code == 401
-            r_health = client.get("/api/health")
+            r_ai = client.patch(
+                "/api/v1/settings/ai",
+                json={"gemini_api_key": "AIzaSyHealthSecret1234", "ai_provider": "gemini"},
+                headers=csrf_headers,
+            )
+            assert r_ai.status_code == 200
+            assert client.get("/api/v1/health").json()["active_provider"] == "gemini"
+
+            r_out = client.post("/api/v1/auth/logout", headers=csrf_headers)
+            assert r_out.status_code == 200
+
+            # Private routes locked (401), but /api/v1/health MUST stay public (200) and secret-free
+            assert client.get("/api/v1/dashboard").status_code == 401
+            r_health = client.get("/api/v1/health")
             assert r_health.status_code == 200
             h = r_health.json()
             assert h["status"] == "ok"
             assert h["db_ok"] is True
             assert h["auth_enabled"] is True
+            assert h["vault_state"] == "locked"
             assert h["intelligence_mode"] == "hybrid"
-            assert h["active_provider"] == "gemini"
             assert "AIzaSyHealthSecret1234" not in r_health.text
-            assert "vault-lock-99" not in r_health.text
+            assert "vault-lock-password-99" not in r_health.text
             assert "passcode_hash" not in r_health.text
         finally:
             svc.close()
@@ -680,20 +717,29 @@ class TestQuantForecastTransactionPatchHealthAndHardening:
 
 
 class TestCLIProductionSmoke:
-    def test_cli_demo_quant_credit_goal_and_deterministic_mode(self, tmp_path, monkeypatch, capsys):
+    def test_cli_seeded_quant_credit_goal_portfolio_usage_and_deterministic_mode(self, tmp_path, monkeypatch, capsys):
         _clear_ai_env(monkeypatch)
         db_file = str(tmp_path / "cli_prod.sqlite3")
 
-        assert run_cli(["--db", db_file, "demo"]) == 0
+        svc = FinanceService(db_path=db_file, secret_store_path=tmp_path / "secrets.enc")
+        try:
+            seed_workspace(svc)
+        finally:
+            svc.close()
+
         assert run_cli(["--db", db_file, "quant", "--days", "30"]) == 0
         assert run_cli(["--db", db_file, "credit", "--extra", "300"]) == 0
         assert run_cli(["--db", db_file, "goal", "Studio Display", "1000"]) == 0
+        assert run_cli(["--db", db_file, "portfolio"]) == 0
+        assert run_cli(["--db", db_file, "usage", "--days", "30"]) == 0
         assert run_cli(["--db", db_file, "--mode", "deterministic_only", "suggest"]) == 0
         assert run_cli(["--db", db_file, "--mode", "deterministic_only", "ask", "How is my 30-day cashflow runway?"]) == 0
 
         out = capsys.readouterr().out
-        assert "ChronoX Quant Forecast" in out
+        assert "CHRONOX QUANT FORECAST" in out
         assert "OPTIMAL SURPLUS ALLOCATION" in out
-        assert "Credit & Debt Optimizer" in out
-        assert "Credit-Safe Goal Plan: Studio Display" in out
-        assert "Verified Local Engine · Quant Math" in out
+        assert "[CREDIT SIMULATOR]" in out
+        assert "[GOAL PLAN] Studio Display" in out
+        assert "CHRONOX PORTFOLIO" in out
+        assert "CHRONOX AI USAGE" in out
+        assert "Verified Local Engine | Quant Math" in out

@@ -60,6 +60,9 @@ class DetectedRecurring:
     is_subscription: bool
     is_essential: bool
     confidence: float
+    amount_min_cents: Optional[int] = None
+    amount_max_cents: Optional[int] = None
+    due_window_days: int = 4
 
 
 @dataclass
@@ -217,17 +220,217 @@ def advance_due_date(last_date: date, cadence: RecurrenceCadence, today: Optiona
     return due
 
 
+DEFAULT_RECURRING_LOOKBACK_DAYS = 730
+
+
+def _step_cycle_back(dt: date, cadence: RecurrenceCadence, anchor_day: int) -> date:
+    month_steps = {
+        RecurrenceCadence.MONTHLY: -1,
+        RecurrenceCadence.BIMONTHLY: -2,
+        RecurrenceCadence.QUARTERLY: -3,
+        RecurrenceCadence.SEMIANNUAL: -6,
+        RecurrenceCadence.ANNUAL: -12,
+    }
+    day_steps = {
+        RecurrenceCadence.WEEKLY: -7,
+        RecurrenceCadence.BIWEEKLY: -14,
+        RecurrenceCadence.SEMIMONTHLY: -15,
+    }
+    if cadence in month_steps:
+        return _add_months(dt, month_steps[cadence], anchor_day)
+    return dt + timedelta(days=day_steps.get(cadence, -30))
+
+
+def _step_cycle_forward(dt: date, cadence: RecurrenceCadence, anchor_day: int) -> date:
+    month_steps = {
+        RecurrenceCadence.MONTHLY: 1,
+        RecurrenceCadence.BIMONTHLY: 2,
+        RecurrenceCadence.QUARTERLY: 3,
+        RecurrenceCadence.SEMIANNUAL: 6,
+        RecurrenceCadence.ANNUAL: 12,
+    }
+    day_steps = {
+        RecurrenceCadence.WEEKLY: 7,
+        RecurrenceCadence.BIWEEKLY: 14,
+        RecurrenceCadence.SEMIMONTHLY: 15,
+    }
+    if cadence in month_steps:
+        return _add_months(dt, month_steps[cadence], anchor_day)
+    return dt + timedelta(days=day_steps.get(cadence, 30))
+
+
+def forecast_bill_amount_cents(
+    bill: Dict[str, Any],
+    recent_matched_amounts: Optional[List[int]] = None,
+    *,
+    prefer_midpoint: bool = False,
+) -> int:
+    """
+    Forecast exact integer-cent amount for a recurring bill (supporting variable utilities).
+
+    Priority:
+    1. Rolling mean of up to last 6 matched transaction amounts when supplied.
+    2. Midpoint `(amount_min_cents + amount_max_cents) // 2` when min/max range is set and
+       either `prefer_midpoint=True` or `amount_cents` is absent/outside range.
+    3. Explicit `amount_cents`.
+    """
+    if recent_matched_amounts:
+        valid = [int(a) for a in recent_matched_amounts[-6:] if int(a) > 0]
+        if valid:
+            return int(round(mean(valid)))
+
+    lo_raw = bill.get("amount_min_cents")
+    hi_raw = bill.get("amount_max_cents")
+    amt = int(bill.get("amount_cents") or 0)
+    if lo_raw is not None and hi_raw is not None:
+        lo, hi = int(lo_raw), int(hi_raw)
+        if hi >= lo > 0:
+            midpoint = (lo + hi) // 2
+            if prefer_midpoint or amt <= 0 or amt < lo or amt > hi:
+                return midpoint
+    return max(0, amt)
+
+
+def is_within_due_window(
+    tx_date: date,
+    bill_due_date: date,
+    cadence: RecurrenceCadence,
+    due_window_days: int = 4,
+) -> bool:
+    """Check if `tx_date` falls within `+/- due_window_days` of any cycle aligned to `bill_due_date`."""
+    window = max(0, int(due_window_days))
+    if abs((tx_date - bill_due_date).days) <= window:
+        return True
+
+    anchor_day = bill_due_date.day
+    cursor = bill_due_date
+    if tx_date < bill_due_date:
+        for _ in range(110):  # covers 2+ years even at weekly cadence
+            cursor = _step_cycle_back(cursor, cadence, anchor_day)
+            if abs((tx_date - cursor).days) <= window:
+                return True
+            if cursor < tx_date - timedelta(days=window + 40):
+                break
+    else:
+        for _ in range(110):
+            cursor = _step_cycle_forward(cursor, cadence, anchor_day)
+            if abs((tx_date - cursor).days) <= window:
+                return True
+            if cursor > tx_date + timedelta(days=window + 40):
+                break
+    return False
+
+
+def match_transaction_to_bill(
+    tx: Dict[str, Any],
+    bill: Dict[str, Any],
+    *,
+    require_date_window: bool = True,
+) -> bool:
+    """
+    Firefly III-inspired bill matcher supporting `[amount_min_cents, amount_max_cents]`
+    and `due_window_days` for variable utilities and fixed subscriptions alike.
+    """
+    if tx.get("tx_type") != "expense":
+        return False
+    tx_amt = int(tx.get("amount_cents") or 0)
+    if tx_amt <= 0:
+        return False
+
+    # 1. Merchant / brand similarity check
+    tx_norm = (tx.get("normalized_merchant") or tx.get("merchant") or "").strip().lower()
+    bill_norm = (bill.get("normalized_merchant") or bill.get("name") or "").strip().lower()
+    if not tx_norm or not bill_norm:
+        return False
+
+    merchant_match = tx_norm == bill_norm or bill_norm in tx_norm or tx_norm in bill_norm
+    if not merchant_match:
+        sim = _token_jaccard(canonical_brand_tokens(tx_norm), canonical_brand_tokens(bill_norm))
+        merchant_match = sim >= 0.65
+    if not merchant_match:
+        return False
+
+    # 2. Exact integer-cent amount range check
+    lo_raw = bill.get("amount_min_cents")
+    hi_raw = bill.get("amount_max_cents")
+    if lo_raw is not None or hi_raw is not None:
+        lo = int(lo_raw) if lo_raw is not None else 0
+        hi = int(hi_raw) if hi_raw is not None else 10**12
+        if lo > hi:
+            lo, hi = hi, lo
+        if not (lo <= tx_amt <= hi):
+            return False
+    else:
+        bill_amt = int(bill.get("amount_cents") or 0)
+        if bill_amt <= 0:
+            return False
+        tol_ratio = 0.15 if bill.get("is_essential", True) else 0.05
+        tol = max(100, int(round(bill_amt * tol_ratio)))
+        if abs(tx_amt - bill_amt) > tol:
+            return False
+
+    # 3. Due-date window check (optional for retroactive / unanchored bills)
+    if require_date_window and bill.get("next_due_date") and tx.get("tx_date"):
+        try:
+            tx_dt = date.fromisoformat(str(tx["tx_date"])[:10])
+            due_dt = date.fromisoformat(str(bill["next_due_date"])[:10])
+        except ValueError:
+            return False
+        cadence_raw = bill.get("cadence", RecurrenceCadence.MONTHLY.value)
+        try:
+            cadence = cadence_raw if isinstance(cadence_raw, RecurrenceCadence) else RecurrenceCadence(str(cadence_raw))
+        except ValueError:
+            cadence = RecurrenceCadence.MONTHLY
+        window = int(bill.get("due_window_days")) if bill.get("due_window_days") is not None else 4
+        if not is_within_due_window(tx_dt, due_dt, cadence, due_window_days=window):
+            return False
+
+    return True
+
+
+def find_matching_bill(
+    tx: Dict[str, Any],
+    recurring_bills: List[Dict[str, Any]],
+    *,
+    require_date_window: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Return the closest matching active recurring bill for a transaction, if any."""
+    candidates: List[Tuple[int, Dict[str, Any]]] = []
+    tx_amt = int(tx.get("amount_cents") or 0)
+    for bill in recurring_bills:
+        if not bill.get("active", 1):
+            continue
+        if match_transaction_to_bill(tx, bill, require_date_window=require_date_window):
+            target = forecast_bill_amount_cents(bill)
+            candidates.append((abs(tx_amt - target), bill))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda pair: pair[0])
+    return candidates[0][1]
+
+
 def detect_recurring_bills(
     transactions: List[Dict[str, Any]],
     today: Optional[date] = None,
+    lookback_days: int = DEFAULT_RECURRING_LOOKBACK_DAYS,
 ) -> List[DetectedRecurring]:
     """
-    Fuzzy-cluster expense transactions and detect recurring bills & subscriptions.
+    Fuzzy-cluster expense transactions over up to 730 days (2 full annual cycles)
+    and detect recurring bills, variable utilities (with `[amount_min_cents, amount_max_cents]`
+    and `due_window_days`), and subscriptions.
     Survives descriptor drift, holiday/weekend date shifts, and step price hikes.
     """
     ref = today or date.today()
     categorizer = TransactionCategorizer()
-    merchant_clusters = cluster_merchants(transactions)
+
+    # Enforce lookback window (default 730 days -> captures 2 full annual billing cycles)
+    if lookback_days and lookback_days > 0:
+        cutoff_iso = (ref - timedelta(days=int(lookback_days))).isoformat()
+        scoped_txs = [t for t in transactions if str(t.get("tx_date", "")) >= cutoff_iso]
+    else:
+        scoped_txs = list(transactions)
+
+    merchant_clusters = cluster_merchants(scoped_txs)
 
     detected: List[DetectedRecurring] = []
 
@@ -260,7 +463,7 @@ def detect_recurring_bills(
         # Check timing consistency (either tight delta std OR tight circular day-of-month anchor!)
         delta_std = stdev(deltas) if len(deltas) >= 2 else 0.0
         dom_spread = _circular_dom_spread(dates)
-        max_std = 6.5 if canonical_days >= 60 else 4.8
+        max_std = 7.5 if canonical_days >= 180 else (6.5 if canonical_days >= 60 else 4.8)
         if delta_std > max_std and not (canonical_days >= 28 and dom_spread <= 2.5):
             continue
 
@@ -276,8 +479,10 @@ def detect_recurring_bills(
         latest_tx = deduped[-1]
         sub_hint, ess_hint = categorizer.detect_hints(latest_tx["merchant"], latest_tx.get("memo", ""))
 
-        # Allow higher seasonal variance on utilities/essentials (up to 30%), tighter on discretionary subs
-        max_cv = 0.30 if ess_hint else 0.14
+        # Allow higher seasonal variance on utilities/essentials (up to 45% when cadence is tight),
+        # tighter on discretionary subscriptions.
+        tight_timing = delta_std <= 4.0 or (canonical_days >= 28 and dom_spread <= 2.5)
+        max_cv = (0.45 if tight_timing else 0.30) if ess_hint else 0.14
         # Always allow a clean step-function price hike (e.g. 1549, 1549, 2299 or 1549, 2299)
         is_step_hike = (
             len(amounts) >= 2
@@ -288,13 +493,15 @@ def detect_recurring_bills(
         if amt_cv > max_cv and not is_step_hike:
             continue
 
-        # Ignore stale subscriptions that stopped > 2.2 cycles ago
-        if (ref - dates[-1]).days > int(canonical_days * 2.25):
+        # Ignore stale subscriptions that stopped > 2.25 cycles ago (capped cleanly for annual)
+        max_stale_days = max(int(canonical_days * 1.35), 400) if canonical_days >= 350 else int(canonical_days * 2.25)
+        if (ref - dates[-1]).days > max_stale_days:
             continue
 
         previous_amt: Optional[int] = None
         if len(amounts) >= 2 and abs(latest_amt - prior_median) >= 50:  # >= $0.50 meaningful change
-            previous_amt = prior_median
+            if is_step_hike or not ess_hint or amt_cv <= 0.10:
+                previous_amt = prior_median
 
         base_conf = 0.78 if len(deduped) == 2 else min(0.98, 0.85 + 0.03 * len(deduped))
         if delta_std <= 1.8 or (canonical_days >= 28 and dom_spread <= 1.5):
@@ -305,11 +512,29 @@ def detect_recurring_bills(
         unique_norms = {t["normalized_merchant"] for t in deduped}
         norm_key = next(iter(unique_norms)) if len(unique_norms) == 1 else cluster_key
 
+        # Compute Firefly-style [amount_min_cents, amount_max_cents] and due_window_days
+        is_variable_utility = (not is_step_hike) and (min(amounts) != max(amounts)) and (amt_cv > 0.05)
+        if is_variable_utility:
+            amt_min = min(amounts)
+            amt_max = max(amounts)
+            # Rolling mean of last 6 cycles forecasts variable utilities smoothly
+            forecast_amt = int(round(mean(amounts[-6:])))
+        else:
+            forecast_amt = latest_amt if previous_amt is not None else med_amt
+            amt_min = forecast_amt if is_step_hike else min(amounts)
+            amt_max = forecast_amt if is_step_hike else max(amounts)
+
+        due_window = (
+            max(4, min(10, int(math.ceil(dom_spread * 2.0)) + 2))
+            if (len(dates) >= 2 and canonical_days >= 28)
+            else 4
+        )
+
         detected.append(
             DetectedRecurring(
                 name=latest_tx["merchant"],
                 normalized_merchant=norm_key,
-                amount_cents=latest_amt if previous_amt is not None else med_amt,
+                amount_cents=forecast_amt,
                 previous_amount_cents=previous_amt,
                 cadence=cadence,
                 next_due_date=next_due.isoformat(),
@@ -317,6 +542,9 @@ def detect_recurring_bills(
                 is_subscription=sub_hint or (not ess_hint and amt_cv <= 0.03),
                 is_essential=ess_hint,
                 confidence=round(base_conf, 2),
+                amount_min_cents=amt_min,
+                amount_max_cents=amt_max,
+                due_window_days=due_window,
             )
         )
 
@@ -331,7 +559,7 @@ def detect_bill_anomalies(
     """
     Detect real-world billing anomalies that ambush ADHD users:
     1. Suspected double charges (same merchant cluster & identical amount within 3 days).
-    2. Missed / overdue active bills (due date passed by >= 3 days with no recent charge).
+    2. Missed / overdue active bills (due date passed beyond due window with no matching charge).
     3. Silent price hikes on active recurring bills.
     """
     ref = today or date.today()
@@ -371,20 +599,28 @@ def detect_bill_anomalies(
             continue
         due_dt = date.fromisoformat(b["next_due_date"])
         overdue_days = (ref - due_dt).days
-        amt = int(b["amount_cents"])
-        if overdue_days >= 3:
-            anomalies.append(
-                BillAnomaly(
-                    kind="missed_bill",
-                    merchant=b["name"],
-                    amount_cents=amt,
-                    summary=(
-                        f"{b['name']} (${amt / 100:,.2f}) was expected {overdue_days} days ago "
-                        f"({b['next_due_date']}) — verify autopay or mark paid so you don't get a late fee."
-                    ),
-                    dates=[b["next_due_date"]],
-                )
+        amt = forecast_bill_amount_cents(b)
+        due_window = max(3, int(b.get("due_window_days") or 3))
+        if overdue_days >= due_window:
+            # Skip false alarm if a transaction matching [min, max] & due window already posted
+            already_paid = any(
+                match_transaction_to_bill(t, b, require_date_window=True)
+                for t in recent_txs
+                if abs((date.fromisoformat(t["tx_date"]) - due_dt).days) <= max(due_window, 5)
             )
+            if not already_paid:
+                anomalies.append(
+                    BillAnomaly(
+                        kind="missed_bill",
+                        merchant=b["name"],
+                        amount_cents=amt,
+                        summary=(
+                            f"{b['name']} (${amt / 100:,.2f}) was expected {overdue_days} days ago "
+                            f"({b['next_due_date']}) — verify autopay or mark paid so you don't get a late fee."
+                        ),
+                        dates=[b["next_due_date"]],
+                    )
+                )
         prev = b.get("previous_amount_cents")
         if prev is not None and amt > int(prev):
             hike = amt - int(prev)

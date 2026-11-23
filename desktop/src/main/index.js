@@ -20,6 +20,7 @@ const {
 const { BackendManager } = require("./backend-manager");
 const { buildApplicationMenu } = require("./menu");
 const { TrayController } = require("./tray");
+const { WatchFolderController } = require("./watch-folder");
 const { loadWindowState, trackWindowState } = require("./window-state");
 
 // ---------------------------------------------------------------------------
@@ -32,19 +33,28 @@ const MAX_STATEMENT_BYTES = 5 * 1024 * 1024; // 5 MB strict safety cap
 const MAX_SAVE_BYTES = 15 * 1024 * 1024;
 const PRIMARY_SHORTCUT = "CommandOrControl+Shift+Space";
 const FALLBACK_SHORTCUT = "Alt+Shift+Space";
-const VALID_TABS = new Set(["today", "credit", "goals", "impulse", "reset", "activity", "settings"]);
+const VALID_TABS = new Set([
+  "today",
+  "analytics",
+  "portfolio",
+  "credit",
+  "goals",
+  "activity",
+  "coach",
+  "settings",
+]);
 const VALID_MODES = new Set(["deterministic_only", "hybrid", "ai_standalone"]);
 
 const THEME_PALETTE = {
   dark: {
-    backgroundColor: "#070b12",
-    overlayColor: "#070b12",
-    symbolColor: "#e6edf7",
+    backgroundColor: "#080a0d",
+    overlayColor: "#080a0d",
+    symbolColor: "#eef2f6",
   },
   light: {
-    backgroundColor: "#f3f6fb",
-    overlayColor: "#f3f6fb",
-    symbolColor: "#0f172a",
+    backgroundColor: "#e9edf2",
+    overlayColor: "#e2e7ee",
+    symbolColor: "#0b1118",
   },
 };
 
@@ -53,6 +63,11 @@ const DEFAULT_PREFS = {
   launchAtLogin: false,
   theme: "dark",
   quickCaptureShortcut: PRIMARY_SHORTCUT,
+  watchFolderEnabled: false,
+  watchFolderPath: "",
+  watchFolderInstitution: "auto",
+  watchFolderSkipPending: true,
+  watchFolderSyncBalance: false,
 };
 
 const DESKTOP_ROOT = path.resolve(__dirname, "..", "..");
@@ -82,15 +97,12 @@ function resolveIconsDir() {
 function parseCliFlags(argv) {
   const args = Array.isArray(argv) ? argv : [];
   let dbPath = null;
-  let demo = false;
   let dev = false;
   let quickCapture = false;
 
   for (let i = 0; i < args.length; i += 1) {
     const arg = String(args[i] || "");
-    if (arg === "--demo") {
-      demo = true;
-    } else if (arg === "--dev") {
+    if (arg === "--dev") {
       dev = true;
     } else if (arg === "--quick-capture") {
       quickCapture = true;
@@ -103,12 +115,7 @@ function parseCliFlags(argv) {
     }
   }
 
-  const envDemo = String(process.env.CHRONOX_DEMO || "").toLowerCase();
-  if (envDemo === "1" || envDemo === "true") {
-    demo = true;
-  }
-
-  return { dbPath, demo, dev, quickCapture };
+  return { dbPath, dev, quickCapture };
 }
 
 const cliFlags = parseCliFlags(process.argv.slice(1));
@@ -137,6 +144,7 @@ let splashWindow = null;
 let hudWindow = null;
 let backendManager = null;
 let trayController = null;
+let watchFolderController = null;
 let desktopPrefs = { ...DEFAULT_PREFS };
 let activeShortcut = PRIMARY_SHORTCUT;
 let shortcutRegistered = false;
@@ -150,7 +158,9 @@ let liveSnapshot = {
   daysUntilPayday: null,
   mode: "hybrid",
   theme: "dark",
+  locked: true,
 };
+let cachedCsrfToken = "";
 
 // ---------------------------------------------------------------------------
 // Preferences & Login Autostart Persistence
@@ -170,11 +180,24 @@ function sanitizePrefs(raw) {
       ? input.quickCaptureShortcut.trim()
       : PRIMARY_SHORTCUT;
 
+  const watchInstitution = ["auto", "generic", "navy_federal", "plaid"].includes(input.watchFolderInstitution)
+    ? input.watchFolderInstitution
+    : "auto";
+  const watchPath =
+    typeof input.watchFolderPath === "string" && input.watchFolderPath.trim().length <= 512
+      ? input.watchFolderPath.trim()
+      : "";
+
   return {
     closeToTray: typeof input.closeToTray === "boolean" ? input.closeToTray : DEFAULT_PREFS.closeToTray,
     launchAtLogin: typeof input.launchAtLogin === "boolean" ? input.launchAtLogin : DEFAULT_PREFS.launchAtLogin,
     theme,
     quickCaptureShortcut: shortcut,
+    watchFolderEnabled: typeof input.watchFolderEnabled === "boolean" ? input.watchFolderEnabled : false,
+    watchFolderPath: watchPath,
+    watchFolderInstitution: watchInstitution,
+    watchFolderSkipPending: typeof input.watchFolderSkipPending === "boolean" ? input.watchFolderSkipPending : true,
+    watchFolderSyncBalance: typeof input.watchFolderSyncBalance === "boolean" ? input.watchFolderSyncBalance : false,
   };
 }
 
@@ -365,12 +388,21 @@ async function backendRequest(method, apiPath, bodyObj = null) {
   }
 
   const payload = bodyObj !== null ? JSON.stringify(bodyObj) : null;
+  const upperMethod = String(method || "GET").toUpperCase();
   const headers = {
     Accept: "application/json",
     Origin: backendManager.baseUrl,
   };
   if (cookieHeader) {
     headers.Cookie = cookieHeader;
+  }
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(upperMethod)) {
+    if (!cachedCsrfToken && !apiPath.startsWith("/api/v1/auth/status")) {
+      await fetchVaultStatus();
+    }
+    if (cachedCsrfToken) {
+      headers["X-ChronoX-CSRF"] = cachedCsrfToken;
+    }
   }
   if (payload !== null) {
     headers["Content-Type"] = "application/json";
@@ -414,14 +446,45 @@ async function backendRequest(method, apiPath, bodyObj = null) {
   });
 }
 
+async function fetchVaultStatus() {
+  try {
+    const res = await backendRequest("GET", "/api/v1/auth/status");
+    if (res.status === 200 && res.data && typeof res.data === "object") {
+      if (typeof res.data.csrf_token === "string" && res.data.csrf_token.trim()) {
+        cachedCsrfToken = res.data.csrf_token.trim();
+      }
+      const unlocked = Boolean(res.data.unlocked && res.data.authenticated);
+      return {
+        unlocked,
+        authenticated: Boolean(res.data.authenticated),
+        state: res.data.state || (unlocked ? "unlocked" : "locked"),
+        csrfToken: cachedCsrfToken,
+      };
+    }
+  } catch {
+    // Backend unavailable or locked
+  }
+  return { unlocked: false, authenticated: false, state: "locked", csrfToken: cachedCsrfToken };
+}
+
 async function fetchLiveDashboardSnapshot() {
   try {
-    const res = await backendRequest("GET", "/api/dashboard");
+    const vault = await fetchVaultStatus();
+    if (!vault.unlocked) {
+      applySnapshotUpdate({ locked: true, dailySafe: null, dailySafeCents: null });
+      return null;
+    }
+    const res = await backendRequest("GET", "/api/v1/dashboard");
+    if (res.status === 401) {
+      applySnapshotUpdate({ locked: true, dailySafe: null, dailySafeCents: null });
+      return null;
+    }
     if (res.status !== 200 || !res.data || typeof res.data !== "object") {
       return null;
     }
     const safe = res.data.safe_to_spend || {};
     const next = {
+      locked: false,
       dailySafeCents: Number.isFinite(safe.daily_safe_to_spend_cents)
         ? safe.daily_safe_to_spend_cents
         : liveSnapshot.dailySafeCents,
@@ -530,10 +593,13 @@ function applySnapshotUpdate(partial) {
   const prevTheme = desktopPrefs.theme;
 
   if (partial.dailySafe !== undefined) liveSnapshot.dailySafe = partial.dailySafe;
-  if (Number.isFinite(partial.dailySafeCents)) liveSnapshot.dailySafeCents = partial.dailySafeCents;
+  if (Number.isFinite(partial.dailySafeCents) || partial.dailySafeCents === null) {
+    liveSnapshot.dailySafeCents = partial.dailySafeCents;
+  }
   if (Number.isFinite(partial.safeToSpendCents)) liveSnapshot.safeToSpendCents = partial.safeToSpendCents;
   if (Number.isFinite(partial.daysUntilPayday)) liveSnapshot.daysUntilPayday = partial.daysUntilPayday;
   if (VALID_MODES.has(partial.mode)) liveSnapshot.mode = partial.mode;
+  if (typeof partial.locked === "boolean") liveSnapshot.locked = partial.locked;
 
   if (partial.theme === "dark" || partial.theme === "light") {
     liveSnapshot.theme = partial.theme;
@@ -912,7 +978,7 @@ function ensureHudWindow() {
   return hudWindow;
 }
 
-function toggleQuickCaptureHud() {
+async function toggleQuickCaptureHud() {
   if (!backendManager || !backendManager.baseUrl) {
     return { visible: false };
   }
@@ -920,6 +986,14 @@ function toggleQuickCaptureHud() {
   if (win.isVisible()) {
     win.hide();
     return { visible: false };
+  }
+
+  // Enforce mandatory vault lock: if locked/uninitialized, focus main unlock window instead of opening HUD
+  const vault = await fetchVaultStatus();
+  if (!vault.unlocked) {
+    applySnapshotUpdate({ locked: true, dailySafe: null, dailySafeCents: null });
+    showMainWindow();
+    return { visible: false, locked: true };
   }
 
   positionHudWindow(win);
@@ -1073,12 +1147,14 @@ function registerIpcHandlers() {
     if (merged.quickCaptureShortcut !== prevShortcut) {
       registerQuickCaptureShortcut(merged.quickCaptureShortcut);
     }
+    const watchStatus = syncWatchFolder();
 
     return {
       ok: true,
       prefs: { ...merged },
       shortcutRegistered,
       shortcut: activeShortcut,
+      watchStatus,
     };
   });
 
@@ -1138,8 +1214,8 @@ function registerIpcHandlers() {
       properties: ["openFile"],
       filters: [
         {
-          name: "Financial Statements",
-          extensions: ["csv", "tsv", "ofx", "qfx", "qif", "json"],
+          name: "Financial Statements (CSV, PDF, OFX, QIF, Plaid JSON)",
+          extensions: ["csv", "tsv", "pdf", "ofx", "qfx", "qif", "json"],
         },
         { name: "All Files", extensions: ["*"] },
       ],
@@ -1159,11 +1235,22 @@ function registerIpcHandlers() {
         };
       }
       const rawBuffer = fs.readFileSync(filePath);
+      const isPdf = filePath.toLowerCase().endsWith(".pdf") || rawBuffer.subarray(0, 5).toString("latin1") === "%PDF-";
+      if (isPdf) {
+        return {
+          canceled: false,
+          filename: path.basename(filePath),
+          contentBase64: rawBuffer.toString("base64"),
+          isBinary: true,
+          sizeBytes: stat.size,
+        };
+      }
       const content = rawBuffer.toString("utf8").replace(/^\uFEFF/, "");
       return {
         canceled: false,
         filename: path.basename(filePath),
         content,
+        isBinary: false,
         sizeBytes: stat.size,
       };
     } catch (err) {
@@ -1218,6 +1305,61 @@ function registerIpcHandlers() {
     } catch (err) {
       return { canceled: false, error: `Could not save file: ${err.message}` };
     }
+  });
+
+  // --- Optional Local Auto-Import Watch Folder (Zero-3rd-Party Sync) ---
+  ipcMain.handle("watch:getStatus", (event) => {
+    assertMainSender(event);
+    return watchFolderController
+      ? watchFolderController.getStatus()
+      : {
+          enabled: desktopPrefs.watchFolderEnabled,
+          watching: false,
+          folderPath: desktopPrefs.watchFolderPath,
+          institution: desktopPrefs.watchFolderInstitution,
+          skipPending: desktopPrefs.watchFolderSkipPending,
+          syncBalance: desktopPrefs.watchFolderSyncBalance,
+          importedFilesCount: 0,
+          lastImportSummary: null,
+          lastError: null,
+        };
+  });
+
+  ipcMain.handle("watch:pickFolder", async (event) => {
+    assertMainSender(event);
+    if (!mainWindow || mainWindow.isDestroyed()) return { canceled: true };
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: "Choose Local Statement Drop Folder (e.g., Navy Federal / Plaid Exports)",
+      defaultPath: desktopPrefs.watchFolderPath || app.getPath("downloads"),
+      properties: ["openDirectory", "createDirectory"],
+    });
+    if (result.canceled || !result.filePaths || result.filePaths.length === 0) {
+      return { canceled: true };
+    }
+    const chosen = result.filePaths[0];
+    const merged = savePrefs({ ...desktopPrefs, watchFolderPath: chosen });
+    const status = syncWatchFolder();
+    return { canceled: false, folderPath: chosen, prefs: { ...merged }, status };
+  });
+
+  ipcMain.handle("watch:scanNow", async (event) => {
+    assertMainSender(event);
+    if (!watchFolderController) {
+      syncWatchFolder();
+    }
+    if (!watchFolderController) {
+      return { ok: false, processed: 0, error: "Watch folder is unavailable." };
+    }
+    return watchFolderController.scanNow();
+  });
+
+  ipcMain.handle("watch:openFolder", async (event) => {
+    assertMainSender(event);
+    if (!desktopPrefs.watchFolderPath) {
+      return { ok: false, error: "No watch folder configured yet." };
+    }
+    const errStr = await shell.openPath(desktopPrefs.watchFolderPath);
+    return { ok: !errStr, path: desktopPrefs.watchFolderPath, ...(errStr ? { error: errStr } : {}) };
   });
 
   // --- Live Tray Snapshot Sync ---
@@ -1278,12 +1420,14 @@ function registerIpcHandlers() {
     }
 
     try {
-      const res = await backendRequest("POST", "/api/quick-add", { text });
+      const res = await backendRequest("POST", "/api/v1/quick-add", { text });
       if (res.status === 401) {
+        applySnapshotUpdate({ locked: true, dailySafe: null, dailySafeCents: null });
+        showMainWindow();
         return {
           ok: false,
           locked: true,
-          error: "ChronoX is locked — unlock the main window first.",
+          error: "ChronoX Vault is locked — unlock the main window first.",
         };
       }
       if (res.status < 200 || res.status >= 300) {
@@ -1344,6 +1488,74 @@ function resolveDbPath() {
   return path.join(app.getPath("userData"), "finance.sqlite3");
 }
 
+function ensureWatchFolderController() {
+  if (!watchFolderController) {
+    watchFolderController = new WatchFolderController({
+      getBackendUrl: () => (backendManager && backendManager.baseUrl ? backendManager.baseUrl : ""),
+      getCookieHeader: async (url) => {
+        try {
+          const cookies = await session.defaultSession.cookies.get({ url });
+          return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+        } catch {
+          return "";
+        }
+      },
+      getCsrfToken: async () => {
+        const st = await fetchVaultStatus();
+        return st.csrfToken || "";
+      },
+      onImported: async (summary) => {
+        const snap = await fetchLiveDashboardSnapshot();
+        const instLabel =
+          summary.detectedInstitution === "navy_federal"
+            ? "Navy Federal"
+            : summary.detectedInstitution === "plaid"
+              ? "Plaid"
+              : summary.formatDetected;
+        const msg =
+          summary.importedCount > 0
+            ? `Auto-imported ${summary.importedCount} ${instLabel} tx from ${summary.filename}`
+            : `Checked ${summary.filename} (${summary.duplicateCount} already imported)`;
+        sendToMain("chronox:refresh", { source: "watch-folder", message: msg });
+        if (Notification.isSupported() && summary.importedCount > 0) {
+          const safeStr =
+            snap && Number.isFinite(snap.dailySafeCents)
+              ? ` · Safe Today: $${(snap.dailySafeCents / 100).toFixed(2)}`
+              : "";
+          try {
+            const n = new Notification({
+              title: `${instLabel} Statement Imported`,
+              body: `Imported ${summary.importedCount} transaction(s) from ${summary.filename}${safeStr}`,
+              icon: getAppIcon(),
+            });
+            n.on("click", () => showMainWindow());
+            n.show();
+          } catch {
+            // Ignore desktop notification daemon absence on headless Linux.
+          }
+        }
+      },
+      onLog: (_level, text) => {
+        if (backendManager && typeof backendManager._pushLog === "function") {
+          backendManager._pushLog("stdout", `[watch-folder] ${text}`);
+        }
+      },
+    });
+  }
+  return watchFolderController;
+}
+
+function syncWatchFolder() {
+  const ctrl = ensureWatchFolderController();
+  return ctrl.configure({
+    enabled: desktopPrefs.watchFolderEnabled,
+    folderPath: desktopPrefs.watchFolderPath,
+    institution: desktopPrefs.watchFolderInstitution,
+    skipPending: desktopPrefs.watchFolderSkipPending,
+    syncBalance: desktopPrefs.watchFolderSyncBalance,
+  });
+}
+
 function initTrayAndShortcuts() {
   if (!trayController) {
     trayController = new TrayController({
@@ -1353,9 +1565,12 @@ function initTrayAndShortcuts() {
       callbacks: {
         onOpenApp: () => showMainWindow(),
         onToggleQuickCapture: () => toggleQuickCaptureHud(),
-        onTriggerSync: () => {
+        onTriggerSync: async () => {
           showMainWindow();
-          sendToMain("chronox:trigger-sync");
+          const vault = await fetchVaultStatus();
+          if (vault.unlocked) {
+            sendToMain("chronox:trigger-sync");
+          }
         },
         onSetMode: (mode) => {
           if (!VALID_MODES.has(mode)) return;
@@ -1380,6 +1595,7 @@ function initTrayAndShortcuts() {
 
   registerQuickCaptureShortcut(desktopPrefs.quickCaptureShortcut);
   refreshApplicationMenu();
+  syncWatchFolder();
 }
 
 async function bootBackendAndMainWindow() {
@@ -1387,7 +1603,6 @@ async function bootBackendAndMainWindow() {
     backendManager = new BackendManager({
       app,
       dbPath: resolveDbPath(),
-      demo: cliFlags.demo,
       repoRoot: REPO_ROOT,
       desktopRoot: DESKTOP_ROOT,
     });
@@ -1480,6 +1695,10 @@ if (gotSingleInstanceLock) {
     if (trayController) {
       trayController.destroy();
       trayController = null;
+    }
+    if (watchFolderController) {
+      watchFolderController.stop();
+      watchFolderController = null;
     }
 
     if (backendManager && backendManager.pid && !isCleaningUpBeforeQuit) {

@@ -272,13 +272,13 @@
     if (!backendUrl) {
       return { ok: false, error: "Desktop bridge unavailable in standalone preview." };
     }
-    const resp = await fetch(`${backendUrl}/api/quick-add`, {
+    const resp = await fetch(`${backendUrl}/api/v1/quick-add`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
     });
     if (resp.status === 401) {
-      return { ok: false, locked: true, error: "ChronoX is locked — unlock the main window first." };
+      return { ok: false, locked: true, error: "ChronoX Vault is locked — unlock the main window first." };
     }
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {
@@ -289,7 +289,7 @@
     let safeToSpendCents = null;
     let daysUntilPayday = null;
     try {
-      const dashResp = await fetch(`${backendUrl}/api/dashboard`);
+      const dashResp = await fetch(`${backendUrl}/api/v1/dashboard`);
       if (dashResp.ok) {
         const dash = await dashResp.json();
         if (dash && dash.safe_to_spend) {

@@ -92,12 +92,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=default_port, help="Bind port (default: 8742)")
     parser.add_argument("--db", default=default_db, help="Path to SQLite database file")
     parser.add_argument(
-        "--demo",
-        action="store_true",
-        default=_env_truthy("CHRONOX_DEMO"),
-        help="Preload 90-day ADHD demo workspace when database is empty",
-    )
-    parser.add_argument(
         "--web-dir",
         default=None,
         help="Explicit path to chronox_finance/web static assets",
@@ -110,7 +104,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--provider",
-        choices=["auto", "opencode_go", "gemini"],
+        choices=["auto", "opencode_go", "gemini", "openai_codex", "chat_wrapper", "codex_cli"],
         default=None,
         help="Optional AI provider override",
     )
@@ -167,10 +161,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ai_provider=AIProvider(args.provider) if args.provider else None,
             )
         )
-
-    if args.demo and not svc.storage.list_transactions(limit=1):
-        svc.load_demo_workspace()
-        print("[chronox-backend] Loaded 90-day ADHD demo workspace.", flush=True)
 
     app = api_module.create_app(db_path=db_path, service=svc)
 

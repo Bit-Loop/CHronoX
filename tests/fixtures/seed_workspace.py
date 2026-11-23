@@ -1,13 +1,7 @@
 """
-Realistic 90-day ADHD Personal Finance Demo Seeder.
+Test-only realistic 90-day workspace seeder for ChronoX Finance unit & integration tests.
 
-Lets users immediately experience every ChronoX Finance capability:
-- Self-updating auto-budgeting across 5 ADHD-friendly Jars
-- Automatic recurring bill & payday detection
-- Silent subscription price hike detection (Streaming service $15.49 -> $22.99)
-- Matured + cooling Impulse Vault items
-- Uncategorized transaction ready for 1-click Weekly Money Reset triage
-- ChronoX Safe-to-Invest trading guardrail
+Strictly isolated under `tests/fixtures/` — NEVER exposed to production UI, API, or CLI.
 """
 
 from __future__ import annotations
@@ -19,12 +13,12 @@ if TYPE_CHECKING:
     from chronox_finance.service import FinanceService
 
 
-def seed_demo_data(service: "FinanceService", today: date | None = None) -> dict:
-    """Populate realistic 90-day sample financial data and trigger self-updating sync."""
+def seed_workspace(service: "FinanceService", today: date | None = None) -> dict:
+    """Populate realistic 90-day test financial data and trigger self-updating sync."""
     ref = today or date.today()
     service.storage.clear_all_financial_data()
 
-    # Create realistic accounts
+    # Create realistic test accounts
     checking = service.storage.create_account(
         name="Main Checking",
         account_type="checking",
@@ -42,7 +36,7 @@ def seed_demo_data(service: "FinanceService", today: date | None = None) -> dict
     credit = service.storage.create_account(
         name="Everyday Rewards Card",
         account_type="credit",
-        balance_cents=-24_800,  # $248.00 current balance (auto-reserved in Safe-to-Spend!)
+        balance_cents=-24_800,  # $248.00 current balance (auto-reserved in Safe-to-Spend)
         institution="Chase",
         is_liquid=False,
     )
@@ -57,8 +51,14 @@ def seed_demo_data(service: "FinanceService", today: date | None = None) -> dict
     cid = int(checking["id"])
     ccid = int(credit["id"])
 
-    # Helper to insert historical transactions without perturbing the starting ending balances
-    def _hist(days_ago: int, tx_type: str, cents: int, merchant: str, memo: str = "", acct_id: int = cid):
+    def _hist(
+        days_ago: int,
+        tx_type: str,
+        cents: int,
+        merchant: str,
+        memo: str = "",
+        acct_id: int = cid,
+    ):
         tx_dt = (ref - timedelta(days=days_ago)).isoformat()
         service.add_transaction_raw(
             account_id=acct_id,
@@ -67,41 +67,44 @@ def seed_demo_data(service: "FinanceService", today: date | None = None) -> dict
             merchant=merchant,
             memo=memo,
             tx_date=tx_dt,
-            source="demo_seed",
+            source="test_fixture",
             adjust_balance=False,
             run_auto_sync=False,
         )
 
     # Bi-weekly paychecks over the past 84 days
     for k in range(6):
-        _hist(days_ago=6 + k * 14, tx_type="income", cents=245_000, merchant="Acme Tech Payroll Direct Deposit")
+        _hist(
+            days_ago=6 + k * 14,
+            tx_type="income",
+            cents=245_000,
+            merchant="Acme Tech Payroll Direct Deposit",
+        )
 
-    # Recurring monthly bills over 3 months — timed so several land inside the 14-day radar
-    # and before next payday (8d out), demonstrating fuzzy merchant matching, Safe-to-Spend shielding & price-hike alerts!
+    # Recurring monthly bills over 3 months
     for m_offset in (62, 32, 2):
         _hist(days_ago=m_offset, tx_type="expense", cents=145_000, merchant="Oakridge Apartments Rent")
-    # Mutating utility descriptors across cycles to showcase fuzzy merchant clustering
     _hist(days_ago=87, tx_type="expense", cents=11_400, merchant="CITY ELECTRIC UTIL #101")
     _hist(days_ago=57, tx_type="expense", cents=11_850, merchant="CITY ELECTRIC UTILITY PAY")
     _hist(days_ago=27, tx_type="expense", cents=11_400, merchant="City Electric Utility")
-    for m_offset in (83, 53, 23):  # Due in ~7 days (before payday!)
+    for m_offset in (83, 53, 23):
         _hist(days_ago=m_offset, tx_type="expense", cents=7_500, merchant="Google Fiber Internet")
-    for m_offset in (79, 49, 19):  # Due in ~11 days (inside 14-day radar!)
+    for m_offset in (79, 49, 19):
         _hist(days_ago=m_offset, tx_type="expense", cents=11_900, merchant="Progressive Auto Insurance")
 
-    # Subscriptions — including a silent price hike on Netflix ($15.49 -> $22.99) due in ~5 days!
+    # Subscriptions — including a silent price hike on Netflix ($15.49 -> $22.99)
     _hist(days_ago=85, tx_type="expense", cents=1_549, merchant="NETFLIX.COM*8821", acct_id=ccid)
     _hist(days_ago=55, tx_type="expense", cents=1_549, merchant="NETFLIX INC CA", acct_id=ccid)
     _hist(days_ago=25, tx_type="expense", cents=2_299, merchant="Netflix Subscription", acct_id=ccid)
 
     for m_offset in (64, 34, 4):
         _hist(days_ago=m_offset, tx_type="expense", cents=1_199, merchant="Spotify Premium", acct_id=ccid)
-    for m_offset in (77, 47, 17):  # Due in ~13 days (inside 14-day radar!)
+    for m_offset in (77, 47, 17):
         _hist(days_ago=m_offset, tx_type="expense", cents=4_999, merchant="Equinox Gym Membership", acct_id=ccid)
     for m_offset in (61, 31, 1):
         _hist(days_ago=m_offset, tx_type="expense", cents=1_000, merchant="OpenCode Go Subscription", acct_id=ccid)
 
-    # Daily living (groceries, gas, pharmacy) across trailing months + current cycle
+    # Daily living
     for d, amt, merch in [
         (55, 13_420, "Trader Joe's"),
         (42, 11_850, "Trader Joe's"),
@@ -114,7 +117,7 @@ def seed_demo_data(service: "FinanceService", today: date | None = None) -> dict
     ]:
         _hist(days_ago=d, tx_type="expense", cents=amt, merchant=merch, acct_id=ccid)
 
-    # Guilt-Free Fun (coffee, dining, hobbies)
+    # Guilt-Free Fun
     for d, amt, merch in [
         (48, 3_650, "DoorDash Thai Kitchen"),
         (33, 6_499, "Steam Games"),
@@ -126,10 +129,17 @@ def seed_demo_data(service: "FinanceService", today: date | None = None) -> dict
     ]:
         _hist(days_ago=d, tx_type="expense", cents=amt, merchant=merch, acct_id=ccid)
 
-    # One low-confidence mystery merchant for the Weekly Reset 1-click triage demo!
-    _hist(days_ago=2, tx_type="expense", cents=3_450, merchant="SQ *BRAINWAVE STUDIO #882", memo="Card tap", acct_id=ccid)
+    # Low-confidence merchant for Weekly Reset triage test
+    _hist(
+        days_ago=2,
+        tx_type="expense",
+        cents=3_450,
+        merchant="SQ *BRAINWAVE STUDIO #882",
+        memo="Card tap",
+        acct_id=ccid,
+    )
 
-    # Impulse Cooling-Off Vault items (one matured ready for dopamine win, one actively cooling)
+    # Impulse Cooling-Off Vault items
     now_utc = datetime.now(timezone.utc).replace(microsecond=0)
     service.storage.create_impulse(
         item_name="Custom Mechanical Keyboard Kit",
@@ -150,11 +160,11 @@ def seed_demo_data(service: "FinanceService", today: date | None = None) -> dict
         unlocks_at=(now_utc + timedelta(hours=38)).isoformat().replace("+00:00", "Z"),
     )
 
-    # Seed realistic ADHD profile settings + initial progress
+    # Profile settings + ADHD progress
     service.storage.update_settings(
         {
-            "hourly_wage_cents": 3_400,  # $34/hr
-            "emergency_buffer_cents": 75_000,  # $750.00 safety shield
+            "hourly_wage_cents": 3_400,
+            "emergency_buffer_cents": 75_000,
             "default_cooling_hours": 48,
             "payday_cadence_days": 14,
             "next_payday_date": (ref + timedelta(days=8)).isoformat(),
@@ -177,19 +187,19 @@ def seed_demo_data(service: "FinanceService", today: date | None = None) -> dict
         }
     )
 
-    # Seed realistic Credit Lines & Debts (showcases AZEO, >29% card cliff, 0% promo cliff, autopay gap & AAoA!)
+    # Credit Lines & Debts
     service.storage.create_credit_line(
         {
             "name": "Chase Sapphire Preferred",
             "issuer": "Chase",
             "kind": "credit_card",
-            "balance_cents": 24_800,         # $248.00 / $6,000 = 4.1% (AZEO primary card!)
+            "balance_cents": 24_800,
             "credit_limit_cents": 600_000,
             "apr_bps": 2149,
             "min_payment_cents": 3_500,
             "statement_closing_day": 18,
             "payment_due_day": 13,
-            "opened_date": "2020-04-15",     # Oldest card — AAoA anchor!
+            "opened_date": "2020-04-15",
             "has_grace_period": True,
             "autopay_mode": "statement",
             "rewards_note": "2x dining/travel + purchase protection",
@@ -201,15 +211,15 @@ def seed_demo_data(service: "FinanceService", today: date | None = None) -> dict
             "name": "Amex Blue Cash Everyday",
             "issuer": "American Express",
             "kind": "credit_card",
-            "balance_cents": 168_000,        # $1,680.00 / $4,000 = 42% per-card drag!
+            "balance_cents": 168_000,
             "credit_limit_cents": 400_000,
             "apr_bps": 2699,
             "min_payment_cents": 5_200,
             "statement_closing_day": 8,
             "payment_due_day": 3,
             "opened_date": "2022-09-01",
-            "has_grace_period": False,       # Grace period lost — triggers advisor warning!
-            "autopay_mode": "none",          # Autopay OFF — triggers ADHD late-fee shield!
+            "has_grace_period": False,
+            "autopay_mode": "none",
             "rewards_note": "3% groceries/gas",
         }
     )
@@ -218,7 +228,7 @@ def seed_demo_data(service: "FinanceService", today: date | None = None) -> dict
             "name": "Discover It 0% Promo",
             "issuer": "Discover",
             "kind": "credit_card",
-            "balance_cents": 62_000,         # $620.00 promo balance expiring in 75d!
+            "balance_cents": 62_000,
             "credit_limit_cents": 350_000,
             "apr_bps": 2499,
             "promo_apr_bps": 0,
@@ -237,7 +247,7 @@ def seed_demo_data(service: "FinanceService", today: date | None = None) -> dict
             "name": "Federal Student Loan B",
             "issuer": "Nelnet",
             "kind": "student_loan",
-            "balance_cents": 420_000,        # $4,200.00 installment loan at 5.5% APR
+            "balance_cents": 420_000,
             "credit_limit_cents": 0,
             "apr_bps": 550,
             "min_payment_cents": 9_500,
@@ -250,7 +260,7 @@ def seed_demo_data(service: "FinanceService", today: date | None = None) -> dict
         }
     )
 
-    # Seed starter Purchase & Savings Goals
+    # Starter Goals
     service.storage.create_goal(
         {
             "name": "$1,000 Workstation Gadget Upgrade",
@@ -275,10 +285,13 @@ def seed_demo_data(service: "FinanceService", today: date | None = None) -> dict
         }
     )
 
-    # Run full self-updating sync (detects recurring bills, payday, and adaptive jar targets)
-    sync_summary = service.run_self_updating_sync(reason="Demo workspace initialized")
+    sync_summary = service.run_self_updating_sync(reason="Test workspace seeded")
     return {
         "accounts_created": 4,
         "savings_id": savings["id"],
         "sync": sync_summary,
     }
+
+
+# Test-only backward-compatible alias
+seed_demo_data = seed_workspace

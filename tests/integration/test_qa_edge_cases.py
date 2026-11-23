@@ -15,17 +15,29 @@ from chronox_finance import get_safe_trading_capital
 from chronox_finance.api import create_app
 from chronox_finance.cli import run_cli
 from chronox_finance.models import ImpulseCreate, ImpulseDecision
-from chronox_finance.security import SlidingWindowRateLimiter, validate_external_api_url
+from chronox_finance.security import CSRF_HEADER_NAME, SlidingWindowRateLimiter, validate_external_api_url
 from chronox_finance.service import FinanceService
+from tests.fixtures.seed_workspace import seed_workspace
+
+EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F300-\U0001F9FF"
+    "\U0001FA00-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0000FE0F"
+    "]"
+)
 
 
-def _make_client(tmp_path, monkeypatch=None):
+def _make_client(tmp_path, monkeypatch=None, *, enforce_vault_lock: bool = False):
     if monkeypatch is not None:
         monkeypatch.delenv("OPENCODE_GO_API_KEY", raising=False)
         monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     db_file = str(tmp_path / "qa_finance.sqlite3")
-    svc = FinanceService(db_path=db_file, secret_store_path=tmp_path / "secrets.json")
-    app = create_app(db_path=db_file, service=svc)
+    svc = FinanceService(db_path=db_file, secret_store_path=tmp_path / "secrets.enc")
+    app = create_app(db_path=db_file, service=svc, enforce_vault_lock=enforce_vault_lock)
     return TestClient(app), svc, db_file
 
 
@@ -33,26 +45,49 @@ class TestFrontendDOMAndSecurityContract:
     def test_every_js_dom_id_exists_in_index_html_and_no_xss_sinks(self):
         web_dir = Path("chronox_finance/web")
         html = (web_dir / "index.html").read_text(encoding="utf-8")
-        js = (web_dir / "app.js").read_text(encoding="utf-8")
+        css = (web_dir / "styles.css").read_text(encoding="utf-8")
+        js_files = [web_dir / "app.js"] + sorted((web_dir / "js").glob("*.js"))
+        assert len(js_files) >= 7, f"Expected app.js + 6+ web/js modules, found {[p.name for p in js_files]}"
 
         html_ids = set(re.findall(r'\bid="([^"]+)"', html))
-        js_ids = set(re.findall(r'\$\("([^"]+)"\)', js))
-        missing_ids = sorted(js_ids - html_ids)
-        assert missing_ids == [], f"app.js references missing HTML IDs: {missing_ids}"
+        dynamic_js_ids = set()
+        for js_path in js_files:
+            txt = js_path.read_text(encoding="utf-8")
+            dynamic_js_ids.update(re.findall(r'\bid\s*:\s*"([^"]+)"', txt))
+            dynamic_js_ids.update(re.findall(r'\.id\s*=\s*"([^"]+)"', txt))
 
-        # Strict CSP & XSS hygiene: zero inline event attributes, zero innerHTML assignments
-        assert not re.search(r"\bon(?:click|submit|change|input|load)\s*=", html, re.I)
-        assert "innerHTML" not in js
-        assert "outerHTML" not in js
-        assert "document.write" not in js
+        valid_ids = html_ids | dynamic_js_ids
+        for js_path in js_files:
+            js = js_path.read_text(encoding="utf-8")
+            js_ids = set(re.findall(r'\$\("([^"]+)"\)', js))
+            missing_ids = sorted(js_ids - valid_ids)
+            assert missing_ids == [], f"{js_path.name} references missing HTML IDs: {missing_ids}"
+
+            # Strict XSS hygiene across app.js and ALL web/js/*.js modules
+            assert "innerHTML" not in js, f"innerHTML found in {js_path.name}"
+            assert "outerHTML" not in js, f"outerHTML found in {js_path.name}"
+            assert "insertAdjacentHTML" not in js, f"insertAdjacentHTML found in {js_path.name}"
+            assert "document.write" not in js, f"document.write found in {js_path.name}"
+            assert not re.search(r"\beval\s*\(", js), f"eval() found in {js_path.name}"
+            assert not re.search(r"\bnew\s+Function\b", js), f"new Function found in {js_path.name}"
+            assert not EMOJI_PATTERN.search(js), f"Raw Unicode emoji found in {js_path.name}"
+
+        # Strict CSP, zero inline on* handlers, zero external CDNs, zero raw emojis in HTML & CSS
+        assert not re.search(r"\bon[a-z]+\s*=", html, re.I)
+        cdn_pat = re.compile(r"https?://(?:cdn\.|fonts\.googleapis|fonts\.gstatic|unpkg\.com|cdnjs\.cloudflare)", re.I)
+        assert not cdn_pat.search(html), "External CDN found in index.html"
+        assert not cdn_pat.search(css), "External CDN found in styles.css"
+        assert not EMOJI_PATTERN.search(html), "Raw Unicode emoji found in index.html"
+        assert not EMOJI_PATTERN.search(css), "Raw Unicode emoji found in styles.css"
 
 
-class TestMonthEndRolloverAndDemoRadar:
-    def test_demo_workspace_populates_14_day_radar_and_unpaid_bills_shield(self, tmp_path, monkeypatch):
+class TestMonthEndRolloverAndSeededRadar:
+    def test_seeded_workspace_populates_14_day_radar_and_unpaid_bills_shield(self, tmp_path, monkeypatch):
         client, svc, db_file = _make_client(tmp_path, monkeypatch)
         try:
-            assert client.post("/api/demo/load").status_code == 200
-            dash = client.get("/api/dashboard").json()
+            assert client.post("/api/demo/load").status_code == 404
+            seed_workspace(svc)
+            dash = client.get("/api/v1/dashboard").json()
             # Unpaid bills due before next payday MUST be shielded (> 0)
             assert dash["safe_to_spend"]["unpaid_bills_until_payday_cents"] > 0
             # Multiple bills must appear in 14-day radar including a price hike
@@ -97,7 +132,7 @@ class TestImpulseSweepAndAtomicBackupSecurity:
     def test_impulse_skip_sweeps_savings_and_buy_logs_transaction_once(self, tmp_path, monkeypatch):
         _client, svc, _ = _make_client(tmp_path, monkeypatch)
         try:
-            svc.load_demo_workspace()
+            seed_workspace(svc)
             imp1 = svc.create_impulse(ImpulseCreate(item_name="RGB Desk Mat", price_cents=6_000, cooling_hours=24))
             res_skip = svc.decide_impulse(imp1.id, ImpulseDecision(decision="skip", sweep_savings_pct=50))
             assert res_skip["status"] == "skipped"
@@ -117,7 +152,7 @@ class TestImpulseSweepAndAtomicBackupSecurity:
     def test_backup_restore_rejects_corrupt_or_ssrf_without_wiping_existing_data(self, tmp_path, monkeypatch):
         client, svc, _ = _make_client(tmp_path, monkeypatch)
         try:
-            svc.load_demo_workspace()
+            seed_workspace(svc)
             orig_tx_count = len(svc.storage.list_transactions(limit=500))
             assert orig_tx_count > 10
 
@@ -239,26 +274,63 @@ class TestFullAPICRUDAndCLI:
             client.patch("/api/settings", json={"clear_opencode_key": True})
             assert client.get("/api/settings").json()["opencode_key_configured"] is False
 
-            # Auth setup -> disable with wrong passcode fails -> right passcode disables
-            assert client.post("/api/auth/setup", json={"passcode": "my-passcode-1"}).status_code == 200
-            assert client.post("/api/auth/disable", json={"passcode": "wrong-pass"}).status_code == 401
-            assert client.post("/api/auth/disable", json={"passcode": "my-passcode-1"}).status_code == 200
-            assert client.get("/api/auth/status").json()["auth_enabled"] is False
+            # Auth disable is intentionally purged (404); mandatory Vault Lock cannot be disabled
+            assert client.post("/api/v1/auth/disable", json={"password": "any-pass"}).status_code == 404
+            assert client.post("/api/auth/disable", json={"password": "any-pass"}).status_code == 404
+        finally:
+            svc.close()
+
+    def test_mandatory_vault_lock_enforces_401_and_csrf_403(self, tmp_path, monkeypatch):
+        client, svc, _ = _make_client(tmp_path, monkeypatch, enforce_vault_lock=True)
+        try:
+            # Before setup -> fail closed 401 needs_setup
+            r0 = client.get("/api/v1/dashboard")
+            assert r0.status_code == 401 and r0.json()["state"] == "needs_setup"
+
+            # Setup -> unlocked + csrf_token
+            r_setup = client.post("/api/v1/auth/setup", json={"password": "my-vault-passcode-1"})
+            assert r_setup.status_code == 200
+            csrf = r_setup.json()["csrf_token"]
+            assert client.get("/api/v1/dashboard").status_code == 200
+
+            # Missing CSRF on mutating route -> 403
+            assert client.post("/api/v1/auth/logout").status_code == 403
+
+            # Logout with CSRF -> locked 401
+            assert client.post("/api/v1/auth/logout", headers={CSRF_HEADER_NAME: csrf}).status_code == 200
+            r_lock = client.get("/api/v1/dashboard")
+            assert r_lock.status_code == 401 and r_lock.json()["state"] == "locked"
+
+            # Re-login with password -> unlocked 200
+            r_in = client.post("/api/v1/auth/login", json={"password": "my-vault-passcode-1"})
+            assert r_in.status_code == 200
+            assert client.get("/api/v1/dashboard").status_code == 200
         finally:
             svc.close()
 
     def test_cli_commands_end_to_end(self, tmp_path, monkeypatch, capsys):
         monkeypatch.delenv("OPENCODE_GO_API_KEY", raising=False)
         monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         db_file = str(tmp_path / "cli_qa.sqlite3")
 
-        assert run_cli(["--db", db_file, "demo"]) == 0
+        svc = FinanceService(db_path=db_file, secret_store_path=tmp_path / "secrets.enc")
+        try:
+            seed_workspace(svc)
+        finally:
+            svc.close()
+
         assert run_cli(["--db", db_file, "status"]) == 0
+        assert run_cli(["--db", db_file, "portfolio"]) == 0
+        assert run_cli(["--db", db_file, "usage", "--days", "30"]) == 0
         assert run_cli(["--db", db_file, "add", "coffee", "5.75"]) == 0
         assert run_cli(["--db", db_file, "ask", "Can I afford a $60 dinner?"]) == 0
         assert run_cli(["--db", db_file, "suggest"]) == 0
 
         out = capsys.readouterr().out
         assert "SAFE TO SPEND TODAY" in out
+        assert "CHRONOX PORTFOLIO" in out
+        assert "CHRONOX AI USAGE" in out
         assert "Logged $5.75" in out
         assert "Verified Local Engine" in out

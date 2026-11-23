@@ -527,9 +527,9 @@ class TestDeterministicQuantCoachAndQA:
     def _build_demo_state(self):
         svc = FinanceService(db_path=":memory:")
         ref = date(2026, 11, 20)
-        from chronox_finance.demo_data import seed_demo_data
+        from tests.fixtures.seed_workspace import seed_workspace
 
-        seed_demo_data(svc, today=ref)
+        seed_workspace(svc, today=ref)
         budget = svc._compute_budget(today=ref)
         credit_report = svc.get_credit_report(today=ref)
         goals = svc.list_goals(include_completed=False)

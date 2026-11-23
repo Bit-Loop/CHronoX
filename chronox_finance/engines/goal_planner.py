@@ -38,6 +38,26 @@ def _fmt(cents: int) -> str:
     return f"${cents / 100:,.2f}"
 
 
+def _build_velocity_warning(credit_report: CreditOptimizationReport) -> Optional[str]:
+    """Return a calm warning against opening new promo/store cards when >=4/24 or inquiry velocity is high."""
+    ftf = credit_report.five_twenty_four
+    if ftf is None:
+        return None
+    parts: List[str] = []
+    if ftf.count_5_24 >= 4:
+        drop = f" (next slot drops {ftf.next_slot_drop_date})" if ftf.next_slot_drop_date else ""
+        parts.append(f"you are at {ftf.count_5_24}/24 on Chase 5/24{drop}")
+    if ftf.inquiries_6m >= 3 or ftf.inquiries_12m >= 5:
+        parts.append(f"recent inquiry velocity is elevated ({ftf.inquiries_6m} in 6m / {ftf.inquiries_12m} in 12m)")
+    if not parts:
+        return None
+    joined = " and ".join(parts)
+    return (
+        f"New-card promo guard: {joined}. Skip opening a new 0% promo or store card for this purchase — "
+        f"use an existing grace-period card or the Cash Sinking Fund instead."
+    )
+
+
 class GoalOptimizerEngine:
     """Deterministic multi-constraint goal & purchase planner."""
 
@@ -255,6 +275,7 @@ class GoalOptimizerEngine:
         credit_report: CreditOptimizationReport,
         ref: date,
     ) -> GoalPlanOption:
+        velocity_warning = _build_velocity_warning(credit_report)
         cards = [
             c for c in credit_report.credit_lines
             if c.kind == DebtKind.CREDIT_CARD and c.credit_limit_cents > 0
@@ -265,6 +286,14 @@ class GoalOptimizerEngine:
         ]
 
         if not grace_cards:
+            blocked_steps = [
+                "Do NOT put this purchase on a card without an active grace period (interest starts Day 1!).",
+                f"Build the {_fmt(remaining)} cash sinking fund first, or reduce card balances below 29% utilization.",
+            ]
+            blocked_note = "Warning: putting this on credit now would spike utilization or trigger immediate APR charges."
+            if velocity_warning:
+                blocked_steps.append(velocity_warning)
+                blocked_note = f"{blocked_note} {velocity_warning}"
             return GoalPlanOption(
                 path_id="credit_optimized_buy",
                 title="Credit Card Purchase (Blocked by Credit Optimizer)",
@@ -279,11 +308,8 @@ class GoalOptimizerEngine:
                     "No credit card currently has both an active grace period AND enough safe credit limit headroom "
                     "for this purchase. Use Cash Sinking Fund (Path A) or Balanced Split (Path C) first."
                 ),
-                steps=[
-                    "Do NOT put this purchase on a card without an active grace period (interest starts Day 1!).",
-                    f"Build the {_fmt(remaining)} cash sinking fund first, or reduce card balances below 29% utilization.",
-                ],
-                credit_impact_note="Warning: putting this on credit now would spike utilization or trigger immediate APR charges.",
+                steps=blocked_steps,
+                credit_impact_note=blocked_note,
             )
 
         # Pick card yielding lowest post-purchase per-card utilization
@@ -323,6 +349,15 @@ class GoalOptimizerEngine:
             steps.append(
                 f"Utilization stays at {post_card_util:.1f}% on {best.name} ({post_agg_util:.1f}% aggregate) — right inside FICO's optimal <8.9% tier!"
             )
+        if velocity_warning:
+            steps.append(velocity_warning)
+
+        impact_note = (
+            f"Unbuffered util would hit {post_card_util:.1f}% card / {post_agg_util:.1f}% agg; "
+            f"pre-paying {_fmt(pre_close_paydown)} before statement close locks reported util <= 8.9% (AZEO-compliant)."
+        )
+        if velocity_warning:
+            impact_note = f"{impact_note} {velocity_warning}"
 
         return GoalPlanOption(
             path_id="credit_optimized_buy",
@@ -339,8 +374,5 @@ class GoalOptimizerEngine:
                 f"back it 100% with cash, buy after statement close, and pre-pay {_fmt(pre_close_paydown)} before closing day."
             ),
             steps=steps,
-            credit_impact_note=(
-                f"Unbuffered util would hit {post_card_util:.1f}% card / {post_agg_util:.1f}% agg; "
-                f"pre-paying {_fmt(pre_close_paydown)} before statement close locks reported util <= 8.9% (AZEO-compliant)."
-            ),
+            credit_impact_note=impact_note,
         )

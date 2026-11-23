@@ -1,30 +1,87 @@
 """
 ChronoX Finance Service Facade.
 
-Coordinates storage, self-updating auto-budgeting loop, recurring bill detection,
-ADHD behavioral mechanics, universal CSV import/export, local passcode security,
-and the grounded OpenCode Go AI Financial Coach.
+Coordinates envelope-encrypted secret vault (`LocalSecretStore` + `LocalVaultAuth`),
+SQLite WAL storage, 730-day self-updating auto-budgeting loop, Firefly III-inspired
+automation rules & exact-sum splits, Plaid Hosted Link & SimpleFIN banking connectors,
+opt-in read-only IMAP email scanner, MoneyStill analytics & What-If simulator,
+honest 5-factor Credit Simulator + Chase 5/24, Stocks & Crypto portfolio + official
+broker adapters (Coinbase read-only, Robinhood Crypto read-only, Charles Schwab OAuth2),
+and Multi-Provider AI Coaching + guarded Agentic Tool Coach (Preview -> Execute -> Undo).
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import os
-from datetime import date, timedelta
+import secrets
+import tempfile
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
+from chronox_finance.ai.agent_tools import (
+    AgentActionPlanner,
+    AgentLedgerContext,
+    compute_portfolio_analysis,
+    validate_agent_batch,
+)
 from chronox_finance.ai.coach import FinancialCoach
+from chronox_finance.ai.codex_client import (
+    DEFAULT_CODEX_CLI_MODEL,
+    DEFAULT_CODEX_MODEL,
+    DEFAULT_OPENAI_BASE_URL,
+    DEFAULT_WRAPPER_BASE_URL,
+    DEFAULT_WRAPPER_MODEL,
+    CodexCLIClient,
+    CodexResponsesClient,
+)
 from chronox_finance.ai.gemini_client import (
     DEFAULT_GEMINI_BASE_URL,
     DEFAULT_GEMINI_MODEL,
     GeminiClient,
 )
-from chronox_finance.ai.opencode_client import LLMClient, OpenCodeGoClient
+from chronox_finance.ai.opencode_client import (
+    DEFAULT_OPENCODE_GO_BASE_URL,
+    CompletionResult,
+    LLMClient,
+    OpenCodeGoClient,
+)
+from chronox_finance.connectors.base import (
+    ConnectorAuthError,
+    ConnectorError,
+    NormalizedAccount,
+    NormalizedHolding,
+    NormalizedTransaction,
+)
+from chronox_finance.connectors.brokers import (
+    CoinbaseConnector,
+    RobinhoodCryptoConnector,
+    SchwabConnector,
+    parse_holdings_csv,
+)
+from chronox_finance.connectors.credit_providers import (
+    OfficialCreditReportImporter,
+    PlaidLiabilitiesAdapter,
+)
+from chronox_finance.connectors.email_scanner import EmailScanner, IMAPConfig
+from chronox_finance.connectors.plaid_client import PlaidClient
+from chronox_finance.connectors.quotes import QuoteService
+from chronox_finance.connectors.simplefin_client import SimpleFINClient
 from chronox_finance.engines.adhd import (
     build_adhd_stats,
     compute_weekly_reset_update,
     enrich_impulse,
     is_reset_done_this_week,
+)
+from chronox_finance.engines.analytics import (
+    AnalyticsEngine,
+    reconstruct_net_worth_timeline,
+)
+from chronox_finance.engines.analytics import (
+    simulate_scenario as run_scenario_simulation,
 )
 from chronox_finance.engines.autobudget import AutoBudgetEngine, AutoBudgetResult, current_cycle_ym
 from chronox_finance.engines.categorizer import TransactionCategorizer, normalize_merchant
@@ -38,28 +95,57 @@ from chronox_finance.engines.recurring import (
     detect_payday_schedule,
     detect_recurring_bills,
 )
+from chronox_finance.engines.rules import (
+    RuleEngine,
+    dry_run_rule,
+    validate_safe_regex,
+    validate_splits,
+)
 from chronox_finance.models import (
     AccountCreate,
     AccountOut,
+    ActiveProviderResolved,
+    AgentExecuteResponse,
+    AgentPlanRequest,
+    AgentPlanResponse,
+    AgentUndoResponse,
     AIProvider,
     AISettingsOut,
     AISettingsUpdate,
+    AIUsageReport,
+    AnalyticsOverview,
     BalanceTransferRequest,
     BalanceTransferResult,
+    BrokerCoinbaseConnectRequest,
+    BrokerRobinhoodConnectRequest,
+    BrokerSchwabConnectRequest,
     BudgetAuditEvent,
     CoachAnswerResponse,
+    ConnectionOut,
+    CreditDerogatoryCreate,
+    CreditDerogatoryOut,
+    CreditInquiryCreate,
+    CreditInquiryOut,
     CreditLineCreate,
     CreditLineUpdate,
     CreditOptimizationReport,
+    CreditReportCreate,
+    CreditReportOut,
     DashboardResponse,
+    EmailConfigOut,
+    EmailConfigUpdate,
+    EmailQueueItem,
     GoalCategory,
     GoalContributeRequest,
     GoalCreate,
     GoalOut,
     GoalPlanRequest,
     GoalPlanResponse,
+    GoalReorderRequest,
     GoalUpdate,
     HealthResponse,
+    HoldingCreate,
+    HoldingOut,
     ImpulseCreate,
     ImpulseDecision,
     ImpulseOut,
@@ -67,29 +153,112 @@ from chronox_finance.models import (
     IntelligenceMode,
     JarKind,
     JarUpdate,
+    NetWorthPoint,
+    OnboardingCompleteRequest,
+    OnboardingStatus,
+    PlaidConfigRequest,
+    PlaidExchangeRequest,
+    PlaidLinkTokenRequest,
+    PlaidLinkTokenResponse,
+    PlaidPollLinkRequest,
+    PortfolioAllocationItem,
+    PortfolioSnapshotOut,
+    PortfolioSummary,
     ProfileSettings,
     ProfileSettingsUpdate,
     QuantForecastReport,
     QuickAddRequest,
     RebalanceTransferRequest,
     RecurringBillCreate,
+    RuleCreate,
+    RuleGroupCreate,
+    RuleGroupOut,
+    RuleOut,
+    RuleTestResult,
+    RuleUpdate,
+    ScenarioCreate,
+    ScenarioOut,
+    ScenarioOverride,
+    ScenarioSimRequest,
+    ScenarioSimResult,
+    SimpleFINClaimRequest,
     SuggestionActionType,
     SuggestionBatchResponse,
+    TagOut,
+    TransactionCommentCreate,
+    TransactionCommentOut,
     TransactionCreate,
     TransactionOut,
+    TransactionSplitOut,
+    TransactionSplitsRequest,
+    TransactionTagsRequest,
     TransactionType,
     TransactionUpdate,
+    VaultChangePasswordRequest,
+    VaultRecoverRequest,
+    VaultRecoverResponse,
+    VaultSetupRequest,
+    VaultSetupResponse,
+    VaultStatus,
     WeeklyResetSummary,
+    compute_holding_value_cents,
     utc_now_iso,
 )
 from chronox_finance.security import (
     LocalSecretStore,
-    hash_passcode,
+    LocalVaultAuth,
+    VaultLockedError,
+    VaultNotInitializedError,
     mask_secret,
     validate_external_api_url,
-    verify_passcode,
 )
 from chronox_finance.storage import FinanceStorage, compute_tx_fingerprint
+
+logger = logging.getLogger(__name__)
+
+_LOOKBACK_730D = 730
+_MAX_TX_LIMIT = 5000
+
+
+def _row_fingerprint(row: Optional[Dict[str, Any]], fields: Sequence[str]) -> str:
+    """Deterministic SHA-256 fingerprint of selected row columns for row-versioned Undo."""
+    if not row:
+        return ""
+    payload = {k: row.get(k) for k in fields}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _splits_fingerprint(splits: Sequence[Dict[str, Any]]) -> str:
+    canonical = [
+        {
+            "jar_id": s.get("jar_id"),
+            "goal_id": s.get("goal_id"),
+            "amount_cents": int(s.get("amount_cents", 0)),
+            "memo": str(s.get("memo", "")),
+        }
+        for s in splits
+    ]
+    return hashlib.sha256(json.dumps(canonical, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _days_until_iso_timestamp(iso_ts: Optional[str]) -> Optional[int]:
+    if not iso_ts:
+        return None
+    raw = str(iso_ts).strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = dt - datetime.now(timezone.utc)
+        return max(0, int(delta.total_seconds() // 86400))
+    except ValueError:
+        try:
+            d = date.fromisoformat(raw[:10])
+            return max(0, (d - date.today()).days)
+        except ValueError:
+            return None
 
 
 class FinanceService:
@@ -99,33 +268,172 @@ class FinanceService:
         self,
         db_path: str = ".chronox/finance.sqlite3",
         secret_store_path: Optional[Path] = None,
+        *,
+        kdf_iterations: Optional[int] = None,
         opencode_transport: Any = None,
         gemini_transport: Any = None,
+        codex_transport: Any = None,
+        wrapper_transport: Any = None,
+        plaid_transport: Any = None,
+        simplefin_transport: Any = None,
+        broker_transport: Any = None,
+        quote_transport: Any = None,
+        imap_factory: Any = None,
     ):
         self.db_path = db_path
         self.storage = FinanceStorage(db_path=db_path)
+        self._temp_secret_dir: Optional[tempfile.TemporaryDirectory[str]] = None
         if secret_store_path is not None:
-            store_file = secret_store_path
+            store_file = Path(secret_store_path)
         elif db_path == ":memory:":
-            store_file = Path(".chronox/test_secrets.json")
+            self._temp_secret_dir = tempfile.TemporaryDirectory(prefix="chronox_vault_")
+            store_file = Path(self._temp_secret_dir.name) / "secrets.enc"
         else:
-            store_file = Path(db_path).parent / "secrets.json"
-        self.secrets = LocalSecretStore(store_file)
+            store_file = Path(db_path).parent / "secrets.enc"
+
+        store_kwargs: Dict[str, Any] = {}
+        if kdf_iterations is not None:
+            store_kwargs["kdf_iterations"] = int(kdf_iterations)
+        self.secrets = LocalSecretStore(store_file, **store_kwargs)
+        self.auth = LocalVaultAuth(self.secrets)
+
         self.categorizer = TransactionCategorizer()
         self.autobudget = AutoBudgetEngine()
         self.credit_optimizer = CreditDebtOptimizer()
         self.goal_optimizer = GoalOptimizerEngine()
         self.quant_engine = QuantMathEngine()
+        self.analytics_engine = AnalyticsEngine()
+        self.rule_engine = RuleEngine()
+        self.plaid_liabilities_adapter = PlaidLiabilitiesAdapter()
+        self.credit_report_importer = OfficialCreditReportImporter()
+
         self._opencode_transport = opencode_transport
         self._gemini_transport = gemini_transport
+        self._codex_transport = codex_transport
+        self._wrapper_transport = wrapper_transport
+        self._plaid_transport = plaid_transport
+        self._simplefin_transport = simplefin_transport
+        self._broker_transport = broker_transport
+        self._quote_transport = quote_transport
+        self._imap_factory = imap_factory
+
+        self._pending_schwab_states: Dict[str, Dict[str, Any]] = {}
 
     def close(self) -> None:
         self.storage.close()
+        if self._temp_secret_dir is not None:
+            try:
+                self._temp_secret_dir.cleanup()
+            except OSError:
+                pass
+            self._temp_secret_dir = None
 
-    # --- Multi-Provider AI Client & Key Resolution (OpenCode Go + Google Gemini) ---
+    # --- Vault Lifecycle & Fail-Closed Secret Helpers ---
+
+    def _check_idle_lock(self) -> bool:
+        settings = self.storage.get_settings()
+        minutes = int(settings.get("vault_auto_lock_minutes", 30))
+        return self.secrets.check_idle_lock(minutes)
+
+    def _require_vault_unlocked(self) -> None:
+        """Fail closed whenever vault is not unlocked (never caches secrets across lock)."""
+        self._check_idle_lock()
+        state = self.secrets.vault_state()
+        if state == "needs_setup":
+            raise VaultNotInitializedError("Vault must be initialized before accessing encrypted credentials.")
+        if state != "unlocked":
+            raise VaultLockedError("Sync paused: vault locked")
+
+    def _safe_get_secret(self, key: str) -> str:
+        """Read a secret only when the vault is currently unlocked; never raises on locked status probes."""
+        if not self.secrets.is_unlocked():
+            return ""
+        try:
+            return self.secrets.get(key).strip()
+        except (VaultLockedError, VaultNotInitializedError):
+            return ""
+
+    def _safe_get_secret_json(self, key: str) -> Optional[Dict[str, Any]]:
+        if not self.secrets.is_unlocked():
+            return None
+        try:
+            return self.secrets.get_json(key)
+        except (VaultLockedError, VaultNotInitializedError):
+            return None
+
+    def is_auth_enabled(self) -> bool:
+        """Mandatory local vault lock is always enabled."""
+        return True
+
+    def get_vault_status(self, *, authenticated: bool = False) -> VaultStatus:
+        self._check_idle_lock()
+        settings = self.storage.get_settings()
+        vstate = self.secrets.vault_state()
+        unlocked = vstate == "unlocked"
+        return VaultStatus(
+            state=vstate,
+            initialized=self.secrets.is_initialized(),
+            unlocked=unlocked,
+            auth_enabled=True,
+            authenticated=bool(authenticated and unlocked),
+            onboarding_completed=bool(settings.get("onboarding_completed", 0)),
+            auto_lock_minutes=int(settings.get("vault_auto_lock_minutes", 30)),
+            csrf_token=self.secrets.get_csrf_token(),
+            recovery_configured=self.secrets.is_initialized(),
+            db_encrypted_at_rest=False,
+        )
+
+    def setup_vault(self, req: VaultSetupRequest) -> VaultSetupResponse:
+        res = self.secrets.setup_vault(req.password)
+        self.storage.log_budget_event("security", "Envelope-encrypted local vault initialized")
+        status = self.get_vault_status(authenticated=True)
+        return VaultSetupResponse(
+            status=status,
+            recovery_key=res["recovery_key"],
+            recovery_groups=list(res["recovery_groups"]),
+            challenge_indices=list(res["challenge_indices"]),
+            csrf_token=self.secrets.get_csrf_token(),
+            migrated_legacy_secrets=bool(res["migrated_legacy_secrets"]),
+        )
+
+    def unlock_vault(self, password: str) -> bool:
+        ok = self.secrets.unlock(password)
+        if ok:
+            self.storage.log_budget_event("security", "Local vault unlocked")
+        return ok
+
+    def recover_vault(self, req: VaultRecoverRequest) -> VaultRecoverResponse:
+        new_rec = self.secrets.recover(
+            req.recovery_key,
+            req.new_password,
+            rotate_recovery_key=req.rotate_recovery_key,
+        )
+        self.storage.log_budget_event("security", "Local vault recovered via Recovery Key (DEK rewrapped)")
+        status = self.get_vault_status(authenticated=True)
+        return VaultRecoverResponse(
+            status=status,
+            csrf_token=self.secrets.get_csrf_token(),
+            new_recovery_key=new_rec,
+        )
+
+    def change_vault_password(self, req: VaultChangePasswordRequest) -> VaultStatus:
+        self.secrets.change_password(req.current_password, req.new_password)
+        self.storage.log_budget_event("security", "Vault master password updated (DEK rewrapped)")
+        return self.get_vault_status(authenticated=True)
+
+    def lock_vault(self) -> VaultStatus:
+        self.secrets.lock()
+        return self.get_vault_status(authenticated=False)
+
+    def complete_onboarding(self, req: OnboardingCompleteRequest) -> OnboardingStatus:
+        self.storage.update_settings({"onboarding_completed": 1})
+        self.storage.log_budget_event("onboarding", f"First-run onboarding completed ({req.track})")
+        return OnboardingStatus(onboarding_completed=True, track=req.track)
+
+    # --- Multi-Provider AI Client & Key Resolution ---
 
     def _resolve_opencode_key_with_source(self) -> Tuple[str, Literal["saved", "env", "none"]]:
-        saved = self.secrets.get("opencode_go_api_key").strip()
+        saved = self._safe_get_secret("opencode_go_api_key")
         if saved:
             return saved, "saved"
         env_key = (os.getenv("OPENCODE_GO_API_KEY") or os.getenv("OPENCODE_API_KEY") or "").strip()
@@ -137,7 +445,7 @@ class FinanceService:
         return self._resolve_opencode_key_with_source()[0]
 
     def _resolve_gemini_key_with_source(self) -> Tuple[str, Literal["saved", "env", "none"]]:
-        saved = self.secrets.get("gemini_api_key").strip()
+        saved = self._safe_get_secret("gemini_api_key")
         if saved:
             return saved, "saved"
         env_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
@@ -147,6 +455,30 @@ class FinanceService:
 
     def _resolve_gemini_api_key(self) -> str:
         return self._resolve_gemini_key_with_source()[0]
+
+    def _resolve_codex_key_with_source(self) -> Tuple[str, Literal["saved", "env", "none"]]:
+        saved = self._safe_get_secret("codex_api_key")
+        if saved:
+            return saved, "saved"
+        env_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+        if env_key:
+            return env_key, "env"
+        return "", "none"
+
+    def _resolve_codex_api_key(self) -> str:
+        return self._resolve_codex_key_with_source()[0]
+
+    def _resolve_wrapper_key_with_source(self) -> Tuple[str, Literal["saved", "env", "none"]]:
+        saved = self._safe_get_secret("wrapper_api_key")
+        if saved:
+            return saved, "saved"
+        env_key = (os.getenv("CHRONOX_WRAPPER_API_KEY") or "").strip()
+        if env_key:
+            return env_key, "env"
+        return "", "none"
+
+    def _resolve_wrapper_api_key(self) -> str:
+        return self._resolve_wrapper_key_with_source()[0]
 
     def _resolve_intelligence_mode(
         self,
@@ -176,29 +508,12 @@ class FinanceService:
         except ValueError:
             return AIProvider.AUTO
 
-    def resolve_active_provider(
-        self,
-        provider_override: Optional[str] = None,
-    ) -> Literal["opencode_go", "gemini", "none"]:
-        pref = self._resolve_ai_provider_setting(override=provider_override)
-        has_oc = bool(self._resolve_opencode_api_key())
-        has_gem = bool(self._resolve_gemini_api_key())
-        if pref == AIProvider.OPENCODE_GO:
-            return "opencode_go" if has_oc else "none"
-        if pref == AIProvider.GEMINI:
-            return "gemini" if has_gem else "none"
-        # Auto mode: prefer OpenCode Go if configured, else Gemini if configured
-        if has_oc:
-            return "opencode_go"
-        if has_gem:
-            return "gemini"
-        return "none"
-
     def build_opencode_client(self) -> OpenCodeGoClient:
         settings = self.storage.get_settings()
         return OpenCodeGoClient(
             api_key=self._resolve_opencode_api_key(),
-            base_url=settings.get("opencode_base_url") or os.getenv("OPENCODE_GO_BASE_URL", "https://opencode.ai/zen/go/v1"),
+            base_url=settings.get("opencode_base_url")
+            or os.getenv("OPENCODE_GO_BASE_URL", DEFAULT_OPENCODE_GO_BASE_URL),
             model=settings.get("opencode_model") or os.getenv("OPENCODE_GO_MODEL", "glm-5.3-flash"),
             protocol=settings.get("opencode_protocol", "auto"),
             transport=self._opencode_transport,
@@ -213,29 +528,96 @@ class FinanceService:
             transport=self._gemini_transport,
         )
 
-    def _build_coach_clients(
+    def build_codex_client(self) -> CodexResponsesClient:
+        settings = self.storage.get_settings()
+        return CodexResponsesClient(
+            api_key=self._resolve_codex_api_key(),
+            base_url=settings.get("codex_base_url") or os.getenv("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
+            model=settings.get("codex_model") or os.getenv("OPENAI_CODEX_MODEL", DEFAULT_CODEX_MODEL),
+            provider_name="openai_codex",
+            wire_api="responses",
+            transport=self._codex_transport,
+        )
+
+    def build_wrapper_client(self) -> CodexResponsesClient:
+        settings = self.storage.get_settings()
+        wire = str(settings.get("wrapper_wire_api") or "chat_completions").strip().lower()
+        if wire not in ("responses", "chat_completions"):
+            wire = "chat_completions"
+        raw_base = (settings.get("wrapper_base_url") or os.getenv("CHRONOX_WRAPPER_BASE_URL") or "").strip()
+        return CodexResponsesClient(
+            api_key=self._resolve_wrapper_api_key(),
+            base_url=raw_base,
+            model=settings.get("wrapper_model") or os.getenv("CHRONOX_WRAPPER_MODEL", DEFAULT_WRAPPER_MODEL),
+            provider_name="chat_wrapper",
+            wire_api=wire,  # type: ignore[arg-type]
+            transport=self._wrapper_transport,
+        )
+
+    def build_codex_cli_client(self) -> CodexCLIClient:
+        settings = self.storage.get_settings()
+        return CodexCLIClient(
+            enabled=bool(settings.get("codex_cli_enabled", 0)),
+            model=str(settings.get("codex_cli_model") or DEFAULT_CODEX_CLI_MODEL),
+        )
+
+    def _build_all_ai_clients(self) -> Dict[str, LLMClient]:
+        return {
+            "opencode_go": self.build_opencode_client(),
+            "gemini": self.build_gemini_client(),
+            "openai_codex": self.build_codex_client(),
+            "chat_wrapper": self.build_wrapper_client(),
+            "codex_cli": self.build_codex_cli_client(),
+        }
+
+    def resolve_active_provider(
         self,
         provider_override: Optional[str] = None,
-    ) -> Tuple[Optional[LLMClient], Optional[LLMClient]]:
-        """Resolve (primary_client, fallback_client) honoring ai_provider preference."""
+    ) -> ActiveProviderResolved:
         pref = self._resolve_ai_provider_setting(override=provider_override)
-        oc = self.build_opencode_client()
-        gem = self.build_gemini_client()
-        if pref == AIProvider.OPENCODE_GO:
-            return (oc, None)
-        if pref == AIProvider.GEMINI:
-            return (gem, None)
-        # Auto: prefer OpenCode Go primary + Gemini fallback, or Gemini primary if only Gemini configured
-        if oc.is_configured:
-            return (oc, gem if gem.is_configured else None)
-        if gem.is_configured:
-            return (gem, None)
-        return (None, None)
+        clients = self._build_all_ai_clients()
+        if pref != AIProvider.AUTO:
+            c = clients.get(pref.value)
+            if c and c.is_configured:
+                return pref.value  # type: ignore[return-value]
+            return "none"
+        for pid in ("opencode_go", "gemini", "openai_codex", "chat_wrapper", "codex_cli"):
+            if clients[pid].is_configured:
+                return pid  # type: ignore[return-value]
+        return "none"
+
+    def _build_coach_clients_list(
+        self,
+        provider_override: Optional[str] = None,
+    ) -> List[LLMClient]:
+        pref = self._resolve_ai_provider_setting(override=provider_override)
+        clients = self._build_all_ai_clients()
+        if pref != AIProvider.AUTO:
+            chosen = clients.get(pref.value)
+            return [chosen] if chosen is not None else []
+        ordered = [clients[p] for p in ("opencode_go", "gemini", "openai_codex", "chat_wrapper", "codex_cli")]
+        return [c for c in ordered if c.is_configured]
+
+    def _record_completion_usage(self, res: CompletionResult) -> None:
+        provider = (res.provider or "unknown").strip().lower()
+        self.storage.record_ai_usage(
+            provider=provider,
+            model=res.model or "",
+            cached=bool(res.cached),
+            input_tokens=int(res.input_tokens),
+            output_tokens=int(res.output_tokens),
+            cached_tokens=int(res.cached_tokens),
+            cost_microdollars=int(res.cost_microdollars),
+            saved_microdollars=int(res.saved_microdollars),
+            latency_ms=int(res.latency_ms),
+        )
 
     def get_ai_status(self) -> Dict[str, Any]:
         settings = self.storage.get_settings()
         oc_key, oc_source = self._resolve_opencode_key_with_source()
         gem_key, gem_source = self._resolve_gemini_key_with_source()
+        codex_key, codex_source = self._resolve_codex_key_with_source()
+        wrap_key, _wrap_source = self._resolve_wrapper_key_with_source()
         mode = self._resolve_intelligence_mode(settings)
         provider_pref = self._resolve_ai_provider_setting(settings)
         active = self.resolve_active_provider()
@@ -244,26 +626,49 @@ class FinanceService:
 
         oc_model = settings.get("opencode_model", "glm-5.3-flash")
         gem_model = settings.get("gemini_model", DEFAULT_GEMINI_MODEL)
+        codex_model = settings.get("codex_model", DEFAULT_CODEX_MODEL)
+        wrap_model = settings.get("wrapper_model", "") or DEFAULT_WRAPPER_MODEL
+        cli_model = settings.get("codex_cli_model", "") or DEFAULT_CODEX_CLI_MODEL
 
-        if active == "gemini":
-            active_label = "Google Gemini"
-            active_model = gem_model
-            active_masked = mask_secret(gem_key)
-            active_url = settings.get("gemini_base_url", DEFAULT_GEMINI_BASE_URL)
-        elif active == "opencode_go":
-            active_label = "OpenCode Go"
-            active_model = oc_model
-            active_masked = mask_secret(oc_key)
-            active_url = settings.get("opencode_base_url", "https://opencode.ai/zen/go/v1")
+        label_map: Dict[str, Tuple[str, str, str, str]] = {
+            "opencode_go": (
+                "OpenCode Go",
+                oc_model,
+                mask_secret(oc_key),
+                settings.get("opencode_base_url", DEFAULT_OPENCODE_GO_BASE_URL),
+            ),
+            "gemini": (
+                "Google Gemini",
+                gem_model,
+                mask_secret(gem_key),
+                settings.get("gemini_base_url", DEFAULT_GEMINI_BASE_URL),
+            ),
+            "openai_codex": (
+                "OpenAI / Codex",
+                codex_model,
+                mask_secret(codex_key),
+                settings.get("codex_base_url", DEFAULT_OPENAI_BASE_URL),
+            ),
+            "chat_wrapper": (
+                "Durable Chat-Wrapper",
+                wrap_model,
+                mask_secret(wrap_key),
+                settings.get("wrapper_base_url", "") or DEFAULT_WRAPPER_BASE_URL,
+            ),
+            "codex_cli": (
+                "Codex CLI",
+                cli_model,
+                "",
+                "local://codex-cli",
+            ),
+        }
+        if active in label_map:
+            active_label, active_model, active_masked, active_url = label_map[active]
         else:
-            active_label = "Quant Math Local" if mode == IntelligenceMode.DETERMINISTIC_ONLY else "OpenCode Go"
-            active_model = gem_model if provider_pref == AIProvider.GEMINI else oc_model
+            active_label = "Quant Math Local" if mode == IntelligenceMode.DETERMINISTIC_ONLY else "Unconfigured"
+            active_model = label_map.get(provider_pref.value, label_map["opencode_go"])[1]
             active_masked = ""
-            active_url = (
-                settings.get("gemini_base_url", DEFAULT_GEMINI_BASE_URL)
-                if provider_pref == AIProvider.GEMINI
-                else settings.get("opencode_base_url", "https://opencode.ai/zen/go/v1")
-            )
+            active_url = label_map.get(provider_pref.value, label_map["opencode_go"])[3]
 
         return {
             "provider": active_label,
@@ -283,81 +688,93 @@ class FinanceService:
             "gemini_key_masked": mask_secret(gem_key),
             "gemini_key_source": gem_source,
             "gemini_model": gem_model,
+            "codex_key_configured": bool(codex_key),
+            "codex_key_masked": mask_secret(codex_key),
+            "codex_key_source": codex_source,
+            "codex_model": codex_model,
+            "wrapper_key_configured": bool(wrap_key),
+            "wrapper_key_masked": mask_secret(wrap_key),
+            "wrapper_base_url": settings.get("wrapper_base_url", ""),
+            "wrapper_model": settings.get("wrapper_model", ""),
+            "wrapper_wire_api": settings.get("wrapper_wire_api", "chat_completions"),
+            "codex_cli_enabled": bool(settings.get("codex_cli_enabled", 0)),
+            "codex_cli_model": settings.get("codex_cli_model", ""),
             "requests_used_today": used_today,
             "max_daily_requests": max_daily,
             "quota_remaining_today": max(0, max_daily - used_today),
         }
 
+    def get_ai_usage(self, days: int = 30) -> AIUsageReport:
+        summary = self.storage.get_ai_usage_summary(days=days)
+        return AIUsageReport(**summary)
+
+    def list_ai_threads(self) -> List[Dict[str, Any]]:
+        return self.storage.list_ai_threads()
+
+    def delete_ai_thread(self, thread_id: str) -> bool:
+        return self.storage.delete_ai_thread(thread_id)
+
     def get_health(self) -> HealthResponse:
         """Public readiness & health probe (never exposes any secret)."""
         db_ok = self.storage.ping()
         mode = IntelligenceMode.HYBRID.value
-        active = "none"
-        auth_enabled = False
+        active: ActiveProviderResolved = "none"
+        vstate = self.secrets.vault_state()
         if db_ok:
             settings = self.storage.get_settings()
             mode = self._resolve_intelligence_mode(settings).value
             active = self.resolve_active_provider()
-            auth_enabled = bool(settings.get("passcode_hash", ""))
         return HealthResponse(
             status="ok" if db_ok else "degraded",
             app="ChronoX Finance",
-            version="1.1.0",
+            version="2.0.0",
             db_ok=db_ok,
-            auth_enabled=auth_enabled,
+            auth_enabled=True,
+            vault_state=vstate,
             intelligence_mode=mode,
             active_provider=active,
         )
 
-    # --- Security / Passcode Lock ---
+    # --- Self-Updating Auto-Budget Core Loop (730-Day + Split-Aware) ---
 
-    def is_auth_enabled(self) -> bool:
-        settings = self.storage.get_settings()
-        return bool(settings.get("passcode_hash", ""))
-
-    def enable_passcode(self, passcode: str) -> None:
-        hashed = hash_passcode(passcode)
-        self.storage.update_settings({"passcode_hash": hashed})
-        self.storage.log_budget_event("security", "Local passcode lock enabled")
-
-    def disable_passcode(self, current_passcode: str) -> bool:
-        settings = self.storage.get_settings()
-        stored = settings.get("passcode_hash", "")
-        if stored and not verify_passcode(current_passcode, stored):
-            return False
-        self.storage.update_settings({"passcode_hash": ""})
-        self.storage.log_budget_event("security", "Local passcode lock disabled")
-        return True
-
-    def verify_owner_passcode(self, passcode: str) -> bool:
-        stored = self.storage.get_settings().get("passcode_hash", "")
-        if not stored:
-            return True
-        return verify_passcode(passcode, stored)
-
-    # --- Self-Updating Auto-Budget Core Loop ---
+    def _load_recent_transactions_with_splits(
+        self,
+        *,
+        days: int = _LOOKBACK_730D,
+        today: Optional[date] = None,
+        limit: int = _MAX_TX_LIMIT,
+    ) -> Tuple[List[Dict[str, Any]], Dict[int, List[Dict[str, Any]]]]:
+        ref = today or date.today()
+        since_str = (ref - timedelta(days=max(1, int(days)))).isoformat()
+        txs = self.storage.list_transactions(
+            limit=limit,
+            since_date=since_str,
+            include_splits=True,
+            include_tags=True,
+        )
+        splits_map = {int(t["id"]): list(t.get("splits") or []) for t in txs if t.get("splits")}
+        return txs, splits_map
 
     def _compute_budget(self, today: Optional[date] = None) -> AutoBudgetResult:
         ref = today or date.today()
         ym = current_cycle_ym(ref)
-        since_180d = (ref - timedelta(days=180)).isoformat()
+        txs, splits_map = self._load_recent_transactions_with_splits(days=_LOOKBACK_730D, today=ref)
         return self.autobudget.compute(
             accounts=self.storage.list_accounts(),
             jars=self.storage.list_jars(),
-            transactions=self.storage.list_transactions(limit=2000, since_date=since_180d),
+            transactions=txs,
             recurring_bills=self.storage.list_recurring_bills(active_only=True),
             transfers=self.storage.list_budget_transfers(ym),
             settings=self.storage.get_settings(),
             credit_lines=self.storage.list_credit_lines(active_only=True),
+            splits_by_tx_id=splits_map,
             today=ref,
         )
 
     def _apply_month_rollover_if_needed(self, today: date) -> int:
         """
         Automatically carry over prior-month jar surpluses when a new calendar month begins.
-
-        Surplus up to `rollover_cap_cents` rolls into each jar; overflow above the cap
-        automatically sweeps into the `Safety & Future` jar. Idempotent via `last_rollover_ym`.
+        Uses child splits when present so split transactions are never double-counted.
         """
         settings = self.storage.get_settings()
         ym_now = current_cycle_ym(today)
@@ -368,14 +785,21 @@ class FinanceService:
         if last_ym >= ym_now:
             return 0
 
-        # Compute prior-month spending per jar to determine rollover surplus
         prev_first = date(today.year, today.month, 1) - timedelta(days=1)
         prev_ym = current_cycle_ym(prev_first)
         since_prev = date(prev_first.year, prev_first.month, 1).isoformat()
-        txs = self.storage.list_transactions(limit=2000, since_date=since_prev)
+        txs = self.storage.list_transactions(limit=_MAX_TX_LIMIT, since_date=since_prev, include_splits=True)
         spent_prev: Dict[int, int] = {}
         for t in txs:
-            if t.get("tx_type") == "expense" and t["tx_date"][:7] == prev_ym and t.get("jar_id") is not None:
+            if t.get("tx_type") != "expense" or str(t["tx_date"])[:7] != prev_ym:
+                continue
+            child_splits = t.get("splits") or []
+            if child_splits:
+                for sp in child_splits:
+                    if sp.get("jar_id") is not None:
+                        jid = int(sp["jar_id"])
+                        spent_prev[jid] = spent_prev.get(jid, 0) + int(sp["amount_cents"])
+            elif t.get("jar_id") is not None:
                 jid = int(t["jar_id"])
                 spent_prev[jid] = spent_prev.get(jid, 0) + int(t["amount_cents"])
 
@@ -390,7 +814,6 @@ class FinanceService:
                 self.storage.update_jar(jid, {"rollover_cents": 0})
                 continue
             prev_avail = int(j.get("auto_allocated_cents", 0)) + int(j.get("rollover_cents", 0)) - spent_prev.get(jid, 0)
-            # Never punish user with negative debt rollover; clamp at 0
             surplus = max(0, prev_avail)
             cap = j.get("rollover_cap_cents")
             if cap is not None and surplus > int(cap):
@@ -407,36 +830,86 @@ class FinanceService:
                 self.storage.update_jar(sid, {"rollover_cents": int(curr_safety["rollover_cents"]) + overflow_to_safety})
 
         self.storage.update_settings({"last_rollover_ym": ym_now})
-        msg = f"Month rollover ({prev_ym} → {ym_now}): rolled surplus across {rolled_jars} jar(s)"
+        msg = f"Month rollover ({prev_ym} -> {ym_now}): rolled surplus across {rolled_jars} jar(s)"
         if overflow_to_safety > 0:
             msg += f" + swept ${overflow_to_safety / 100:,.2f} overflow into Safety & Future"
-        self.storage.log_budget_event("month_rollover", msg, {"from_ym": prev_ym, "to_ym": ym_now, "overflow_cents": overflow_to_safety})
+        self.storage.log_budget_event(
+            "month_rollover",
+            msg,
+            {"from_ym": prev_ym, "to_ym": ym_now, "overflow_cents": overflow_to_safety},
+        )
         return rolled_jars
+
+    def _refresh_net_worth_snapshot_today(self, today: Optional[date] = None) -> None:
+        ref = today or date.today()
+        accounts = self.storage.list_accounts()
+        holdings = self.storage.list_holdings()
+        credit_lines = self.storage.list_credit_lines(active_only=True)
+        liquid = sum(int(a["balance_cents"]) for a in accounts if a.get("is_liquid", 1))
+        invest = sum(
+            compute_holding_value_cents(int(h["quantity_e8"]), int(h["price_e8"]))
+            for h in holdings
+        )
+        debt = sum(int(cl["balance_cents"]) for cl in credit_lines)
+        self.storage.upsert_net_worth_snapshot(
+            snap_date=ref.isoformat(),
+            liquid_cents=liquid,
+            investment_cents=invest,
+            debt_cents=debt,
+            net_worth_cents=liquid + invest - debt,
+        )
+
+    def _backfill_net_worth_snapshots(self, days: int = _LOOKBACK_730D, today: Optional[date] = None) -> int:
+        ref = today or date.today()
+        txs, _ = self._load_recent_transactions_with_splits(days=days, today=ref)
+        points = reconstruct_net_worth_timeline(
+            accounts=self.storage.list_accounts(),
+            transactions=txs,
+            holdings=self.storage.list_holdings(),
+            credit_lines=self.storage.list_credit_lines(active_only=True),
+            existing_snapshots=self.storage.list_net_worth_snapshots(limit=days),
+            days=days,
+            today=ref,
+        )
+        # Store periodic/weekly + recent daily points cleanly without churning thousands of rows
+        saved = 0
+        if points:
+            step = max(1, len(points) // 180)
+            chosen = points[::step]
+            if chosen[-1].date != points[-1].date:
+                chosen.append(points[-1])
+            for pt in chosen:
+                self.storage.upsert_net_worth_snapshot(
+                    snap_date=pt.date,
+                    liquid_cents=pt.liquid_cents,
+                    investment_cents=pt.investment_cents,
+                    debt_cents=pt.debt_cents,
+                    net_worth_cents=pt.net_worth_cents,
+                )
+                saved += 1
+        return saved
 
     def run_self_updating_sync(self, reason: str = "Automatic refresh", today: Optional[date] = None) -> Dict[str, Any]:
         """
-        Execute the full Self-Updating Auto-Budget Loop:
-        0. Automatically roll over prior-month surplus if a new calendar month started.
-        1. Scan 180-day transaction history for recurring bills & silent price hikes.
+        Execute the full 730-day Self-Updating Auto-Budget Loop:
+        0. Purge soft-deleted goals past undo window & roll over prior-month surplus.
+        1. Scan 730-day transaction history for recurring bills (including annual + min/max ranges).
         2. Infer updated payday schedule & paycheck amount from recent deposits.
-        3. Recompute adaptive jar allocations and persist updated auto_allocated_cents.
-        4. Log concise audit event whenever material shifts occur.
+        3. Recompute adaptive split-aware jar allocations and refresh net-worth snapshot.
         """
         ref = today or date.today()
+        self.storage.purge_deleted_goals(older_than_hours=24)
         self._apply_month_rollover_if_needed(ref)
-        since_180d = (ref - timedelta(days=180)).isoformat()
-        txs = self.storage.list_transactions(limit=2000, since_date=since_180d)
+        txs, _ = self._load_recent_transactions_with_splits(days=_LOOKBACK_730D, today=ref)
         settings = self.storage.get_settings()
 
-        # 1. Detect recurring bills & update table
-        detected_bills = detect_recurring_bills(txs, today=ref)
+        detected_bills = detect_recurring_bills(txs, today=ref, lookback_days=_LOOKBACK_730D)
         existing_by_norm = {b["normalized_merchant"]: b for b in self.storage.list_recurring_bills(active_only=False)}
         bills_upserted = 0
         price_hikes_found: List[str] = []
 
         for dbill in detected_bills:
             existing = existing_by_norm.get(dbill.normalized_merchant)
-            # Respect user explicitly deactivating a cancelled subscription
             if existing and not existing.get("active", 1):
                 continue
             saved = self.storage.upsert_recurring_bill(
@@ -444,6 +917,9 @@ class FinanceService:
                 normalized_merchant=dbill.normalized_merchant,
                 amount_cents=dbill.amount_cents,
                 previous_amount_cents=dbill.previous_amount_cents,
+                amount_min_cents=dbill.amount_min_cents,
+                amount_max_cents=dbill.amount_max_cents,
+                due_window_days=dbill.due_window_days,
                 cadence=dbill.cadence.value,
                 next_due_date=dbill.next_due_date,
                 jar_id=dbill.jar_id,
@@ -457,7 +933,6 @@ class FinanceService:
                 hike = dbill.amount_cents - dbill.previous_amount_cents
                 price_hikes_found.append(f"{saved['name']} (+${hike / 100:,.2f})")
 
-        # 2. Update inferred payday schedule if high-confidence paychecks detected
         payday = detect_payday_schedule(
             transactions=txs,
             fallback_cadence_days=int(settings.get("payday_cadence_days", 14)),
@@ -474,7 +949,6 @@ class FinanceService:
                 }
             )
 
-        # 3. Recompute adaptive allocations & persist updated jar allocations
         budget = self._compute_budget(today=ref)
         jars_adjusted = 0
         for jar in self.storage.list_jars():
@@ -483,6 +957,8 @@ class FinanceService:
             if new_alloc is not None and new_alloc != int(jar.get("auto_allocated_cents", 0)):
                 self.storage.update_jar(jid, {"auto_allocated_cents": new_alloc})
                 jars_adjusted += 1
+
+        self._refresh_net_worth_snapshot_today(today=ref)
 
         if jars_adjusted > 0 or price_hikes_found or reason != "Automatic refresh":
             summary = f"Auto-budget updated ({reason}): Safe-to-Spend ${budget.safe_to_spend.safe_to_spend_cents / 100:,.2f}"
@@ -521,13 +997,12 @@ class FinanceService:
         goals: Optional[List[GoalOut]] = None,
     ) -> QuantForecastReport:
         ref = today or date.today()
-        horizon = max(7, min(90, int(days)))
+        horizon = max(7, min(730, int(days)))
         settings = self.storage.get_settings()
         b = budget if budget is not None else self._compute_budget(today=ref)
         cr = credit_report if credit_report is not None else self.get_credit_report(today=ref)
         g = goals if goals is not None else self.list_goals(include_completed=False)
-        since_90d = (ref - timedelta(days=90)).isoformat()
-        txs = self.storage.list_transactions(limit=2000, since_date=since_90d)
+        txs, splits_map = self._load_recent_transactions_with_splits(days=_LOOKBACK_730D, today=ref)
         bills = self.storage.list_recurring_bills(active_only=True)
         return self.quant_engine.build_forecast_report(
             budget=b,
@@ -536,7 +1011,132 @@ class FinanceService:
             settings=settings,
             credit_report=cr,
             goals=g,
+            splits_by_tx_id=splits_map,
             days=horizon,
+            today=ref,
+        )
+
+    # --- MoneyStill Analytics, Net Worth & What-If Scenarios ---
+
+    def get_analytics_overview(
+        self,
+        period: str = "1y",
+        group_by: str = "jar",
+        today: Optional[date] = None,
+    ) -> AnalyticsOverview:
+        ref = today or date.today()
+        txs, splits_map = self._load_recent_transactions_with_splits(days=_LOOKBACK_730D, today=ref)
+        return self.analytics_engine.build_overview(
+            transactions=txs,
+            jars=self.storage.list_jars(),
+            accounts=self.storage.list_accounts(),
+            holdings=self.storage.list_holdings(),
+            credit_lines=self.storage.list_credit_lines(active_only=True),
+            net_worth_snapshots=self.storage.list_net_worth_snapshots(limit=_LOOKBACK_730D),
+            splits_by_tx_id=splits_map,
+            period=period,
+            group_by=group_by,
+            today=ref,
+        )
+
+    def get_net_worth_series(
+        self,
+        days: int = _LOOKBACK_730D,
+        today: Optional[date] = None,
+    ) -> List[NetWorthPoint]:
+        ref = today or date.today()
+        bounded = max(7, min(_LOOKBACK_730D, int(days)))
+        txs, _ = self._load_recent_transactions_with_splits(days=_LOOKBACK_730D, today=ref)
+        return reconstruct_net_worth_timeline(
+            accounts=self.storage.list_accounts(),
+            transactions=txs,
+            holdings=self.storage.list_holdings(),
+            credit_lines=self.storage.list_credit_lines(active_only=True),
+            existing_snapshots=self.storage.list_net_worth_snapshots(limit=_LOOKBACK_730D),
+            days=bounded,
+            today=ref,
+        )
+
+    def _to_scenario_out(self, row: Dict[str, Any]) -> ScenarioOut:
+        raw_ov = row.get("overrides") or {}
+        if isinstance(raw_ov, str):
+            try:
+                raw_ov = json.loads(raw_ov)
+            except json.JSONDecodeError:
+                raw_ov = {}
+        return ScenarioOut(
+            id=int(row["id"]),
+            name=str(row["name"]),
+            overrides=ScenarioOverride(**raw_ov),
+            active=bool(row.get("active", True)),
+            updated_at=str(row.get("updated_at", "")),
+        )
+
+    def list_scenarios(self) -> List[ScenarioOut]:
+        return [self._to_scenario_out(r) for r in self.storage.list_scenarios()]
+
+    def create_scenario(self, req: ScenarioCreate) -> ScenarioOut:
+        row = self.storage.create_scenario(
+            {
+                "name": req.name.strip(),
+                "overrides": req.overrides.model_dump(),
+                "active": req.active,
+            }
+        )
+        return self._to_scenario_out(row)
+
+    def delete_scenario(self, scenario_id: int) -> bool:
+        return self.storage.delete_scenario(scenario_id)
+
+    def simulate_scenario(
+        self,
+        req: ScenarioSimRequest,
+        today: Optional[date] = None,
+    ) -> ScenarioSimResult:
+        ref = today or date.today()
+        settings = self.storage.get_settings()
+        budget = self._compute_budget(today=ref)
+        txs, _ = self._load_recent_transactions_with_splits(days=_LOOKBACK_730D, today=ref)
+        goals = self.list_goals(include_completed=False)
+        bills = self.storage.list_recurring_bills(active_only=True)
+        credit_lines = self.storage.list_credit_lines(active_only=True)
+
+        merged_ov = req.overrides
+        if req.scenario_id is not None:
+            saved = self.storage.get_scenario(req.scenario_id)
+            if saved and isinstance(saved.get("overrides"), dict):
+                base_ov = ScenarioOverride(**saved["overrides"])
+                # Layer explicit request overrides on top of saved scenario overrides
+                combined_shifts = dict(base_ov.goal_date_shifts)
+                combined_shifts.update(req.overrides.goal_date_shifts)
+                combined_one_offs = list(base_ov.one_off_events) + list(req.overrides.one_off_events)
+                merged_ov = ScenarioOverride(
+                    goal_date_shifts=combined_shifts,
+                    monthly_income_delta_cents=(
+                        req.overrides.monthly_income_delta_cents
+                        if req.overrides.monthly_income_delta_cents != 0
+                        else base_ov.monthly_income_delta_cents
+                    ),
+                    monthly_expense_delta_cents=(
+                        req.overrides.monthly_expense_delta_cents
+                        if req.overrides.monthly_expense_delta_cents != 0
+                        else base_ov.monthly_expense_delta_cents
+                    ),
+                    one_off_events=combined_one_offs,
+                )
+
+        return run_scenario_simulation(
+            starting_balance_cents=budget.safe_to_spend.total_liquid_cash_cents,
+            recurring_bills=bills,
+            goals=goals,
+            transactions=txs,
+            credit_lines=credit_lines,
+            payday_cadence_days=int(settings.get("payday_cadence_days", 14)),
+            next_payday_date=settings.get("next_payday_date"),
+            estimated_paycheck_cents=int(settings.get("expected_paycheck_cents", 220_000)),
+            emergency_buffer_cents=int(settings.get("emergency_buffer_cents", 50_000)),
+            horizon_days=req.horizon_days,
+            overrides=merged_ov,
             today=ref,
         )
 
@@ -556,7 +1156,7 @@ class FinanceService:
             )
             for imp in raw_impulses
         ]
-        recent_txs = [self._to_tx_out(t) for t in self.storage.list_transactions(limit=25)]
+        recent_txs = self.list_transactions(limit=25)
         triage_txs = self.storage.list_transactions(limit=50, needs_review_only=True)
         adhd_stats = build_adhd_stats(self.storage.get_adhd_progress())
         accounts = [AccountOut(**a) for a in self.storage.list_accounts()]
@@ -607,6 +1207,9 @@ class FinanceService:
                 "autopay_missing_count": credit_report.autopay_missing_count,
                 "alerts_count": len(credit_report.alerts),
                 "recommended_strategy": credit_report.recommended_strategy,
+                "five_twenty_four_count": (
+                    credit_report.five_twenty_four.count_5_24 if credit_report.five_twenty_four else 0
+                ),
             },
             goals=goals,
             quant_forecast=quant_forecast,
@@ -614,11 +1217,60 @@ class FinanceService:
             active_ai_provider=active_provider,
         )
 
-    # --- Transactions & Quick Add ---
+    # --- Transactions, Splits, Tags, Comments & Quick Add ---
 
-    def _to_tx_out(self, row: Dict[str, Any]) -> TransactionOut:
+    def _get_comment_counts(self, tx_ids: Sequence[int]) -> Dict[int, int]:
+        if not tx_ids:
+            return {}
+        counts: Dict[int, int] = {}
+        with self.storage._lock:
+            for i in range(0, len(tx_ids), 500):
+                chunk = [int(x) for x in tx_ids[i : i + 500]]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = self.storage._conn.execute(
+                    f"SELECT tx_id, COUNT(*) AS cnt FROM transaction_comments WHERE tx_id IN ({placeholders}) GROUP BY tx_id",
+                    chunk,
+                ).fetchall()
+                for r in rows:
+                    counts[int(r["tx_id"])] = int(r["cnt"])
+        return counts
+
+    def _to_tx_out(
+        self,
+        row: Dict[str, Any],
+        *,
+        comment_counts: Optional[Dict[int, int]] = None,
+    ) -> TransactionOut:
+        tx_id = int(row["id"])
+        raw_splits = row.get("splits")
+        if raw_splits is None:
+            raw_splits = self.storage.get_transaction_splits(tx_id)
+        splits = [
+            TransactionSplitOut(
+                id=int(s["id"]),
+                parent_tx_id=int(s["parent_tx_id"]),
+                jar_id=int(s["jar_id"]) if s.get("jar_id") is not None else None,
+                goal_id=int(s["goal_id"]) if s.get("goal_id") is not None else None,
+                amount_cents=int(s["amount_cents"]),
+                memo=str(s.get("memo", "")),
+                jar_name=str(s.get("jar_name", "")),
+            )
+            for s in raw_splits
+        ]
+        raw_tags = row.get("tags")
+        if raw_tags is None:
+            raw_tags = self.storage.get_transaction_tags(tx_id)
+        tags = [
+            TagOut(id=int(tg["id"]), name=str(tg["name"]), color=str(tg.get("color", "#06b6d4")))
+            for tg in raw_tags
+        ]
+        c_count = (
+            comment_counts.get(tx_id, 0)
+            if comment_counts is not None
+            else len(self.storage.list_transaction_comments(tx_id))
+        )
         return TransactionOut(
-            id=int(row["id"]),
+            id=tx_id,
             account_id=int(row["account_id"]),
             jar_id=int(row["jar_id"]) if row.get("jar_id") is not None else None,
             jar_name=row.get("jar_name", ""),
@@ -634,7 +1286,73 @@ class FinanceService:
             needs_review=bool(row.get("needs_review", 0)),
             source=row.get("source", "manual"),
             created_at=row["created_at"],
+            splits=splits,
+            tags=tags,
+            comment_count=c_count,
         )
+
+    def _persist_rule_changes_for_tx(self, tx_row: Dict[str, Any], changes: Dict[str, Any]) -> bool:
+        tx_id = int(tx_row["id"])
+        mutated = False
+        tx_updates: Dict[str, Any] = {}
+        if "jar_id" in changes and changes["jar_id"] is not None:
+            if self.storage.get_jar(int(changes["jar_id"])):
+                tx_updates["jar_id"] = int(changes["jar_id"])
+                tx_updates["needs_review"] = 0
+                tx_updates["confidence"] = 1.0
+        if "memo" in changes and isinstance(changes["memo"], str):
+            tx_updates["memo"] = changes["memo"][:300]
+        if tx_updates:
+            self.storage.update_transaction(tx_id, tx_updates)
+            mutated = True
+
+        tags_to_add = changes.get("tags_to_add") or []
+        if tags_to_add:
+            existing = [t["name"] for t in self.storage.get_transaction_tags(tx_id)]
+            merged = list(existing)
+            lower_set = {x.lower() for x in merged}
+            for tag in tags_to_add:
+                cleaned = str(tag).strip()
+                if cleaned and cleaned.lower() not in lower_set:
+                    merged.append(cleaned)
+                    lower_set.add(cleaned.lower())
+            self.storage.set_transaction_tags(tx_id, merged)
+            mutated = True
+
+        computed_splits = changes.get("splits") or []
+        if computed_splits:
+            parent_amt = int(tx_row["amount_cents"])
+            valid_splits = validate_splits(parent_amt, computed_splits)
+            self.storage.set_transaction_splits(tx_id, valid_splits)
+            mutated = True
+
+        for alloc in changes.get("goal_allocations") or []:
+            gid = int(alloc["goal_id"])
+            amt = int(alloc["amount_cents"])
+            existing_goal = self.storage.get_goal(gid)
+            if existing_goal and amt > 0:
+                new_saved = int(existing_goal["saved_cents"]) + amt
+                new_status = "funded" if new_saved >= int(existing_goal["target_cents"]) else existing_goal["status"]
+                self.storage.update_goal(gid, {"saved_cents": new_saved, "status": new_status})
+                mutated = True
+
+        return mutated
+
+    def _apply_active_rules_to_tx(self, tx_row: Dict[str, Any]) -> Dict[str, Any]:
+        active_rules = self.storage.list_rules(active_only=True)
+        if not active_rules:
+            return tx_row
+        rule_groups = self.storage.list_rule_groups()
+        tx_id = int(tx_row["id"])
+        tx_enriched = dict(tx_row)
+        tx_enriched["tags"] = [t["name"] for t in self.storage.get_transaction_tags(tx_id)]
+        res = self.rule_engine.evaluate_transaction(tx_enriched, active_rules, rule_groups=rule_groups)
+        if res.matched and res.changes:
+            self._persist_rule_changes_for_tx(tx_row, res.changes)
+            refreshed = self.storage.get_transaction(tx_id)
+            if refreshed:
+                return refreshed
+        return tx_row
 
     def add_transaction_raw(
         self,
@@ -652,6 +1370,7 @@ class FinanceService:
         external_id: str = "",
         adjust_balance: bool = True,
         run_auto_sync: bool = True,
+        apply_rules: bool = True,
     ) -> Optional[TransactionOut]:
         acct_id = account_id if account_id is not None else self.storage.get_default_account_id()
         norm = normalize_merchant(merchant)
@@ -670,7 +1389,7 @@ class FinanceService:
         elif tx_type == TransactionType.INCOME.value:
             jar_id = None
             if not subcategory:
-                subcategory = "Income"
+                subcategory = self.categorizer.classify_income_subcategory(merchant, memo)
         elif tx_type == TransactionType.TRANSFER.value:
             jar_id = None
             if not subcategory:
@@ -699,6 +1418,9 @@ class FinanceService:
         )
         if row is None:
             return None
+
+        if apply_rules:
+            row = self._apply_active_rules_to_tx(row)
 
         if run_auto_sync:
             reason = (
@@ -760,7 +1482,7 @@ class FinanceService:
         if parsed.tx_type == "income":
             msg = f"Logged +${tx.amount_cents / 100:,.2f} ({tx.merchant}) — auto-budget & Safe-to-Spend updated!"
         else:
-            msg = f"Logged ${tx.amount_cents / 100:,.2f} at {tx.merchant} → {tx.jar_icon} {tx.jar_name}"
+            msg = f"Logged ${tx.amount_cents / 100:,.2f} at {tx.merchant} -> {tx.jar_name}"
         return {"kind": "transaction", "message": msg, "transaction": tx.model_dump()}
 
     def update_transaction(self, tx_id: int, req: TransactionUpdate) -> Optional[TransactionOut]:
@@ -775,6 +1497,12 @@ class FinanceService:
             updates["needs_review"] = 0
             updates["confidence"] = 1.0
         if req.amount_cents is not None:
+            # If parent amount changes and existing splits no longer sum to parent, require explicit split update
+            existing_splits = self.storage.get_transaction_splits(tx_id)
+            if existing_splits and req.amount_cents != int(existing["amount_cents"]):
+                raise ValueError(
+                    "Transaction has child splits; update or clear splits before changing parent amount."
+                )
             updates["amount_cents"] = req.amount_cents
         if req.tx_type is not None:
             updates["tx_type"] = req.tx_type.value
@@ -792,7 +1520,6 @@ class FinanceService:
         if not updated:
             return None
 
-        # Auto-learn merchant rule so ADHD user NEVER has to categorize the same merchant twice!
         if req.learn_merchant_rule and req.jar_id is not None:
             self.storage.upsert_merchant_rule(
                 updated["normalized_merchant"],
@@ -801,7 +1528,7 @@ class FinanceService:
             )
             self.storage.log_budget_event(
                 "learned_rule",
-                f"Learned rule: '{updated['merchant']}' → {updated.get('jar_name', 'Jar')}",
+                f"Learned rule: '{updated['merchant']}' -> {updated.get('jar_name', 'Jar')}",
             )
 
         self.run_self_updating_sync(reason=f"Updated transaction #{tx_id}")
@@ -817,48 +1544,762 @@ class FinanceService:
         self,
         *,
         limit: int = 100,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        account_id: Optional[int] = None,
         jar_id: Optional[int] = None,
         needs_review_only: bool = False,
         search: Optional[str] = None,
     ) -> List[TransactionOut]:
         rows = self.storage.list_transactions(
-            limit=limit, jar_id=jar_id, needs_review_only=needs_review_only, search=search
+            limit=max(1, min(_MAX_TX_LIMIT, int(limit))),
+            start_date=start_date,
+            end_date=end_date,
+            account_id=account_id,
+            jar_id=jar_id,
+            needs_review_only=needs_review_only,
+            search=search,
+            include_splits=True,
+            include_tags=True,
         )
-        return [self._to_tx_out(r) for r in rows]
+        comment_counts = self._get_comment_counts([int(r["id"]) for r in rows])
+        return [self._to_tx_out(r, comment_counts=comment_counts) for r in rows]
 
-    # --- Multi-Format Bank Statement Ingestion (CSV, TSV, OFX/QFX, QIF, JSON) ---
+    def set_transaction_splits(
+        self,
+        tx_id: int,
+        req: TransactionSplitsRequest,
+    ) -> List[TransactionSplitOut]:
+        parent = self.storage.get_transaction(tx_id)
+        if not parent:
+            raise ValueError(f"Transaction {tx_id} not found")
+        raw_splits = [sp.model_dump() for sp in req.splits]
+        validated = validate_splits(int(parent["amount_cents"]), raw_splits)
+        for sp in validated:
+            if sp.get("jar_id") is not None and not self.storage.get_jar(int(sp["jar_id"])):
+                raise ValueError(f"Unknown jar ID: {sp['jar_id']}")
+            if sp.get("goal_id") is not None and not self.storage.get_goal(int(sp["goal_id"])):
+                raise ValueError(f"Unknown goal ID: {sp['goal_id']}")
+        saved = self.storage.set_transaction_splits(tx_id, validated)
+        self.run_self_updating_sync(reason=f"Split transaction #{tx_id} into {len(saved)} lines")
+        return [TransactionSplitOut(**s) for s in saved]
+
+    def clear_transaction_splits(self, tx_id: int) -> None:
+        if not self.storage.get_transaction(tx_id):
+            raise ValueError(f"Transaction {tx_id} not found")
+        self.storage.clear_transaction_splits(tx_id)
+        self.run_self_updating_sync(reason=f"Cleared splits on transaction #{tx_id}")
+
+    def set_transaction_tags(self, tx_id: int, req: TransactionTagsRequest) -> List[TagOut]:
+        rows = self.storage.set_transaction_tags(tx_id, req.tags)
+        return [TagOut(**r) for r in rows]
+
+    def list_transaction_comments(self, tx_id: int) -> List[TransactionCommentOut]:
+        if not self.storage.get_transaction(tx_id):
+            raise ValueError(f"Transaction {tx_id} not found")
+        return [TransactionCommentOut(**c) for c in self.storage.list_transaction_comments(tx_id)]
+
+    def add_transaction_comment(
+        self,
+        tx_id: int,
+        req: TransactionCommentCreate,
+    ) -> TransactionCommentOut:
+        saved = self.storage.add_transaction_comment(tx_id, req.body, author=req.author)
+        return TransactionCommentOut(**saved)
+
+    # --- Firefly III-Inspired Rules & Rule Groups ---
+
+    def _validate_rule_triggers(self, triggers: Sequence[Any]) -> None:
+        for trig in triggers:
+            op = trig.op if hasattr(trig, "op") else trig.get("op")
+            val = trig.value if hasattr(trig, "value") else trig.get("value")
+            if op == "regex":
+                validate_safe_regex(str(val or ""))
+
+    def list_rule_groups(self) -> List[RuleGroupOut]:
+        return [RuleGroupOut(**g) for g in self.storage.list_rule_groups()]
+
+    def create_rule_group(self, req: RuleGroupCreate) -> RuleGroupOut:
+        saved = self.storage.create_rule_group(req.name.strip(), priority=req.priority, active=req.active)
+        return RuleGroupOut(**saved)
+
+    def list_rules(self, active_only: bool = False) -> List[RuleOut]:
+        return [RuleOut(**r) for r in self.storage.list_rules(active_only=active_only)]
+
+    def create_rule(self, req: RuleCreate) -> RuleOut:
+        self._validate_rule_triggers(req.triggers)
+        saved = self.storage.create_rule(
+            {
+                "group_id": req.group_id,
+                "name": req.name.strip(),
+                "priority": req.priority,
+                "strict_and": req.strict_and,
+                "stop_processing": req.stop_processing,
+                "triggers": [t.model_dump() for t in req.triggers],
+                "actions": [a.model_dump() for a in req.actions],
+                "active": req.active,
+            }
+        )
+        self.storage.log_budget_event("rule_created", f"Created automation rule '{saved['name']}'")
+        return RuleOut(**saved)
+
+    def update_rule(self, rule_id: int, req: RuleUpdate) -> Optional[RuleOut]:
+        if req.triggers is not None:
+            self._validate_rule_triggers(req.triggers)
+        updates = req.model_dump(exclude_none=True)
+        if "triggers" in updates and req.triggers is not None:
+            updates["triggers"] = [t.model_dump() for t in req.triggers]
+        if "actions" in updates and req.actions is not None:
+            updates["actions"] = [a.model_dump() for a in req.actions]
+        updated = self.storage.update_rule(rule_id, updates)
+        return RuleOut(**updated) if updated else None
+
+    def delete_rule(self, rule_id: int) -> bool:
+        return self.storage.delete_rule(rule_id)
+
+    def test_rule(self, rule_id: int, lookback_days: int = _LOOKBACK_730D) -> RuleTestResult:
+        rule = self.storage.get_rule(rule_id)
+        if not rule:
+            raise ValueError(f"Rule {rule_id} not found")
+        txs, _ = self._load_recent_transactions_with_splits(days=lookback_days)
+        for t in txs:
+            if t.get("tags") and isinstance(t["tags"][0], dict):
+                t["tags"] = [tg["name"] for tg in t["tags"]]
+        return dry_run_rule(rule, txs, lookback_days=lookback_days)
+
+    def apply_rule(self, rule_id: int, lookback_days: int = _LOOKBACK_730D) -> Dict[str, Any]:
+        rule = self.storage.get_rule(rule_id)
+        if not rule:
+            raise ValueError(f"Rule {rule_id} not found")
+        txs, _ = self._load_recent_transactions_with_splits(days=lookback_days)
+        for t in txs:
+            if t.get("tags") and isinstance(t["tags"][0], dict):
+                t["tags"] = [tg["name"] for tg in t["tags"]]
+        matches = self.rule_engine.apply_rules_batch(txs, [rule])
+        updated_count = 0
+        with self.storage.transaction(immediate=True):
+            for tx_row, res in matches:
+                if res.changes and self._persist_rule_changes_for_tx(tx_row, res.changes):
+                    updated_count += 1
+        if updated_count > 0:
+            self.run_self_updating_sync(reason=f"Applied rule '{rule['name']}' to {updated_count} tx")
+        return {
+            "rule_id": rule_id,
+            "rule_name": rule["name"],
+            "scanned_count": len(txs),
+            "matched_count": len(matches),
+            "updated_count": updated_count,
+            "lookback_days": lookback_days,
+        }
+
+    # --- Banking Connectors (Plaid Hosted Link BYOK, SimpleFIN, Connections) ---
+
+    def _to_connection_out(self, row: Dict[str, Any]) -> ConnectionOut:
+        provider = str(row["provider"])
+        hist_days = int(row.get("history_days_requested", 730))
+        status = str(row.get("status", "active"))
+        refresh_rem = _days_until_iso_timestamp(row.get("token_expires_at"))
+        if provider == "schwab" and refresh_rem is not None and refresh_rem <= 0:
+            status = "needs_reauth"
+        if not self.secrets.is_unlocked() and status == "active":
+            status = "paused_locked"
+        return ConnectionOut(
+            id=int(row["id"]),
+            provider=provider,  # type: ignore[arg-type]
+            item_id=str(row.get("item_id", "")),
+            institution=str(row.get("institution", "")),
+            env=str(row.get("env", "production")),
+            status=status,  # type: ignore[arg-type]
+            token_expires_at=row.get("token_expires_at"),
+            refresh_days_remaining=refresh_rem,
+            last_synced_at=row.get("last_synced_at"),
+            history_days_requested=hist_days,
+            needs_relink_for_730d=(provider == "plaid" and hist_days < 730),
+            created_at=str(row.get("created_at", "")),
+            updated_at=str(row.get("updated_at", "")),
+        )
+
+    def list_connections(self) -> List[ConnectionOut]:
+        return [self._to_connection_out(r) for r in self.storage.list_connections()]
+
+    def delete_connection(self, connection_id: int) -> bool:
+        existing = self.storage.get_connection(connection_id)
+        if not existing:
+            return False
+        if self.secrets.is_unlocked():
+            self.secrets.delete(f"conn:{connection_id}")
+        ok = self.storage.delete_connection(connection_id)
+        if ok:
+            self.storage.log_budget_event(
+                "connector_removed",
+                f"Disconnected {existing['provider']} ({existing.get('institution', '')})",
+            )
+        return ok
+
+    def _build_plaid_client(self) -> Tuple[PlaidClient, str]:
+        self._require_vault_unlocked()
+        cfg = self.secrets.get_json("plaid:config")
+        if not cfg or not cfg.get("client_id") or not cfg.get("secret"):
+            raise ConnectorError(
+                "Plaid BYOK credentials are not configured. Save your Plaid client_id and secret in Vault & Connectors first."
+            )
+        env = str(cfg.get("env") or "sandbox").strip().lower()
+        return (
+            PlaidClient(
+                client_id=str(cfg["client_id"]),
+                secret=str(cfg["secret"]),
+                env=env,
+                transport=self._plaid_transport,
+            ),
+            env,
+        )
+
+    def configure_plaid(self, req: PlaidConfigRequest) -> Dict[str, Any]:
+        self._require_vault_unlocked()
+        self.secrets.set_json(
+            "plaid:config",
+            {"client_id": req.client_id.strip(), "secret": req.secret.strip(), "env": req.env},
+        )
+        self.storage.log_budget_event("connector_config", f"Plaid BYOK credentials sealed ({req.env})")
+        return {
+            "configured": True,
+            "env": req.env,
+            "client_id_masked": mask_secret(req.client_id),
+        }
+
+    def create_plaid_link_token(self, req: PlaidLinkTokenRequest) -> PlaidLinkTokenResponse:
+        client, _env = self._build_plaid_client()
+        res = client.create_link_token(
+            days_requested=req.days_requested,
+            products=tuple(req.products or ["transactions"]),
+            optional_products=tuple(req.optional_products or ["liabilities", "investments"]),
+        )
+        return PlaidLinkTokenResponse(
+            link_token=res.link_token,
+            hosted_link_url=res.hosted_link_url,
+            expiration=res.expiration,
+            days_requested=res.days_requested,
+        )
+
+    def poll_plaid_link(self, req: PlaidPollLinkRequest) -> Dict[str, Any]:
+        client, _env = self._build_plaid_client()
+        poll = client.poll_link_token(req.link_token)
+        return {
+            "status": poll.status,
+            "public_token": poll.public_token,
+            "institution_id": poll.institution_id,
+            "institution_name": poll.institution_name,
+            "institution": poll.institution_name or "Plaid Institution",
+            "accounts": poll.accounts,
+        }
+
+    def exchange_plaid_token(self, req: PlaidExchangeRequest) -> ConnectionOut:
+        client, env = self._build_plaid_client()
+        ex = client.exchange_public_token(req.public_token)
+        row = self.storage.upsert_connection(
+            {
+                "provider": "plaid",
+                "item_id": ex.item_id,
+                "institution": req.institution.strip() or "Plaid Institution",
+                "env": env,
+                "sync_cursor": "",
+                "status": "active",
+                "history_days_requested": 730,
+            }
+        )
+        self.secrets.set_json(
+            f"conn:{row['id']}",
+            {"access_token": ex.access_token, "item_id": ex.item_id},
+        )
+        self.storage.log_budget_event("connector_added", f"Connected Plaid institution '{row['institution']}' (730d)")
+        return self._to_connection_out(row)
+
+    def _ensure_local_account_for_normalized(self, acct: NormalizedAccount) -> int:
+        existing_accounts = self.storage.list_accounts()
+        for local in existing_accounts:
+            if (
+                local["name"].strip().lower() == acct.name.strip().lower()
+                and local.get("institution", "").strip().lower() == acct.institution.strip().lower()
+            ):
+                self.storage.set_account_balance(int(local["id"]), acct.balance_cents)
+                return int(local["id"])
+        created = self.storage.create_account(
+            name=acct.name[:80],
+            account_type=acct.account_type if acct.account_type in ("checking", "savings", "credit", "cash", "trading") else "checking",
+            balance_cents=acct.balance_cents,
+            institution=acct.institution[:80],
+            is_liquid=acct.is_liquid,
+        )
+        return int(created["id"])
+
+    def _ingest_normalized_transactions(
+        self,
+        *,
+        acct_map: Dict[str, int],
+        transactions: Sequence[NormalizedTransaction],
+        source_tag: str,
+    ) -> Tuple[int, int]:
+        default_acct_id = self.storage.get_default_account_id()
+        tx_indexes: Dict[int, List[Tuple[date, str, int, str, str]]] = {}
+        imported = 0
+        duplicates = 0
+        for ntx in transactions:
+            if ntx.pending:
+                continue
+            acct_id = acct_map.get(ntx.external_account_id, default_acct_id)
+            if acct_id not in tx_indexes:
+                tx_indexes[acct_id] = self._load_account_tx_index(acct_id)
+            norm = normalize_merchant(ntx.merchant)
+            if self._matches_cross_source_duplicate(
+                tx_indexes[acct_id], ntx.tx_date, ntx.tx_type, ntx.amount_cents, norm
+            ):
+                duplicates += 1
+                continue
+            created = self.add_transaction_raw(
+                account_id=acct_id,
+                tx_type=ntx.tx_type,
+                amount_cents=ntx.amount_cents,
+                merchant=ntx.merchant,
+                memo=ntx.memo,
+                subcategory=ntx.subcategory,
+                tx_date=ntx.tx_date,
+                source=source_tag,
+                deduplicate=True,
+                external_id=ntx.external_id,
+                adjust_balance=False,
+                run_auto_sync=False,
+                apply_rules=True,
+            )
+            if created is None:
+                duplicates += 1
+            else:
+                imported += 1
+                try:
+                    tx_indexes[acct_id].append(
+                        (date.fromisoformat(ntx.tx_date), ntx.tx_type, ntx.amount_cents, norm, source_tag)
+                    )
+                except ValueError:
+                    pass
+        return imported, duplicates
+
+    def sync_plaid(self, connection_id: Optional[int] = None) -> Dict[str, Any]:
+        self._require_vault_unlocked()
+        client, _env = self._build_plaid_client()
+        all_conns = self.storage.list_connections()
+        targets = [
+            c
+            for c in all_conns
+            if c["provider"] == "plaid" and (connection_id is None or int(c["id"]) == int(connection_id))
+        ]
+        if not targets:
+            raise ConnectorError("No linked Plaid connections found.")
+
+        total_imported = 0
+        total_dups = 0
+        total_removed = 0
+        liabilities_synced = 0
+        holdings_synced = 0
+
+        for conn in targets:
+            cid = int(conn["id"])
+            creds = self.secrets.get_json(f"conn:{cid}")
+            if not creds or not creds.get("access_token"):
+                self.storage.upsert_connection({"id": cid, "provider": "plaid", "status": "needs_reauth"})
+                continue
+            access_token = str(creds["access_token"])
+            cursor = str(conn.get("sync_cursor") or "") or None
+            institution = str(conn.get("institution") or "Plaid")
+
+            sync_res = client.sync_transactions(access_token, cursor=cursor, institution=institution)
+            try:
+                bal_accounts = client.get_accounts_balances(access_token, institution=institution)
+            except ConnectorError:
+                bal_accounts = sync_res.accounts
+
+            acct_map: Dict[str, int] = {}
+            for na in bal_accounts or sync_res.accounts:
+                acct_map[na.external_id] = self._ensure_local_account_for_normalized(na)
+
+            imp, dups = self._ingest_normalized_transactions(
+                acct_map=acct_map,
+                transactions=list(sync_res.added) + list(sync_res.modified),
+                source_tag="plaid_sync",
+            )
+            total_imported += imp
+            total_dups += dups
+            total_removed += len(sync_res.removed_tx_ids)
+
+            # Optional Plaid Liabilities -> credit_lines
+            try:
+                liabs = client.get_liabilities(access_token, institution=institution)
+                payloads = self.plaid_liabilities_adapter.to_credit_line_payloads(liabs)
+                existing_lines = {cl["name"].strip().lower(): cl for cl in self.storage.list_credit_lines(active_only=False)}
+                for pl in payloads:
+                    key = str(pl.get("name", "")).strip().lower()
+                    if key in existing_lines:
+                        self.storage.update_credit_line(int(existing_lines[key]["id"]), pl)
+                    else:
+                        self.storage.create_credit_line(pl)
+                    liabilities_synced += 1
+            except ConnectorError:
+                pass
+
+            # Optional Plaid Investments -> holdings
+            try:
+                inv_holdings = client.get_investments_holdings(access_token)
+                for nh in inv_holdings:
+                    self._upsert_normalized_holding(nh, connection_id=cid, account_id=acct_map.get(nh.external_account_id))
+                    holdings_synced += 1
+            except ConnectorError:
+                pass
+
+            self.storage.upsert_connection(
+                {
+                    "id": cid,
+                    "provider": "plaid",
+                    "sync_cursor": sync_res.next_cursor or "",
+                    "status": "active",
+                    "last_synced_at": utc_now_iso(),
+                }
+            )
+
+        self._backfill_net_worth_snapshots(days=_LOOKBACK_730D)
+        sync_summary = self.run_self_updating_sync(reason=f"Plaid synced ({total_imported} new tx)")
+        return {
+            "synced_connections": len(targets),
+            "imported_count": total_imported,
+            "duplicate_count": total_dups,
+            "removed_count": total_removed,
+            "liabilities_synced": liabilities_synced,
+            "holdings_synced": holdings_synced,
+            "history_note": "730-day history applies when linking new Items; existing Items require re-Link for 2-year backfill.",
+            "sync": sync_summary,
+        }
+
+    def claim_simplefin(self, req: SimpleFINClaimRequest) -> ConnectionOut:
+        self._require_vault_unlocked()
+        client = SimpleFINClient(transport=self._simplefin_transport)
+        access_url = client.claim_setup_token(req.setup_token)
+        item_key = hashlib.sha256(access_url.encode("utf-8")).hexdigest()[:16]
+        row = self.storage.upsert_connection(
+            {
+                "provider": "simplefin",
+                "item_id": item_key,
+                "institution": req.institution.strip() or "SimpleFIN Bridge",
+                "env": "production",
+                "status": "active",
+                "history_days_requested": 730,
+            }
+        )
+        self.secrets.set_json(f"conn:{row['id']}", {"access_url": access_url})
+        self.storage.log_budget_event("connector_added", f"Claimed SimpleFIN Bridge '{row['institution']}'")
+        return self._to_connection_out(row)
+
+    def sync_simplefin(self, connection_id: Optional[int] = None, days: int = _LOOKBACK_730D) -> Dict[str, Any]:
+        self._require_vault_unlocked()
+        client = SimpleFINClient(transport=self._simplefin_transport)
+        targets = [
+            c
+            for c in self.storage.list_connections()
+            if c["provider"] == "simplefin" and (connection_id is None or int(c["id"]) == int(connection_id))
+        ]
+        if not targets:
+            raise ConnectorError("No linked SimpleFIN connections found.")
+
+        total_imported = 0
+        total_dups = 0
+        accounts_synced = 0
+        for conn in targets:
+            cid = int(conn["id"])
+            creds = self.secrets.get_json(f"conn:{cid}")
+            if not creds or not creds.get("access_url"):
+                self.storage.upsert_connection({"id": cid, "provider": "simplefin", "status": "needs_reauth"})
+                continue
+            res = client.fetch_accounts(str(creds["access_url"]), days=max(1, min(730, int(days))))
+            acct_map: Dict[str, int] = {}
+            for na in res.accounts:
+                acct_map[na.external_id] = self._ensure_local_account_for_normalized(na)
+                accounts_synced += 1
+            imp, dups = self._ingest_normalized_transactions(
+                acct_map=acct_map,
+                transactions=res.added,
+                source_tag="simplefin_sync",
+            )
+            total_imported += imp
+            total_dups += dups
+            self.storage.upsert_connection(
+                {
+                    "id": cid,
+                    "provider": "simplefin",
+                    "status": "active",
+                    "last_synced_at": utc_now_iso(),
+                }
+            )
+
+        self._backfill_net_worth_snapshots(days=_LOOKBACK_730D)
+        sync_summary = self.run_self_updating_sync(reason=f"SimpleFIN synced ({total_imported} new tx)")
+        return {
+            "synced_connections": len(targets),
+            "accounts_synced": accounts_synced,
+            "imported_count": total_imported,
+            "duplicate_count": total_dups,
+            "sync": sync_summary,
+        }
+
+    # --- Optional Read-Only IMAP Email Scanner ---
+
+    def get_email_config(self) -> EmailConfigOut:
+        s = self.storage.get_settings()
+        return EmailConfigOut(
+            enabled=bool(s.get("email_scanner_enabled", 0)),
+            imap_host=str(s.get("email_imap_host", "")),
+            imap_port=int(s.get("email_imap_port", 993)),
+            username=str(s.get("email_username", "")),
+            password_configured=bool(self._safe_get_secret("email:app_password")),
+            folder=str(s.get("email_folder", "INBOX")),
+            lookback_days=int(s.get("email_lookback_days", 30)),
+            read_only_mode=True,
+        )
+
+    def update_email_config(self, req: EmailConfigUpdate) -> EmailConfigOut:
+        updates: Dict[str, Any] = {}
+        if req.enabled is not None:
+            updates["email_scanner_enabled"] = int(bool(req.enabled))
+        if req.imap_host is not None:
+            updates["email_imap_host"] = req.imap_host.strip()
+        if req.imap_port is not None:
+            updates["email_imap_port"] = int(req.imap_port)
+        if req.username is not None:
+            updates["email_username"] = req.username.strip()
+        if req.folder is not None:
+            updates["email_folder"] = req.folder.strip() or "INBOX"
+        if req.lookback_days is not None:
+            updates["email_lookback_days"] = int(req.lookback_days)
+        if updates:
+            self.storage.update_settings(updates)
+        if req.clear_password:
+            self._require_vault_unlocked()
+            self.secrets.delete("email:app_password")
+        elif req.app_password is not None and req.app_password.strip():
+            self._require_vault_unlocked()
+            self.secrets.set("email:app_password", req.app_password.strip())
+        return self.get_email_config()
+
+    def scan_email(self) -> Dict[str, Any]:
+        self._require_vault_unlocked()
+        cfg = self.get_email_config()
+        if not cfg.enabled:
+            raise ConnectorError("Email scanner is disabled. Enable it in Vault & Connectors first.")
+        app_password = self.secrets.get("email:app_password").strip()
+        if not cfg.imap_host or not cfg.username or not app_password:
+            raise ConnectorError("IMAP host, username, and App Password are required before scanning.")
+
+        existing_uids = {item["uid_key"] for item in self.storage.list_email_queue(limit=500)}
+        scanner = EmailScanner(
+            IMAPConfig(
+                host=cfg.imap_host,
+                port=cfg.imap_port,
+                username=cfg.username,
+                app_password=app_password,
+                mailbox=cfg.folder or "INBOX",
+                lookback_days=cfg.lookback_days,
+            ),
+            imap_factory=self._imap_factory,
+        )
+        res = scanner.scan(existing_uid_keys=existing_uids)
+        queued_items: List[EmailQueueItem] = []
+        for cand in res.candidates:
+            saved = self.storage.enqueue_email_item(
+                {
+                    "uid_key": cand.uid_key,
+                    "sender": cand.sender,
+                    "subject": cand.subject,
+                    "received_at": cand.received_at,
+                    "extracted_vendor": cand.extracted_vendor,
+                    "amount_cents": cand.amount_cents,
+                    "due_date": cand.due_date,
+                    "kind": cand.kind,
+                }
+            )
+            if saved:
+                queued_items.append(EmailQueueItem(**saved))
+        skipped_duplicates = max(0, len(res.candidates) - len(queued_items))
+        return {
+            "scanned_count": res.scanned_count,
+            "scanned_messages": res.scanned_count,
+            "matched_count": res.matched_count,
+            "queued_count": len(queued_items),
+            "skipped_duplicates": skipped_duplicates,
+            "read_only_verified": res.read_only_verified,
+            "scanned_at": res.scanned_at,
+            "warnings": list(res.warnings),
+            "items": [i.model_dump() for i in queued_items],
+        }
+
+    def list_email_queue(self, status: Optional[str] = None, limit: int = 100) -> List[EmailQueueItem]:
+        return [EmailQueueItem(**r) for r in self.storage.list_email_queue(status=status, limit=limit)]
+
+    def approve_email_queue_item(self, item_id: int) -> Dict[str, Any]:
+        item = self.storage.get_email_queue_item(item_id)
+        if not item:
+            raise ValueError(f"Email queue item {item_id} not found")
+        if item["status"] != "pending":
+            raise ValueError(f"Email queue item {item_id} is already {item['status']}")
+
+        vendor = (item.get("extracted_vendor") or item.get("subject") or "Email Bill").strip()[:100]
+        amount_cents = int(item["amount_cents"]) if item.get("amount_cents") else 0
+        matched_bill_id: Optional[int] = None
+        created_tx: Optional[Dict[str, Any]] = None
+
+        if item.get("kind") == "bill" and amount_cents > 0:
+            due = item.get("due_date") or (date.today() + timedelta(days=7)).isoformat()
+            bill = self.create_recurring_bill(
+                RecurringBillCreate(
+                    name=vendor,
+                    amount_cents=amount_cents,
+                    next_due_date=due,
+                    is_subscription=False,
+                    is_essential=True,
+                )
+            )
+            matched_bill_id = int(bill["id"])
+        elif amount_cents > 0:
+            tx_date = (item.get("received_at") or date.today().isoformat())[:10]
+            try:
+                date.fromisoformat(tx_date)
+            except ValueError:
+                tx_date = date.today().isoformat()
+            tx = self.add_transaction_raw(
+                account_id=None,
+                tx_type=TransactionType.EXPENSE.value,
+                amount_cents=amount_cents,
+                merchant=vendor,
+                memo=f"Approved email receipt: {item.get('subject', '')[:180]}",
+                tx_date=tx_date,
+                source="email_receipt",
+                deduplicate=True,
+                external_id=str(item["uid_key"]),
+            )
+            if tx:
+                created_tx = tx.model_dump()
+
+        updated = self.storage.update_email_queue_status(item_id, "approved", matched_bill_id=matched_bill_id)
+        return {
+            "approved": True,
+            "item": EmailQueueItem(**updated).model_dump() if updated else None,
+            "matched_bill_id": matched_bill_id,
+            "transaction": created_tx,
+        }
+
+    def dismiss_email_queue_item(self, item_id: int) -> Optional[EmailQueueItem]:
+        updated = self.storage.update_email_queue_status(item_id, "dismissed")
+        return EmailQueueItem(**updated) if updated else None
+
+    # --- Multi-Format Bank Statement Ingestion (CSV, TSV, PDF, OFX/QFX, QIF, JSON/Plaid) ---
+
+    @staticmethod
+    def _merchants_semantically_match(norm_a: str, norm_b: str) -> bool:
+        if not norm_a or not norm_b:
+            return False
+        if norm_a == norm_b:
+            return True
+        if len(norm_a) >= 4 and len(norm_b) >= 4 and (norm_a in norm_b or norm_b in norm_a):
+            return True
+        toks_a = {t for t in norm_a.split() if len(t) >= 2}
+        toks_b = {t for t in norm_b.split() if len(t) >= 2}
+        if not toks_a or not toks_b:
+            return False
+        overlap = len(toks_a & toks_b) / len(toks_a | toks_b)
+        return overlap >= 0.5
+
+    def _load_account_tx_index(self, acct_id: int) -> List[Tuple[date, str, int, str, str]]:
+        """Snapshot existing account transactions for cross-source (Plaid <-> NFCU CSV/PDF) dedup."""
+        rows = self.storage._conn.execute(
+            """
+            SELECT tx_date, tx_type, amount_cents, normalized_merchant, source
+            FROM transactions
+            WHERE account_id = ?
+            """,
+            (acct_id,),
+        ).fetchall()
+        index: List[Tuple[date, str, int, str, str]] = []
+        for r in rows:
+            try:
+                index.append(
+                    (
+                        date.fromisoformat(str(r["tx_date"])),
+                        str(r["tx_type"]),
+                        int(r["amount_cents"]),
+                        str(r["normalized_merchant"] or ""),
+                        str(r["source"] or ""),
+                    )
+                )
+            except ValueError:
+                continue
+        return index
+
+    def _matches_cross_source_duplicate(
+        self,
+        existing_index: List[Tuple[date, str, int, str, str]],
+        tx_date_str: str,
+        tx_type: str,
+        amount_cents: int,
+        norm_merchant: str,
+    ) -> bool:
+        """Detect same transaction across Plaid JSON vs Navy Federal CSV/PDF (±2d posting lag)."""
+        try:
+            cand_dt = date.fromisoformat(tx_date_str)
+        except ValueError:
+            return False
+        for ex_dt, ex_type, ex_amt, ex_norm, _ex_src in existing_index:
+            if ex_amt != amount_cents or ex_type != tx_type:
+                continue
+            if abs((cand_dt - ex_dt).days) <= 2 and self._merchants_semantically_match(norm_merchant, ex_norm):
+                return True
+        return False
 
     def preview_statement(
         self,
-        content: str,
+        content: Any,
         *,
         filename: str = "",
         account_id: Optional[int] = None,
         flip_expense_sign: bool = False,
         detect_transfers: bool = True,
+        institution: str = "auto",
+        skip_pending: bool = True,
     ) -> Dict[str, Any]:
-        """Dry-run statement ingestion returning format, counts, duplicates, and sample rows."""
         res = ingest_statement(
             content,
             filename=filename,
             flip_expense_sign=flip_expense_sign,
             detect_transfers=detect_transfers,
+            institution=institution,
+            skip_pending=skip_pending,
         )
         acct_id = account_id if account_id is not None else self.storage.get_default_account_id()
         existing_fps = {
             r["fingerprint"]
             for r in self.storage._conn.execute("SELECT fingerprint FROM transactions WHERE fingerprint IS NOT NULL").fetchall()
         }
+        existing_index = self._load_account_tx_index(acct_id)
         dup_count = 0
+        cross_source_dups = 0
         sample = []
         for r in res.rows:
             norm = normalize_merchant(r.merchant)
             fp = compute_tx_fingerprint(
                 acct_id, r.tx_date, r.tx_type, r.amount_cents, norm, r.memo, external_id=r.external_id
             )
-            is_dup = fp in existing_fps
+            is_exact_dup = fp in existing_fps
+            is_cross_dup = (not is_exact_dup) and self._matches_cross_source_duplicate(
+                existing_index, r.tx_date, r.tx_type, r.amount_cents, norm
+            )
+            is_dup = is_exact_dup or is_cross_dup
             if is_dup:
                 dup_count += 1
+            if is_cross_dup:
+                cross_source_dups += 1
             if len(sample) < 8:
                 sample.append(
                     {
@@ -867,13 +2308,17 @@ class FinanceService:
                         "tx_type": r.tx_type,
                         "amount_cents": r.amount_cents,
                         "duplicate": is_dup,
+                        "cross_source_duplicate": is_cross_dup,
                     }
                 )
         return {
             "format_detected": res.format_detected,
+            "detected_institution": res.detected_institution,
             "total_parsed": len(res.rows),
             "new_count": max(0, len(res.rows) - dup_count),
             "duplicate_count": dup_count,
+            "cross_source_duplicates": cross_source_dups,
+            "pending_skipped": res.pending_skipped,
             "transfers_detected": res.transfers_detected,
             "detected_balance_cents": res.detected_balance_cents,
             "warnings": res.warnings[:20],
@@ -882,24 +2327,42 @@ class FinanceService:
 
     def import_statement(
         self,
-        content: str,
+        content: Any,
         *,
         filename: str = "",
         account_id: Optional[int] = None,
         flip_expense_sign: bool = False,
         detect_transfers: bool = True,
         sync_ofx_balance: bool = False,
+        sync_balance: Optional[bool] = None,
+        institution: str = "auto",
+        skip_pending: bool = True,
     ) -> Dict[str, Any]:
         res = ingest_statement(
             content,
             filename=filename,
             flip_expense_sign=flip_expense_sign,
             detect_transfers=detect_transfers,
+            institution=institution,
+            skip_pending=skip_pending,
         )
         acct_id = account_id if account_id is not None else self.storage.get_default_account_id()
+        should_sync_balance = sync_balance if sync_balance is not None else sync_ofx_balance
+        existing_index = self._load_account_tx_index(acct_id)
+        source_tag = (
+            f"{res.detected_institution}_{res.format_detected}_import"
+            if res.detected_institution in ("navy_federal", "plaid")
+            else f"{res.format_detected}_import"
+        )
         imported = 0
         duplicates = 0
+        cross_source_dups = 0
         for r in res.rows:
+            norm = normalize_merchant(r.merchant)
+            if self._matches_cross_source_duplicate(existing_index, r.tx_date, r.tx_type, r.amount_cents, norm):
+                duplicates += 1
+                cross_source_dups += 1
+                continue
             tx = self.add_transaction_raw(
                 account_id=acct_id,
                 tx_type=r.tx_type,
@@ -907,27 +2370,37 @@ class FinanceService:
                 merchant=r.merchant,
                 memo=r.memo,
                 tx_date=r.tx_date,
-                source=f"{res.format_detected}_import",
+                source=source_tag,
                 deduplicate=True,
                 external_id=r.external_id,
-                adjust_balance=not (sync_ofx_balance and res.detected_balance_cents is not None),
+                adjust_balance=not (should_sync_balance and res.detected_balance_cents is not None),
                 run_auto_sync=False,
+                apply_rules=True,
             )
             if tx is None:
                 duplicates += 1
             else:
                 imported += 1
 
-        if sync_ofx_balance and res.detected_balance_cents is not None:
+        if should_sync_balance and res.detected_balance_cents is not None:
             self.storage.set_account_balance(acct_id, res.detected_balance_cents)
 
+        self._backfill_net_worth_snapshots(days=_LOOKBACK_730D)
+        inst_label = (
+            "Navy Federal"
+            if res.detected_institution == "navy_federal"
+            else ("Plaid" if res.detected_institution == "plaid" else res.format_detected.upper())
+        )
         sync = self.run_self_updating_sync(
-            reason=f"Imported {imported} {res.format_detected.upper()} statement transactions"
+            reason=f"Imported {imported} {inst_label} ({res.format_detected.upper()}) transactions"
         )
         return {
             "format_detected": res.format_detected,
+            "detected_institution": res.detected_institution,
             "imported_count": imported,
             "duplicate_count": duplicates,
+            "cross_source_duplicates": cross_source_dups,
+            "pending_skipped": res.pending_skipped,
             "transfers_detected": res.transfers_detected,
             "detected_balance_cents": res.detected_balance_cents,
             "warnings": res.warnings[:20],
@@ -940,14 +2413,16 @@ class FinanceService:
         )
 
     def export_csv(self) -> str:
-        txs = self.storage.list_transactions(limit=5000)
+        txs = self.storage.list_transactions(limit=_MAX_TX_LIMIT)
         return export_transactions_csv(txs)
 
-    # --- Credit Score & Debt Optimization ---
+    # --- Credit Reports, Inquiries, Derogatories & Factor Simulator ---
 
     def get_credit_report(
         self,
         extra_monthly_budget_cents: int = 25_000,
+        *,
+        include_authorized_user: bool = True,
         today: Optional[date] = None,
     ) -> CreditOptimizationReport:
         ref = today or date.today()
@@ -956,17 +2431,24 @@ class FinanceService:
             raw_lines=self.storage.list_credit_lines(active_only=True),
             smoothed_monthly_income_cents=budget.smoothed_monthly_income_cents,
             extra_monthly_budget_cents=extra_monthly_budget_cents,
+            credit_reports=self.storage.list_credit_reports(),
+            credit_inquiries=self.storage.list_credit_inquiries(),
+            credit_derogatories=self.storage.list_credit_derogatories(active_only=False),
+            include_authorized_user=include_authorized_user,
             today=ref,
         )
 
     def create_credit_line(self, req: CreditLineCreate) -> Dict[str, Any]:
-        saved = self.storage.create_credit_line(req.model_dump())
+        data = req.model_dump()
+        data["kind"] = req.kind.value
+        data["autopay_mode"] = req.autopay_mode.value
+        saved = self.storage.create_credit_line(data)
         self.run_self_updating_sync(reason=f"Added credit/debt line {saved['name']}")
         return saved
 
     def update_credit_line(self, line_id: int, req: CreditLineUpdate) -> Optional[Dict[str, Any]]:
         updates = req.model_dump(exclude_none=True)
-        if "autopay_mode" in updates:
+        if "autopay_mode" in updates and hasattr(updates["autopay_mode"], "value"):
             updates["autopay_mode"] = updates["autopay_mode"].value
         updated = self.storage.update_credit_line(line_id, updates)
         if not updated:
@@ -983,7 +2465,527 @@ class FinanceService:
     def evaluate_balance_transfer(self, req: BalanceTransferRequest) -> BalanceTransferResult:
         return self.credit_optimizer.evaluate_balance_transfer(req)
 
-    # --- Goal Optimizer & Purchase Planner ---
+    def list_credit_reports(self) -> List[CreditReportOut]:
+        return [CreditReportOut(**r) for r in self.storage.list_credit_reports()]
+
+    def create_credit_report(self, req: CreditReportCreate) -> CreditReportOut:
+        saved = self.storage.create_credit_report(req.model_dump())
+        return CreditReportOut(**saved)
+
+    def delete_credit_report(self, report_id: int) -> bool:
+        return self.storage.delete_credit_report(report_id)
+
+    def list_credit_inquiries(self) -> List[CreditInquiryOut]:
+        today_str = date.today().isoformat()
+        out = []
+        for r in self.storage.list_credit_inquiries():
+            out.append(
+                CreditInquiryOut(
+                    id=int(r["id"]),
+                    lender=r["lender"],
+                    bureau=r["bureau"],
+                    inquiry_date=r["inquiry_date"],
+                    counts_until=r["counts_until"],
+                    drops_off=r["drops_off"],
+                    is_scoring_active=str(r["counts_until"]) >= today_str,
+                    created_at=str(r.get("created_at", "")),
+                )
+            )
+        return out
+
+    def create_credit_inquiry(self, req: CreditInquiryCreate) -> CreditInquiryOut:
+        saved = self.storage.create_credit_inquiry(req.model_dump())
+        today_str = date.today().isoformat()
+        return CreditInquiryOut(
+            id=int(saved["id"]),
+            lender=saved["lender"],
+            bureau=saved["bureau"],
+            inquiry_date=saved["inquiry_date"],
+            counts_until=saved["counts_until"],
+            drops_off=saved["drops_off"],
+            is_scoring_active=str(saved["counts_until"]) >= today_str,
+            created_at=str(saved.get("created_at", "")),
+        )
+
+    def delete_credit_inquiry(self, inquiry_id: int) -> bool:
+        return self.storage.delete_credit_inquiry(inquiry_id)
+
+    def list_credit_derogatories(self) -> List[CreditDerogatoryOut]:
+        return [CreditDerogatoryOut(**r) for r in self.storage.list_credit_derogatories(active_only=False)]
+
+    def create_credit_derogatory(self, req: CreditDerogatoryCreate) -> CreditDerogatoryOut:
+        saved = self.storage.create_credit_derogatory(req.model_dump())
+        return CreditDerogatoryOut(**saved)
+
+    def delete_credit_derogatory(self, derog_id: int) -> bool:
+        return self.storage.delete_credit_derogatory(derog_id)
+
+    def import_credit_report(
+        self,
+        content: Any,
+        *,
+        filename: str = "",
+        bureau_hint: str = "auto",
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Parse an official AnnualCreditReport PDF or structured JSON report.
+        PDF imports ALWAYS default to `needs_review=True` preview until explicitly confirmed (`confirm=True`).
+        """
+        bundle = self.credit_report_importer.import_auto(content, filename=filename, bureau_hint=bureau_hint)
+        out = bundle.to_dict()
+        should_commit = bool(confirm) or (not bundle.needs_review)
+        committed_counts = {"reports": 0, "inquiries": 0, "derogatories": 0, "credit_lines": 0}
+        if should_commit:
+            for rep in bundle.reports:
+                if rep.score is not None and 300 <= int(rep.score) <= 850:
+                    model_val = rep.model if rep.model in ("fico8", "vantage3", "fico9", "other") else "other"
+                    self.storage.create_credit_report(
+                        {
+                            "bureau": rep.bureau,
+                            "model": model_val,
+                            "score": int(rep.score),
+                            "pulled_date": rep.pulled_date,
+                            "source": rep.source,
+                        }
+                    )
+                    committed_counts["reports"] += 1
+            for inq in bundle.inquiries:
+                self.storage.create_credit_inquiry(
+                    {
+                        "lender": inq.lender,
+                        "bureau": inq.bureau,
+                        "inquiry_date": inq.inquiry_date,
+                        "counts_until": inq.counts_until,
+                        "drops_off": inq.drops_off,
+                    }
+                )
+                committed_counts["inquiries"] += 1
+            valid_derog = {
+                "late_30",
+                "late_60",
+                "late_90",
+                "charge_off",
+                "collection",
+                "bankruptcy_ch7",
+                "bankruptcy_ch13",
+                "other",
+            }
+            for der in bundle.derogatories:
+                dkind = der.kind if der.kind in valid_derog else "other"
+                self.storage.create_credit_derogatory(
+                    {
+                        "kind": dkind,
+                        "lender": der.lender or der.creditor,
+                        "opened_date": der.opened_date,
+                        "drops_off": der.drops_off,
+                        "active": der.active,
+                    }
+                )
+                committed_counts["derogatories"] += 1
+            for tl in bundle.tradelines:
+                self.storage.create_credit_line(tl.to_credit_line_payload())
+                committed_counts["credit_lines"] += 1
+            if sum(committed_counts.values()) > 0:
+                self.run_self_updating_sync(reason="Imported official credit report")
+
+        out["committed"] = should_commit
+        out["committed_counts"] = committed_counts
+        return out
+
+    # --- Stocks & Crypto Portfolio + Direct Official Brokers ---
+
+    def _to_holding_out(self, row: Dict[str, Any]) -> HoldingOut:
+        qty = int(row["quantity_e8"])
+        price = int(row["price_e8"])
+        mval = compute_holding_value_cents(qty, price)
+        cb = int(row.get("cost_basis_cents", 0))
+        pnl = mval - cb if cb > 0 else 0
+        pnl_pct = round((pnl / cb) * 100.0, 2) if cb > 0 else 0.0
+        return HoldingOut(
+            id=int(row["id"]),
+            account_id=int(row["account_id"]) if row.get("account_id") is not None else None,
+            connection_id=int(row["connection_id"]) if row.get("connection_id") is not None else None,
+            symbol=str(row["symbol"]).upper(),
+            name=str(row.get("name", "")),
+            asset_class=str(row.get("asset_class", "equity")),  # type: ignore[arg-type]
+            quantity_e8=qty,
+            cost_basis_cents=cb,
+            price_e8=price,
+            market_value_cents=mval,
+            unrealized_pnl_cents=pnl,
+            unrealized_pnl_pct=pnl_pct,
+            source=str(row.get("source", "manual")),
+            updated_at=str(row.get("updated_at", "")),
+        )
+
+    def _upsert_normalized_holding(
+        self,
+        nh: NormalizedHolding,
+        *,
+        connection_id: Optional[int] = None,
+        account_id: Optional[int] = None,
+    ) -> HoldingOut:
+        saved = self.storage.upsert_holding(
+            {
+                "account_id": account_id,
+                "connection_id": connection_id,
+                "symbol": nh.symbol,
+                "name": nh.name,
+                "asset_class": nh.asset_class if nh.asset_class in ("equity", "etf", "crypto", "cash") else "equity",
+                "quantity_e8": nh.quantity_e8,
+                "cost_basis_cents": nh.cost_basis_cents,
+                "price_e8": nh.price_e8,
+                "source": nh.source,
+            }
+        )
+        return self._to_holding_out(saved)
+
+    def _record_portfolio_snapshot(self, today: Optional[date] = None) -> None:
+        ref = today or date.today()
+        holdings = [self._to_holding_out(r) for r in self.storage.list_holdings()]
+        tot_val = sum(h.market_value_cents for h in holdings)
+        tot_cb = sum(h.cost_basis_cents for h in holdings)
+        self.storage.upsert_portfolio_snapshot(ref.isoformat(), tot_val, tot_cb)
+        self._refresh_net_worth_snapshot_today(today=ref)
+
+    def get_portfolio(self) -> PortfolioSummary:
+        holdings = [self._to_holding_out(r) for r in self.storage.list_holdings()]
+        tot_val = sum(h.market_value_cents for h in holdings)
+        tot_cb = sum(h.cost_basis_cents for h in holdings)
+        pnl = tot_val - tot_cb if tot_cb > 0 else 0
+        pnl_pct = round((pnl / tot_cb) * 100.0, 2) if tot_cb > 0 else 0.0
+
+        by_class: Dict[str, int] = {}
+        sources = set()
+        for h in holdings:
+            by_class[h.asset_class] = by_class.get(h.asset_class, 0) + h.market_value_cents
+            if h.source:
+                sources.add(h.source)
+
+        allocations = [
+            PortfolioAllocationItem(
+                asset_class=cls_name,  # type: ignore[arg-type]
+                value_cents=val,
+                pct=round((val / tot_val) * 100.0, 2) if tot_val > 0 else 0.0,
+            )
+            for cls_name, val in sorted(by_class.items(), key=lambda kv: -kv[1])
+        ]
+        snaps = [
+            PortfolioSnapshotOut(
+                snap_date=s["snap_date"],
+                total_value_cents=int(s["total_value_cents"]),
+                cost_basis_cents=int(s["cost_basis_cents"]),
+            )
+            for s in self.storage.list_portfolio_snapshots(limit=_LOOKBACK_730D)
+        ]
+        return PortfolioSummary(
+            generated_at=utc_now_iso(),
+            total_value_cents=tot_val,
+            total_cost_basis_cents=tot_cb,
+            unrealized_pnl_cents=pnl,
+            unrealized_pnl_pct=pnl_pct,
+            allocations=allocations,
+            holdings=holdings,
+            snapshots=snaps,
+            quote_sources=sorted(sources),
+        )
+
+    def upsert_holding(self, req: HoldingCreate) -> HoldingOut:
+        saved = self.storage.upsert_holding(req.model_dump())
+        self._record_portfolio_snapshot()
+        return self._to_holding_out(saved)
+
+    def delete_holding(self, holding_id: int) -> bool:
+        ok = self.storage.delete_holding(holding_id)
+        if ok:
+            self._record_portfolio_snapshot()
+        return ok
+
+    def _build_quote_service(self) -> QuoteService:
+        schwab_connector: Optional[SchwabConnector] = None
+        schwab_token: Optional[str] = None
+        if self.secrets.is_unlocked():
+            for c in self.storage.list_connections():
+                if c["provider"] == "schwab" and c.get("status") == "active":
+                    creds = self.secrets.get_json(f"conn:{c['id']}")
+                    if creds and creds.get("access_token") and creds.get("client_id") and creds.get("client_secret"):
+                        schwab_connector = SchwabConnector(
+                            client_id=str(creds["client_id"]),
+                            client_secret=str(creds["client_secret"]),
+                            callback_url=str(
+                                creds.get("redirect_uri") or "https://127.0.0.1:8787/api/v1/brokers/schwab/callback"
+                            ),
+                            transport=self._broker_transport,
+                        )
+                        schwab_token = str(creds["access_token"])
+                        break
+        polygon_key = self._safe_get_secret("polygon_api_key") or (os.getenv("POLYGON_API_KEY") or "").strip() or None
+        return QuoteService(
+            schwab_connector=schwab_connector,
+            schwab_access_token=schwab_token,
+            polygon_api_key=polygon_key,
+            transport=self._quote_transport,
+        )
+
+    def refresh_portfolio_quotes(self, force_refresh: bool = True) -> PortfolioSummary:
+        raw_rows = self.storage.list_holdings()
+        if not raw_rows:
+            return self.get_portfolio()
+        qsvc = self._build_quote_service()
+        items = [(str(r["symbol"]), str(r.get("asset_class", "equity"))) for r in raw_rows]
+        quotes = qsvc.get_quotes(items, force_refresh=force_refresh)
+        for r in raw_rows:
+            sym = str(r["symbol"]).upper()
+            q = quotes.get(sym)
+            if q and q.price_e8 > 0:
+                self.storage.upsert_holding(
+                    {
+                        "id": int(r["id"]),
+                        "account_id": r.get("account_id"),
+                        "connection_id": r.get("connection_id"),
+                        "symbol": sym,
+                        "name": r.get("name", ""),
+                        "asset_class": r.get("asset_class", "equity"),
+                        "quantity_e8": int(r["quantity_e8"]),
+                        "cost_basis_cents": int(r["cost_basis_cents"]),
+                        "price_e8": int(q.price_e8),
+                        "source": str(r.get("source", "manual")),
+                    }
+                )
+        self._record_portfolio_snapshot()
+        return self.get_portfolio()
+
+    def import_portfolio_csv(self, csv_text: str, source: str = "csv_import") -> Dict[str, Any]:
+        res = parse_holdings_csv(csv_text, source=source)
+        for nh in res.holdings:
+            self._upsert_normalized_holding(nh)
+        self._record_portfolio_snapshot()
+        return {
+            "imported_count": len(res.holdings),
+            "warnings": list(res.warnings),
+            "portfolio": self.get_portfolio().model_dump(),
+        }
+
+    def connect_coinbase(self, req: BrokerCoinbaseConnectRequest) -> Dict[str, Any]:
+        self._require_vault_unlocked()
+        connector = CoinbaseConnector(
+            api_key_name=req.api_key_name.strip(),
+            private_key_pem=req.private_key_pem.strip(),
+            transport=self._broker_transport,
+        )
+        # Strictly enforces read-only key_permissions (refuses can_trade / can_transfer)
+        info = connector.connect()
+        item_key = hashlib.sha256(req.api_key_name.strip().encode("utf-8")).hexdigest()[:16]
+        row = self.storage.upsert_connection(
+            {
+                "provider": "coinbase",
+                "item_id": item_key,
+                "institution": req.label.strip() or "Coinbase",
+                "env": "production",
+                "status": "active",
+            }
+        )
+        self.secrets.set_json(
+            f"conn:{row['id']}",
+            {
+                "api_key_name": req.api_key_name.strip(),
+                "private_key_pem": req.private_key_pem.strip(),
+            },
+        )
+        self.storage.log_budget_event("connector_added", f"Connected read-only Coinbase ({row['institution']})")
+        return {"connection": self._to_connection_out(row).model_dump(), "permissions": info}
+
+    def connect_robinhood(self, req: BrokerRobinhoodConnectRequest) -> Dict[str, Any]:
+        self._require_vault_unlocked()
+        connector = RobinhoodCryptoConnector(
+            api_key=req.api_key.strip(),
+            private_key_b64=req.private_key_b64.strip(),
+            declared_scopes=req.declared_scopes,
+            transport=self._broker_transport,
+        )
+        # Enforces read-only scope check
+        info = connector.connect(declared_scopes=req.declared_scopes)
+        item_key = hashlib.sha256(req.api_key.strip().encode("utf-8")).hexdigest()[:16]
+        row = self.storage.upsert_connection(
+            {
+                "provider": "robinhood",
+                "item_id": item_key,
+                "institution": req.label.strip() or "Robinhood Crypto",
+                "env": "production",
+                "status": "active",
+            }
+        )
+        self.secrets.set_json(
+            f"conn:{row['id']}",
+            {
+                "api_key": req.api_key.strip(),
+                "private_key_b64": req.private_key_b64.strip(),
+                "declared_scopes": req.declared_scopes,
+            },
+        )
+        self.storage.log_budget_event("connector_added", f"Connected read-only Robinhood Crypto ({row['institution']})")
+        return {"connection": self._to_connection_out(row).model_dump(), "account": info}
+
+    def connect_schwab(self, req: BrokerSchwabConnectRequest) -> Dict[str, Any]:
+        self._require_vault_unlocked()
+        connector = SchwabConnector(
+            client_id=req.client_id.strip(),
+            client_secret=req.client_secret.strip(),
+            callback_url=req.redirect_uri.strip(),
+            transport=self._broker_transport,
+        )
+        oauth_state = secrets.token_urlsafe(24)
+        auth_url = connector.build_authorization_url(oauth_state)
+        self._pending_schwab_states[oauth_state] = {
+            "client_id": req.client_id.strip(),
+            "client_secret": req.client_secret.strip(),
+            "redirect_uri": req.redirect_uri.strip(),
+            "label": req.label.strip() or "Charles Schwab",
+            "created_at": utc_now_iso(),
+        }
+        return {
+            "authorize_url": auth_url,
+            "authorization_url": auth_url,
+            "state": oauth_state,
+            "redirect_uri": req.redirect_uri.strip(),
+            "refresh_note": "Schwab refresh tokens expire every 7 days and require 1-click re-authentication.",
+        }
+
+    def handle_schwab_callback(self, code: str, state: str) -> ConnectionOut:
+        self._require_vault_unlocked()
+        pending = self._pending_schwab_states.pop(state, None)
+        if not pending:
+            raise ConnectorAuthError("Invalid or expired Charles Schwab OAuth2 state parameter.")
+        connector = SchwabConnector(
+            client_id=pending["client_id"],
+            client_secret=pending["client_secret"],
+            callback_url=pending["redirect_uri"],
+            transport=self._broker_transport,
+        )
+        bundle = connector.exchange_code(code)
+        item_key = hashlib.sha256(pending["client_id"].encode("utf-8")).hexdigest()[:16]
+        row = self.storage.upsert_connection(
+            {
+                "provider": "schwab",
+                "item_id": item_key,
+                "institution": pending["label"],
+                "env": "production",
+                "status": "active",
+                "token_expires_at": bundle.refresh_expires_at,
+            }
+        )
+        self.secrets.set_json(
+            f"conn:{row['id']}",
+            {
+                "client_id": pending["client_id"],
+                "client_secret": pending["client_secret"],
+                "redirect_uri": pending["redirect_uri"],
+                "access_token": bundle.access_token,
+                "refresh_token": bundle.refresh_token,
+                "access_expires_at": bundle.access_expires_at,
+                "refresh_expires_at": bundle.refresh_expires_at,
+            },
+        )
+        self.storage.log_budget_event("connector_added", f"Connected Charles Schwab OAuth2 ({row['institution']})")
+        return self._to_connection_out(row)
+
+    def sync_broker(self, connection_id: int) -> Dict[str, Any]:
+        self._require_vault_unlocked()
+        conn = self.storage.get_connection(connection_id)
+        if not conn:
+            raise ValueError(f"Connection {connection_id} not found")
+        provider = str(conn["provider"])
+        creds = self.secrets.get_json(f"conn:{connection_id}")
+        if not creds:
+            self.storage.upsert_connection({"id": connection_id, "provider": provider, "status": "needs_reauth"})
+            raise ConnectorAuthError(f"Missing sealed credentials for {provider} connection #{connection_id}")
+
+        holdings: List[NormalizedHolding] = []
+        if provider == "coinbase":
+            cb = CoinbaseConnector(
+                api_key_name=str(creds["api_key_name"]),
+                private_key_pem=str(creds["private_key_pem"]),
+                transport=self._broker_transport,
+            )
+            holdings = cb.fetch_holdings(verify_permissions=True, fetch_prices=True)
+        elif provider == "robinhood":
+            rh = RobinhoodCryptoConnector(
+                api_key=str(creds["api_key"]),
+                private_key_b64=str(creds["private_key_b64"]),
+                declared_scopes=creds.get("declared_scopes"),
+                transport=self._broker_transport,
+            )
+            holdings = rh.fetch_holdings(fetch_prices=True)
+        elif provider == "schwab":
+            sc = SchwabConnector(
+                client_id=str(creds["client_id"]),
+                client_secret=str(creds["client_secret"]),
+                callback_url=str(creds.get("redirect_uri") or "https://127.0.0.1:8787/api/v1/brokers/schwab/callback"),
+                transport=self._broker_transport,
+            )
+            access_token = str(creds.get("access_token") or "")
+            access_exp = creds.get("access_expires_at")
+            refresh_exp = creds.get("refresh_expires_at")
+            rem_days = _days_until_iso_timestamp(refresh_exp)
+            if rem_days is not None and rem_days <= 0:
+                self.storage.upsert_connection({"id": connection_id, "provider": "schwab", "status": "needs_reauth"})
+                raise ConnectorAuthError("Schwab 7-day refresh token expired — please re-authenticate.")
+            # Refresh access token if expired or close to expiry
+            needs_refresh = not access_token
+            if access_exp and not needs_refresh:
+                try:
+                    exp_dt = datetime.fromisoformat(str(access_exp).replace("Z", "+00:00"))
+                    if exp_dt <= datetime.now(timezone.utc) + timedelta(minutes=2):
+                        needs_refresh = True
+                except ValueError:
+                    needs_refresh = True
+            if needs_refresh and creds.get("refresh_token"):
+                bundle = sc.refresh_access_token(
+                    str(creds["refresh_token"]),
+                    existing_refresh_expires_at=refresh_exp,
+                )
+                access_token = bundle.access_token
+                creds["access_token"] = bundle.access_token
+                creds["refresh_token"] = bundle.refresh_token
+                creds["access_expires_at"] = bundle.access_expires_at
+                creds["refresh_expires_at"] = bundle.refresh_expires_at
+                self.secrets.set_json(f"conn:{connection_id}", creds)
+                self.storage.upsert_connection(
+                    {
+                        "id": connection_id,
+                        "provider": "schwab",
+                        "token_expires_at": bundle.refresh_expires_at,
+                    }
+                )
+            holdings = sc.fetch_holdings(access_token)
+        elif provider == "plaid":
+            client, _env = self._build_plaid_client()
+            holdings = client.get_investments_holdings(str(creds["access_token"]))
+        else:
+            raise ConnectorError(f"Provider '{provider}' does not support brokerage holdings sync.")
+
+        for nh in holdings:
+            self._upsert_normalized_holding(nh, connection_id=connection_id)
+
+        self.storage.upsert_connection(
+            {
+                "id": connection_id,
+                "provider": provider,
+                "status": "active",
+                "last_synced_at": utc_now_iso(),
+            }
+        )
+        self._record_portfolio_snapshot()
+        summary = self.get_portfolio()
+        return {
+            "connection_id": connection_id,
+            "provider": provider,
+            "holdings_synced": len(holdings),
+            "total_value_cents": summary.total_value_cents,
+        }
+
+    # --- Goal Optimizer & Direct Manipulation ---
 
     def _to_goal_out(self, row: Dict[str, Any]) -> GoalOut:
         target = max(1, int(row["target_cents"]))
@@ -999,10 +3001,12 @@ class FinanceService:
             pct_funded=pct,
             target_date=row.get("target_date"),
             priority=int(row.get("priority", 2)),
+            priority_order=int(row.get("priority_order", 0)),
             category=GoalCategory(row.get("category", GoalCategory.GADGET.value)),
             funding_jar_slug=row.get("funding_jar_slug", "fun"),
             status=row.get("status", "active"),
             notes=row.get("notes", ""),
+            deleted_at=row.get("deleted_at"),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -1023,6 +3027,11 @@ class FinanceService:
     def update_goal(self, goal_id: int, req: GoalUpdate) -> Optional[GoalOut]:
         updated = self.storage.update_goal(goal_id, req.model_dump(exclude_none=True))
         return self._to_goal_out(updated) if updated else None
+
+    def reorder_goals(self, req: GoalReorderRequest) -> List[GoalOut]:
+        rows = self.storage.reorder_goals(req.ordered_ids)
+        self.storage.log_budget_event("goals_reordered", f"Reordered {len(req.ordered_ids)} goal(s)")
+        return [self._to_goal_out(r) for r in rows]
 
     def contribute_goal(self, goal_id: int, req: GoalContributeRequest) -> GoalOut:
         existing = self.storage.get_goal(goal_id)
@@ -1045,8 +3054,14 @@ class FinanceService:
         self.storage.log_budget_event("goal_contribution", win_text, {"goal_id": goal_id, "amount_cents": req.amount_cents})
         return self._to_goal_out(updated)
 
-    def delete_goal(self, goal_id: int) -> bool:
-        return self.storage.delete_goal(goal_id)
+    def delete_goal(self, goal_id: int, *, hard: bool = False) -> bool:
+        if hard:
+            return self.storage.delete_goal(goal_id)
+        return self.storage.soft_delete_goal(goal_id) is not None
+
+    def restore_goal(self, goal_id: int) -> Optional[GoalOut]:
+        restored = self.storage.restore_goal(goal_id)
+        return self._to_goal_out(restored) if restored else None
 
     def optimize_goal_plan(self, req: GoalPlanRequest, today: Optional[date] = None) -> GoalPlanResponse:
         ref = today or date.today()
@@ -1121,7 +3136,7 @@ class FinanceService:
         )
         self.storage.log_budget_event(
             "rebalance",
-            f"Shifted ${req.amount_cents / 100:,.2f} from {src.name} → {dst.name}",
+            f"Shifted ${req.amount_cents / 100:,.2f} from {src.name} -> {dst.name}",
             {"from_jar_id": src.id, "to_jar_id": dst.id, "amount_cents": req.amount_cents},
         )
         return tr
@@ -1138,6 +3153,9 @@ class FinanceService:
             name=req.name.strip(),
             normalized_merchant=norm,
             amount_cents=req.amount_cents,
+            amount_min_cents=req.amount_min_cents,
+            amount_max_cents=req.amount_max_cents,
+            due_window_days=req.due_window_days,
             cadence=req.cadence.value,
             next_due_date=req.next_due_date,
             jar_id=jar_id,
@@ -1176,7 +3194,6 @@ class FinanceService:
             url=req.url.strip(),
             cooling_hours=req.cooling_hours,
         )
-        # Reward the healthy habit of pausing immediately (+15 XP!)
         prog = self.storage.get_adhd_progress()
         wins = [f"Parked '{req.item_name.strip()}' (${req.price_cents / 100:,.2f}) for {req.cooling_hours}h cooldown +15 XP"] + prog["recent_wins"]
         self.storage.update_adhd_progress(
@@ -1210,7 +3227,6 @@ class FinanceService:
         price_cents = int(raw["price_cents"])
         if req.decision == "skip":
             resolved = self.storage.resolve_impulse(impulse_id, ImpulseStatus.SKIPPED.value)
-            # Optionally sweep a share of avoided spend from Guilt-Free Fun -> Safety & Future
             swept_cents = 0
             if req.sweep_savings_pct > 0:
                 budget = self._compute_budget()
@@ -1255,7 +3271,6 @@ class FinanceService:
                 "impulse": resolved,
             }
 
-        # Intentional purchase after cooling off
         fun_jar = self.storage.get_jar_by_slug("fun")
         tx = self.add_transaction_raw(
             account_id=req.account_id,
@@ -1280,9 +3295,13 @@ class FinanceService:
 
     def get_weekly_reset_summary(self) -> WeeklyResetSummary:
         budget = self._compute_budget()
-        triage = [self._to_tx_out(r) for r in self.storage.list_transactions(limit=25, needs_review_only=True)]
+        triage = self.list_transactions(limit=25, needs_review_only=True)
         upcoming_14d = [b for b in budget.upcoming_bills if b.days_until_due <= 14]
-        zombies = [b for b in budget.upcoming_bills if b.flagged_zombie or b.price_hike_cents > 0 or (b.is_subscription and not b.is_essential)]
+        zombies = [
+            b
+            for b in budget.upcoming_bills
+            if b.flagged_zombie or b.price_hike_cents > 0 or (b.is_subscription and not b.is_essential)
+        ]
         matured = [i for i in self.list_impulses(include_resolved=False) if i.status == ImpulseStatus.READY]
         prog = self.storage.get_adhd_progress()
         return WeeklyResetSummary(
@@ -1322,7 +3341,655 @@ class FinanceService:
             "sync": sync,
         }
 
-    # --- Multi-Mode Intelligence & Multi-Provider AI Coach ---
+    # --- Multi-Mode Intelligence, Multi-Provider AI Coach & Guarded Agentic Tool Coach ---
+
+    def _build_agent_ledger_context(self) -> AgentLedgerContext:
+        budget = self._compute_budget()
+        qf = self.get_quant_forecast(days=30, budget=budget)
+        return AgentLedgerContext.from_objects(
+            accounts=self.storage.list_accounts(),
+            jars=self.storage.list_jars(),
+            transactions=self.storage.list_transactions(limit=250, include_splits=True, include_tags=True),
+            goals=self.storage.list_goals(include_completed=True),
+            rules=self.storage.list_rules(active_only=False),
+            credit_lines=self.storage.list_credit_lines(active_only=True),
+            holdings=self.storage.list_holdings(),
+            email_queue=self.storage.list_email_queue(status="pending", limit=25),
+            safe_to_spend_cents=budget.safe_to_spend.safe_to_spend_cents,
+            safe_to_invest_cents=budget.safe_to_invest_cents,
+            monthly_surplus_cents=qf.monthly_surplus_cents,
+        )
+
+    def plan_agent_batch(
+        self,
+        req: AgentPlanRequest,
+        *,
+        mode_override: Optional[str] = None,
+    ) -> AgentPlanResponse:
+        settings = self.storage.get_settings()
+        mode = self._resolve_intelligence_mode(settings, override=mode_override)
+        provider_override = req.provider.value if req.provider is not None else None
+        max_daily = int(settings.get("opencode_max_daily_requests", 60))
+        used = self.storage.count_ai_requests_today()
+        remaining = max(0, max_daily - used)
+
+        ctx = self._build_agent_ledger_context()
+        clients = [] if mode == IntelligenceMode.DETERMINISTIC_ONLY else self._build_coach_clients_list(provider_override)
+        planner = AgentActionPlanner(clients=clients, on_completion=self._record_completion_usage)
+        plan = planner.plan(
+            prompt=req.prompt,
+            context=ctx,
+            intelligence_mode=mode,
+            quota_remaining=remaining,
+        )
+        saved = self.storage.create_agent_batch(
+            {
+                "prompt": plan.prompt,
+                "provider": plan.provider_used or plan.source,
+                "model": plan.model_used or "",
+                "actions": [a.to_dict() for a in plan.actions],
+                "undo_snapshot": {},
+                "status": "preview",
+            }
+        )
+        return plan.to_plan_response(batch_id=int(saved["id"]))
+
+    def list_agent_batches(self, limit: int = 30) -> List[Dict[str, Any]]:
+        return self.storage.list_agent_batches(limit=limit)
+
+    def execute_agent_batch(self, batch_id: int) -> AgentExecuteResponse:
+        """
+        Execute a validated Preview batch inside ONE atomic `BEGIN IMMEDIATE` SQLite transaction,
+        capturing exact row pre-images and post-execution row versions for safe Undo.
+        """
+        batch = self.storage.get_agent_batch(batch_id)
+        if not batch:
+            raise ValueError(f"Agent batch #{batch_id} not found")
+        if batch["status"] != "preview":
+            raise ValueError(f"Agent batch #{batch_id} is already '{batch['status']}' and cannot be re-executed.")
+
+        raw_actions = list(batch.get("actions") or [])
+        if not raw_actions:
+            raise ValueError(f"Agent batch #{batch_id} contains no executable actions.")
+
+        ctx = self._build_agent_ledger_context()
+        reval = validate_agent_batch(raw_actions, ctx)
+        if not reval.actions:
+            raise ValueError(
+                "No valid actions remained after re-validation: " + "; ".join(reval.rejection_reasons[:3])
+            )
+
+        tx_fp_fields = (
+            "account_id",
+            "jar_id",
+            "tx_type",
+            "amount_cents",
+            "merchant",
+            "normalized_merchant",
+            "subcategory",
+            "memo",
+            "tx_date",
+        )
+        goal_fp_fields = (
+            "name",
+            "target_cents",
+            "saved_cents",
+            "target_date",
+            "priority",
+            "priority_order",
+            "status",
+            "notes",
+            "deleted_at",
+        )
+        rule_fp_fields = (
+            "group_id",
+            "name",
+            "priority",
+            "strict_and",
+            "stop_processing",
+            "triggers",
+            "actions",
+            "active",
+        )
+        cl_fp_fields = (
+            "name",
+            "issuer",
+            "balance_cents",
+            "credit_limit_cents",
+            "apr_bps",
+            "min_payment_cents",
+            "statement_closing_day",
+            "payment_due_day",
+            "promo_apr_bps",
+            "promo_ends_date",
+            "opened_date",
+            "has_grace_period",
+            "autopay_mode",
+            "rewards_note",
+            "is_authorized_user",
+        )
+        results: List[Dict[str, Any]] = []
+        undo_entries: List[Dict[str, Any]] = []
+
+        with self.storage.transaction(immediate=True) as conn:
+            for act in reval.actions:
+                atype = act.action_type
+                pl = dict(act.payload)
+
+                if atype == "create_transaction":
+                    acct_id = int(pl["account_id"]) if pl.get("account_id") is not None else self.storage.get_default_account_id()
+                    merchant = str(pl["merchant"]).strip()
+                    tx_type = str(pl.get("tx_type", "expense"))
+                    amt = int(pl["amount_cents"])
+                    jar_id = int(pl["jar_id"]) if pl.get("jar_id") is not None else None
+                    if tx_type == "expense" and jar_id is None:
+                        jars_by_slug = {j["slug"]: j for j in self.storage.list_jars()}
+                        learned = self.storage.get_merchant_rules()
+                        jar_id, auto_sub, _, _ = self.categorizer.categorize(
+                            merchant, str(pl.get("memo", "")), jars_by_slug, learned
+                        )
+                        if not pl.get("subcategory"):
+                            pl["subcategory"] = auto_sub
+                    row = self.storage.insert_transaction(
+                        account_id=acct_id,
+                        jar_id=jar_id,
+                        tx_type=tx_type,
+                        amount_cents=amt,
+                        merchant=merchant,
+                        normalized_merchant=normalize_merchant(merchant),
+                        subcategory=str(pl.get("subcategory", "")),
+                        memo=str(pl.get("memo", "")),
+                        tx_date=str(pl.get("tx_date") or date.today().isoformat()),
+                        confidence=1.0,
+                        needs_review=False,
+                        source="ai_agent",
+                        adjust_balance=True,
+                    )
+                    assert row is not None
+                    undo_entries.append(
+                        {
+                            "op": "delete_tx",
+                            "table": "transactions",
+                            "id": int(row["id"]),
+                            "after_hash": _row_fingerprint(row, tx_fp_fields),
+                        }
+                    )
+                    results.append({"action_type": atype, "transaction_id": int(row["id"]), "summary": act.summary})
+
+                elif atype == "update_transaction":
+                    tx_id = int(pl["transaction_id"])
+                    before = self.storage.get_transaction(tx_id)
+                    if not before:
+                        raise ValueError(f"Transaction #{tx_id} no longer exists")
+                    upd: Dict[str, Any] = {}
+                    for k in ("jar_id", "amount_cents", "tx_type", "tx_date", "subcategory", "memo"):
+                        if k in pl and pl[k] is not None:
+                            upd[k] = pl[k]
+                    if "merchant" in pl and pl["merchant"]:
+                        upd["merchant"] = str(pl["merchant"]).strip()
+                        upd["normalized_merchant"] = normalize_merchant(upd["merchant"])
+                    after = self.storage.update_transaction(tx_id, upd)
+                    assert after is not None
+                    undo_entries.append(
+                        {
+                            "op": "restore_tx",
+                            "table": "transactions",
+                            "id": tx_id,
+                            "before_row": {k: before.get(k) for k in tx_fp_fields},
+                            "after_hash": _row_fingerprint(after, tx_fp_fields),
+                        }
+                    )
+                    results.append({"action_type": atype, "transaction_id": tx_id, "summary": act.summary})
+
+                elif atype == "add_tx_comment":
+                    tx_id = int(pl["transaction_id"])
+                    saved_c = self.storage.add_transaction_comment(
+                        tx_id,
+                        str(pl["body"]),
+                        author=str(pl.get("author") or "ai_coach"),
+                    )
+                    undo_entries.append(
+                        {
+                            "op": "delete_comment",
+                            "table": "transaction_comments",
+                            "id": int(saved_c["id"]),
+                            "tx_id": tx_id,
+                            "after_hash": _row_fingerprint(saved_c, ("tx_id", "author", "body")),
+                        }
+                    )
+                    results.append(
+                        {"action_type": atype, "comment_id": int(saved_c["id"]), "transaction_id": tx_id, "summary": act.summary}
+                    )
+
+                elif atype == "split_transaction":
+                    tx_id = int(pl["transaction_id"])
+                    parent = self.storage.get_transaction(tx_id)
+                    if not parent:
+                        raise ValueError(f"Transaction #{tx_id} not found")
+                    before_splits = [
+                        {
+                            "jar_id": s.get("jar_id"),
+                            "goal_id": s.get("goal_id"),
+                            "amount_cents": int(s["amount_cents"]),
+                            "memo": str(s.get("memo", "")),
+                        }
+                        for s in self.storage.get_transaction_splits(tx_id)
+                    ]
+                    valid_splits = validate_splits(int(parent["amount_cents"]), pl["splits"])
+                    after_splits = self.storage.set_transaction_splits(tx_id, valid_splits)
+                    undo_entries.append(
+                        {
+                            "op": "restore_splits",
+                            "table": "transaction_splits",
+                            "id": tx_id,
+                            "before_splits": before_splits,
+                            "after_splits_hash": _splits_fingerprint(after_splits),
+                        }
+                    )
+                    results.append(
+                        {"action_type": atype, "transaction_id": tx_id, "split_count": len(after_splits), "summary": act.summary}
+                    )
+
+                elif atype == "create_goal":
+                    created_g = self.storage.create_goal(pl)
+                    undo_entries.append(
+                        {
+                            "op": "delete_goal",
+                            "table": "goals",
+                            "id": int(created_g["id"]),
+                            "after_updated_at": str(created_g["updated_at"]),
+                            "after_hash": _row_fingerprint(created_g, goal_fp_fields),
+                        }
+                    )
+                    results.append({"action_type": atype, "goal_id": int(created_g["id"]), "summary": act.summary})
+
+                elif atype == "update_goal":
+                    gid = int(pl["goal_id"])
+                    before_g = self.storage.get_goal(gid)
+                    if not before_g:
+                        raise ValueError(f"Goal #{gid} not found")
+                    upd_g = {k: v for k, v in pl.items() if k != "goal_id" and v is not None}
+                    after_g = self.storage.update_goal(gid, upd_g)
+                    assert after_g is not None
+                    undo_entries.append(
+                        {
+                            "op": "restore_goal",
+                            "table": "goals",
+                            "id": gid,
+                            "before_row": {
+                                k: before_g.get(k)
+                                for k in ("name", "target_cents", "saved_cents", "target_date", "priority", "priority_order", "status", "notes")
+                            },
+                            "after_updated_at": str(after_g["updated_at"]),
+                            "after_hash": _row_fingerprint(after_g, goal_fp_fields),
+                        }
+                    )
+                    results.append({"action_type": atype, "goal_id": gid, "summary": act.summary})
+
+                elif atype == "delete_goal":
+                    gid = int(pl["goal_id"])
+                    deleted_g = self.storage.soft_delete_goal(gid)
+                    if not deleted_g:
+                        raise ValueError(f"Goal #{gid} not found or already deleted")
+                    undo_entries.append(
+                        {
+                            "op": "restore_soft_deleted_goal",
+                            "table": "goals",
+                            "id": gid,
+                            "after_updated_at": str(deleted_g["updated_at"]),
+                            "after_hash": _row_fingerprint(deleted_g, goal_fp_fields),
+                        }
+                    )
+                    results.append({"action_type": atype, "goal_id": gid, "summary": act.summary})
+
+                elif atype == "create_rule":
+                    self._validate_rule_triggers(pl.get("triggers") or [])
+                    created_r = self.storage.create_rule(pl)
+                    undo_entries.append(
+                        {
+                            "op": "delete_rule",
+                            "table": "automation_rules",
+                            "id": int(created_r["id"]),
+                            "after_updated_at": str(created_r["updated_at"]),
+                            "after_hash": _row_fingerprint(created_r, rule_fp_fields),
+                        }
+                    )
+                    results.append({"action_type": atype, "rule_id": int(created_r["id"]), "summary": act.summary})
+
+                elif atype == "update_rule":
+                    rid = int(pl["rule_id"])
+                    before_r = self.storage.get_rule(rid)
+                    if not before_r:
+                        raise ValueError(f"Rule #{rid} not found")
+                    if pl.get("triggers") is not None:
+                        self._validate_rule_triggers(pl["triggers"])
+                    upd_r = {k: v for k, v in pl.items() if k != "rule_id" and v is not None}
+                    after_r = self.storage.update_rule(rid, upd_r)
+                    assert after_r is not None
+                    undo_entries.append(
+                        {
+                            "op": "restore_rule",
+                            "table": "automation_rules",
+                            "id": rid,
+                            "before_row": {k: before_r.get(k) for k in rule_fp_fields},
+                            "after_updated_at": str(after_r["updated_at"]),
+                            "after_hash": _row_fingerprint(after_r, rule_fp_fields),
+                        }
+                    )
+                    results.append({"action_type": atype, "rule_id": rid, "summary": act.summary})
+
+                elif atype == "create_credit_line":
+                    created_cl = self.storage.create_credit_line(pl)
+                    undo_entries.append(
+                        {
+                            "op": "delete_credit_line",
+                            "table": "credit_lines",
+                            "id": int(created_cl["id"]),
+                            "after_updated_at": str(created_cl["updated_at"]),
+                            "after_hash": _row_fingerprint(created_cl, cl_fp_fields),
+                        }
+                    )
+                    results.append({"action_type": atype, "credit_line_id": int(created_cl["id"]), "summary": act.summary})
+
+                elif atype == "update_credit_line":
+                    clid = int(pl["credit_line_id"])
+                    before_cl = self.storage.get_credit_line(clid)
+                    if not before_cl:
+                        raise ValueError(f"Credit line #{clid} not found")
+                    upd_cl = {k: v for k, v in pl.items() if k != "credit_line_id" and v is not None}
+                    after_cl = self.storage.update_credit_line(clid, upd_cl)
+                    assert after_cl is not None
+                    undo_entries.append(
+                        {
+                            "op": "restore_credit_line",
+                            "table": "credit_lines",
+                            "id": clid,
+                            "before_row": {k: before_cl.get(k) for k in cl_fp_fields},
+                            "after_updated_at": str(after_cl["updated_at"]),
+                            "after_hash": _row_fingerprint(after_cl, cl_fp_fields),
+                        }
+                    )
+                    results.append({"action_type": atype, "credit_line_id": clid, "summary": act.summary})
+
+                elif atype == "analyze_portfolio":
+                    analysis = pl.get("analysis") or compute_portfolio_analysis(
+                        ctx, focus=str(pl.get("focus") or "full"), symbols=pl.get("symbols")
+                    )
+                    results.append({"action_type": atype, "analysis": analysis, "summary": act.summary})
+
+            # Persist executed status + undo pre-images inside the same atomic transaction
+            conn.execute(
+                "UPDATE agent_action_batches SET status = 'executed', undo_snapshot_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps({"version": 1, "entries": undo_entries}), utc_now_iso(), batch_id),
+            )
+
+        self.run_self_updating_sync(reason=f"Executed agent batch #{batch_id} ({len(results)} actions)")
+        return AgentExecuteResponse(
+            batch_id=batch_id,
+            status="executed",
+            applied_count=len(results),
+            results=results,
+            undo_available=bool(undo_entries),
+        )
+
+    def undo_agent_batch(self, batch_id: int) -> AgentUndoResponse:
+        """
+        Row-versioned atomic Undo for an executed agent batch (Gate 1 Amendment #53).
+        Verifies EVERY affected row's post-execute version/fingerprint BEFORE mutating anything;
+        refuses cleanly with a structured conflict diff if any row changed since execute.
+        """
+        batch = self.storage.get_agent_batch(batch_id)
+        if not batch:
+            raise ValueError(f"Agent batch #{batch_id} not found")
+        if batch["status"] != "executed":
+            raise ValueError(f"Agent batch #{batch_id} has status '{batch['status']}' and cannot be undone.")
+
+        snapshot = batch.get("undo_snapshot") or {}
+        entries: List[Dict[str, Any]] = list(snapshot.get("entries") or [])
+        tx_fp_fields = (
+            "account_id",
+            "jar_id",
+            "tx_type",
+            "amount_cents",
+            "merchant",
+            "normalized_merchant",
+            "subcategory",
+            "memo",
+            "tx_date",
+        )
+        goal_fp_fields = (
+            "name",
+            "target_cents",
+            "saved_cents",
+            "target_date",
+            "priority",
+            "priority_order",
+            "status",
+            "notes",
+            "deleted_at",
+        )
+        rule_fp_fields = (
+            "group_id",
+            "name",
+            "priority",
+            "strict_and",
+            "stop_processing",
+            "triggers",
+            "actions",
+            "active",
+        )
+        cl_fp_fields = (
+            "name",
+            "issuer",
+            "balance_cents",
+            "credit_limit_cents",
+            "apr_bps",
+            "min_payment_cents",
+            "statement_closing_day",
+            "payment_due_day",
+            "promo_apr_bps",
+            "promo_ends_date",
+            "opened_date",
+            "has_grace_period",
+            "autopay_mode",
+            "rewards_note",
+            "is_authorized_user",
+        )
+
+        with self.storage.transaction(immediate=True) as conn:
+            conflicts: List[Dict[str, Any]] = []
+
+            # Phase 1: Check ALL row versions & content hashes before touching a single row
+            for entry in reversed(entries):
+                op = entry["op"]
+                row_id = int(entry["id"])
+
+                if op in ("delete_tx", "restore_tx"):
+                    curr = self.storage.get_transaction(row_id)
+                    curr_hash = _row_fingerprint(curr, tx_fp_fields)
+                    if not curr:
+                        conflicts.append(
+                            {
+                                "table": "transactions",
+                                "id": row_id,
+                                "reason": f"Transaction #{row_id} was deleted after batch execution.",
+                            }
+                        )
+                    elif curr_hash != entry["after_hash"]:
+                        conflicts.append(
+                            {
+                                "table": "transactions",
+                                "id": row_id,
+                                "reason": f"Transaction #{row_id} was modified after batch execution.",
+                                "expected_hash": entry["after_hash"][:12],
+                                "actual_hash": curr_hash[:12],
+                                "current": {k: curr.get(k) for k in ("merchant", "amount_cents", "jar_id", "memo")},
+                            }
+                        )
+
+                elif op == "delete_comment":
+                    row = conn.execute("SELECT * FROM transaction_comments WHERE id = ?", (row_id,)).fetchone()
+                    curr = dict(row) if row else None
+                    curr_hash = _row_fingerprint(curr, ("tx_id", "author", "body"))
+                    if not curr or curr_hash != entry["after_hash"]:
+                        conflicts.append(
+                            {
+                                "table": "transaction_comments",
+                                "id": row_id,
+                                "reason": f"Comment #{row_id} changed or was removed after execution.",
+                            }
+                        )
+
+                elif op == "restore_splits":
+                    curr_splits = self.storage.get_transaction_splits(row_id)
+                    curr_hash = _splits_fingerprint(curr_splits)
+                    if curr_hash != entry["after_splits_hash"]:
+                        conflicts.append(
+                            {
+                                "table": "transaction_splits",
+                                "id": row_id,
+                                "reason": f"Splits on transaction #{row_id} were modified after execution.",
+                                "current_splits_count": len(curr_splits),
+                            }
+                        )
+
+                elif op in ("delete_goal", "restore_goal", "restore_soft_deleted_goal"):
+                    curr = self.storage.get_goal(row_id, include_deleted=True)
+                    curr_hash = _row_fingerprint(curr, goal_fp_fields)
+                    expected_hash = entry.get("after_hash")
+                    if not curr:
+                        conflicts.append(
+                            {
+                                "table": "goals",
+                                "id": row_id,
+                                "reason": f"Goal #{row_id} was permanently removed after execution.",
+                            }
+                        )
+                    elif (
+                        str(curr.get("updated_at", "")) != str(entry["after_updated_at"])
+                        or (expected_hash and curr_hash != expected_hash)
+                    ):
+                        conflicts.append(
+                            {
+                                "table": "goals",
+                                "id": row_id,
+                                "reason": f"Goal #{row_id} ('{curr.get('name', '')}') was modified after execution.",
+                                "expected_updated_at": entry["after_updated_at"],
+                                "actual_updated_at": curr.get("updated_at"),
+                                "current": {
+                                    "name": curr.get("name"),
+                                    "target_cents": curr.get("target_cents"),
+                                    "saved_cents": curr.get("saved_cents"),
+                                    "notes": curr.get("notes"),
+                                    "deleted_at": curr.get("deleted_at"),
+                                },
+                            }
+                        )
+
+                elif op in ("delete_rule", "restore_rule"):
+                    curr = self.storage.get_rule(row_id)
+                    curr_hash = _row_fingerprint(curr, rule_fp_fields)
+                    expected_hash = entry.get("after_hash")
+                    if (
+                        not curr
+                        or str(curr.get("updated_at", "")) != str(entry["after_updated_at"])
+                        or (expected_hash and curr_hash != expected_hash)
+                    ):
+                        conflicts.append(
+                            {
+                                "table": "automation_rules",
+                                "id": row_id,
+                                "reason": f"Rule #{row_id} was modified or deleted after execution.",
+                                "expected_updated_at": entry["after_updated_at"],
+                                "actual_updated_at": curr.get("updated_at") if curr else None,
+                            }
+                        )
+
+                elif op in ("delete_credit_line", "restore_credit_line"):
+                    curr = self.storage.get_credit_line(row_id)
+                    curr_hash = _row_fingerprint(curr, cl_fp_fields)
+                    expected_hash = entry.get("after_hash")
+                    if (
+                        not curr
+                        or str(curr.get("updated_at", "")) != str(entry["after_updated_at"])
+                        or (expected_hash and curr_hash != expected_hash)
+                    ):
+                        conflicts.append(
+                            {
+                                "table": "credit_lines",
+                                "id": row_id,
+                                "reason": f"Credit line #{row_id} was modified or deleted after execution.",
+                                "expected_updated_at": entry["after_updated_at"],
+                                "actual_updated_at": curr.get("updated_at") if curr else None,
+                            }
+                        )
+
+            if conflicts:
+                return AgentUndoResponse(
+                    batch_id=batch_id,
+                    status="conflict",
+                    restored_count=0,
+                    conflicts=conflicts,
+                    message=f"Undo refused: {len(conflicts)} row(s) changed since batch execution.",
+                )
+
+            # Phase 2: All versions verified — restore in reverse order atomically
+            restored_count = 0
+            for entry in reversed(entries):
+                op = entry["op"]
+                row_id = int(entry["id"])
+
+                if op == "delete_tx":
+                    self.storage.delete_transaction(row_id)
+                    restored_count += 1
+                elif op == "restore_tx":
+                    self.storage.update_transaction(row_id, dict(entry["before_row"]))
+                    restored_count += 1
+                elif op == "delete_comment":
+                    conn.execute("DELETE FROM transaction_comments WHERE id = ?", (row_id,))
+                    restored_count += 1
+                elif op == "restore_splits":
+                    before_splits = entry.get("before_splits") or []
+                    if before_splits:
+                        self.storage.set_transaction_splits(row_id, before_splits)
+                    else:
+                        self.storage.clear_transaction_splits(row_id)
+                    restored_count += 1
+                elif op == "delete_goal":
+                    self.storage.delete_goal(row_id)
+                    restored_count += 1
+                elif op == "restore_goal":
+                    self.storage.update_goal(row_id, dict(entry["before_row"]))
+                    restored_count += 1
+                elif op == "restore_soft_deleted_goal":
+                    self.storage.restore_goal(row_id)
+                    restored_count += 1
+                elif op == "delete_rule":
+                    self.storage.delete_rule(row_id)
+                    restored_count += 1
+                elif op == "restore_rule":
+                    self.storage.update_rule(row_id, dict(entry["before_row"]))
+                    restored_count += 1
+                elif op == "delete_credit_line":
+                    self.storage.delete_credit_line(row_id)
+                    restored_count += 1
+                elif op == "restore_credit_line":
+                    self.storage.update_credit_line(row_id, dict(entry["before_row"]))
+                    restored_count += 1
+
+            conn.execute(
+                "UPDATE agent_action_batches SET status = 'undone', updated_at = ? WHERE id = ?",
+                (utc_now_iso(), batch_id),
+            )
+
+        self.run_self_updating_sync(reason=f"Undid agent batch #{batch_id}")
+        return AgentUndoResponse(
+            batch_id=batch_id,
+            status="undone",
+            restored_count=restored_count,
+            conflicts=[],
+            message=f"Undid {restored_count} action(s) from batch #{batch_id} cleanly.",
+        )
 
     def get_ai_suggestions(
         self,
@@ -1356,10 +4023,10 @@ class FinanceService:
         if mode == IntelligenceMode.DETERMINISTIC_ONLY:
             coach = FinancialCoach(client=None, fallback_client=None)
         else:
-            primary_client, fallback_client = self._build_coach_clients(provider_override=provider_override)
-            coach = FinancialCoach(client=primary_client, fallback_client=fallback_client)
+            clients = self._build_coach_clients_list(provider_override=provider_override)
+            coach = FinancialCoach(clients=clients, on_completion=self._record_completion_usage)
 
-        result = coach.generate_suggestions(
+        return coach.generate_suggestions(
             budget=budget,
             impulses=impulses,
             adhd_stats=adhd_stats,
@@ -1372,13 +4039,6 @@ class FinanceService:
             quota_remaining=remaining,
             force_refresh=force_refresh,
         )
-        if result.provider_used in ("opencode_go", "gemini"):
-            self.storage.record_ai_usage(
-                result.provider_used,
-                result.model_used or "",
-                cached=result.cached,
-            )
-        return result
 
     def apply_suggestion_action(self, action_type: str, action_payload: Dict[str, Any]) -> Dict[str, Any]:
         """Deterministically execute a verified 1-click AI suggestion action."""
@@ -1507,10 +4167,10 @@ class FinanceService:
         if mode == IntelligenceMode.DETERMINISTIC_ONLY:
             coach = FinancialCoach(client=None, fallback_client=None)
         else:
-            primary_client, fallback_client = self._build_coach_clients(provider_override=provider_override)
-            coach = FinancialCoach(client=primary_client, fallback_client=fallback_client)
+            clients = self._build_coach_clients_list(provider_override=provider_override)
+            coach = FinancialCoach(clients=clients, on_completion=self._record_completion_usage)
 
-        answer = coach.answer_question(
+        return coach.answer_question(
             question=question,
             budget=budget,
             impulses=impulses,
@@ -1524,43 +4184,35 @@ class FinanceService:
             intelligence_mode=mode,
             quota_remaining=remaining,
         )
-        if answer.provider_used in ("opencode_go", "gemini"):
-            self.storage.record_ai_usage(answer.provider_used, answer.model_used or "", cached=False)
-        return answer
 
-    def _resolve_target_provider(self, provider: str = "auto") -> Literal["opencode_go", "gemini"]:
+    def _resolve_target_provider(self, provider: str = "auto") -> str:
         cleaned = (provider or "auto").strip().lower()
-        if cleaned == "gemini":
-            return "gemini"
-        if cleaned == "opencode_go":
-            return "opencode_go"
+        if cleaned in ("opencode_go", "gemini", "openai_codex", "chat_wrapper", "codex_cli"):
+            return cleaned
         active = self.resolve_active_provider()
-        if active == "gemini":
-            return "gemini"
-        if active == "opencode_go":
-            return "opencode_go"
+        if active != "none":
+            return active
         pref = self._resolve_ai_provider_setting()
-        return "gemini" if pref == AIProvider.GEMINI else "opencode_go"
+        return pref.value if pref != AIProvider.AUTO else "opencode_go"
+
+    def _get_client_by_provider(self, provider: str) -> LLMClient:
+        target = self._resolve_target_provider(provider)
+        clients = self._build_all_ai_clients()
+        return clients.get(target, clients["opencode_go"])
 
     def list_ai_models(self, provider: str = "auto", force_refresh: bool = False) -> Dict[str, Any]:
         target = self._resolve_target_provider(provider)
-        client: LLMClient = self.build_gemini_client() if target == "gemini" else self.build_opencode_client()
+        client = self._get_client_by_provider(target)
         res = dict(client.list_models(force_refresh=force_refresh))
         res.setdefault("provider", target)
         return res
 
     def test_ai_connection(self, provider: str = "auto") -> Dict[str, Any]:
         target = self._resolve_target_provider(provider)
-        client: LLMClient = self.build_gemini_client() if target == "gemini" else self.build_opencode_client()
+        client = self._get_client_by_provider(target)
         res = dict(client.test_connection())
         res.setdefault("provider", target)
         return res
-
-    def list_opencode_models(self, force_refresh: bool = False) -> Dict[str, Any]:
-        return self.list_ai_models(provider="opencode_go", force_refresh=force_refresh)
-
-    def test_opencode_connection(self) -> Dict[str, Any]:
-        return self.test_ai_connection(provider="opencode_go")
 
     # --- Settings ---
 
@@ -1568,13 +4220,15 @@ class FinanceService:
         raw = self.storage.get_settings()
         oc_key, oc_source = self._resolve_opencode_key_with_source()
         gem_key, gem_source = self._resolve_gemini_key_with_source()
+        codex_key, codex_source = self._resolve_codex_key_with_source()
+        wrap_key, _wrap_source = self._resolve_wrapper_key_with_source()
         max_daily = int(raw.get("opencode_max_daily_requests", 60))
         used_today = self.storage.count_ai_requests_today()
         return AISettingsOut(
             intelligence_mode=self._resolve_intelligence_mode(raw),
             ai_provider=self._resolve_ai_provider_setting(raw),
             active_provider_resolved=self.resolve_active_provider(),
-            opencode_base_url=raw.get("opencode_base_url", "https://opencode.ai/zen/go/v1"),
+            opencode_base_url=raw.get("opencode_base_url", DEFAULT_OPENCODE_GO_BASE_URL),
             opencode_model=raw.get("opencode_model", "glm-5.3-flash"),
             opencode_protocol=raw.get("opencode_protocol", "auto"),
             opencode_max_daily_requests=max_daily,
@@ -1586,6 +4240,18 @@ class FinanceService:
             gemini_key_source=gem_source,
             gemini_model=raw.get("gemini_model", DEFAULT_GEMINI_MODEL),
             gemini_base_url=raw.get("gemini_base_url", DEFAULT_GEMINI_BASE_URL),
+            codex_base_url=raw.get("codex_base_url", DEFAULT_OPENAI_BASE_URL),
+            codex_model=raw.get("codex_model", DEFAULT_CODEX_MODEL),
+            codex_key_configured=bool(codex_key),
+            codex_key_masked=mask_secret(codex_key),
+            codex_key_source=codex_source,
+            wrapper_base_url=raw.get("wrapper_base_url", ""),
+            wrapper_model=raw.get("wrapper_model", ""),
+            wrapper_wire_api=raw.get("wrapper_wire_api", "chat_completions"),
+            wrapper_key_configured=bool(wrap_key),
+            wrapper_key_masked=mask_secret(wrap_key),
+            codex_cli_enabled=bool(raw.get("codex_cli_enabled", 0)),
+            codex_cli_model=raw.get("codex_cli_model", ""),
             requests_used_today=used_today,
             quota_remaining_today=max(0, max_daily - used_today),
         )
@@ -1598,6 +4264,8 @@ class FinanceService:
         raw = self.storage.get_settings()
         oc_key, oc_source = self._resolve_opencode_key_with_source()
         gem_key, gem_source = self._resolve_gemini_key_with_source()
+        codex_key, codex_source = self._resolve_codex_key_with_source()
+        wrap_key, _wrap_source = self._resolve_wrapper_key_with_source()
         return ProfileSettings(
             currency=raw.get("currency", "USD"),
             hourly_wage_cents=int(raw.get("hourly_wage_cents", 3000)),
@@ -1608,10 +4276,13 @@ class FinanceService:
             expected_paycheck_cents=int(raw.get("expected_paycheck_cents", 220_000)),
             calm_mode=bool(raw.get("calm_mode", 1)),
             auto_rebalance_enabled=bool(raw.get("auto_rebalance_enabled", 1)),
+            onboarding_completed=bool(raw.get("onboarding_completed", 0)),
+            vault_auto_lock_minutes=int(raw.get("vault_auto_lock_minutes", 30)),
+            email_scanner_enabled=bool(raw.get("email_scanner_enabled", 0)),
             intelligence_mode=self._resolve_intelligence_mode(raw),
             ai_provider=self._resolve_ai_provider_setting(raw),
             active_provider_resolved=self.resolve_active_provider(),
-            opencode_base_url=raw.get("opencode_base_url", "https://opencode.ai/zen/go/v1"),
+            opencode_base_url=raw.get("opencode_base_url", DEFAULT_OPENCODE_GO_BASE_URL),
             opencode_model=raw.get("opencode_model", "glm-5.3-flash"),
             opencode_protocol=raw.get("opencode_protocol", "auto"),
             opencode_max_daily_requests=int(raw.get("opencode_max_daily_requests", 60)),
@@ -1623,38 +4294,61 @@ class FinanceService:
             gemini_key_source=gem_source,
             gemini_model=raw.get("gemini_model", DEFAULT_GEMINI_MODEL),
             gemini_base_url=raw.get("gemini_base_url", DEFAULT_GEMINI_BASE_URL),
-            auth_enabled=bool(raw.get("passcode_hash", "")),
+            codex_base_url=raw.get("codex_base_url", DEFAULT_OPENAI_BASE_URL),
+            codex_model=raw.get("codex_model", DEFAULT_CODEX_MODEL),
+            codex_key_configured=bool(codex_key),
+            codex_key_masked=mask_secret(codex_key),
+            codex_key_source=codex_source,
+            wrapper_base_url=raw.get("wrapper_base_url", ""),
+            wrapper_model=raw.get("wrapper_model", ""),
+            wrapper_wire_api=raw.get("wrapper_wire_api", "chat_completions"),
+            wrapper_key_configured=bool(wrap_key),
+            wrapper_key_masked=mask_secret(wrap_key),
+            codex_cli_enabled=bool(raw.get("codex_cli_enabled", 0)),
+            codex_cli_model=raw.get("codex_cli_model", ""),
+            auth_enabled=True,
         )
 
     def update_settings(self, req: ProfileSettingsUpdate) -> ProfileSettings:
         data = req.model_dump(exclude_none=True)
-        clear_oc_key = bool(data.pop("clear_opencode_key", False))
-        oc_api_key = data.pop("opencode_api_key", None)
-        if clear_oc_key:
-            self.secrets.set("opencode_go_api_key", "")
-        elif oc_api_key is not None and oc_api_key.strip():
-            self.secrets.set("opencode_go_api_key", oc_api_key.strip())
 
-        clear_gem_key = bool(data.pop("clear_gemini_key", False))
-        gem_api_key = data.pop("gemini_api_key", None)
-        if clear_gem_key:
-            self.secrets.set("gemini_api_key", "")
-        elif gem_api_key is not None and gem_api_key.strip():
-            self.secrets.set("gemini_api_key", gem_api_key.strip())
+        secret_ops = [
+            ("opencode_api_key", "clear_opencode_key", "opencode_go_api_key"),
+            ("gemini_api_key", "clear_gemini_key", "gemini_api_key"),
+            ("codex_api_key", "clear_codex_key", "codex_api_key"),
+            ("wrapper_api_key", "clear_wrapper_key", "wrapper_api_key"),
+        ]
+        for key_field, clear_field, store_key in secret_ops:
+            should_clear = bool(data.pop(clear_field, False))
+            raw_val = data.pop(key_field, None)
+            if should_clear:
+                self._require_vault_unlocked()
+                self.secrets.delete(store_key)
+            elif raw_val is not None and str(raw_val).strip():
+                self._require_vault_unlocked()
+                self.secrets.set(store_key, str(raw_val).strip())
 
         if "intelligence_mode" in data and isinstance(data["intelligence_mode"], IntelligenceMode):
             data["intelligence_mode"] = data["intelligence_mode"].value
         if "ai_provider" in data and isinstance(data["ai_provider"], AIProvider):
             data["ai_provider"] = data["ai_provider"].value
 
-        if "opencode_base_url" in data:
-            data["opencode_base_url"] = validate_external_api_url(data["opencode_base_url"])
-        if "gemini_base_url" in data:
-            data["gemini_base_url"] = validate_external_api_url(data["gemini_base_url"])
+        for url_field in ("opencode_base_url", "gemini_base_url", "codex_base_url"):
+            if url_field in data and data[url_field]:
+                data[url_field] = validate_external_api_url(str(data[url_field]))
+        if "wrapper_base_url" in data:
+            val = str(data["wrapper_base_url"]).strip()
+            data["wrapper_base_url"] = validate_external_api_url(val) if val else ""
 
-        for bool_k in ("calm_mode", "auto_rebalance_enabled"):
+        for bool_k in (
+            "calm_mode",
+            "auto_rebalance_enabled",
+            "onboarding_completed",
+            "codex_cli_enabled",
+            "email_scanner_enabled",
+        ):
             if bool_k in data:
-                data[bool_k] = int(data[bool_k])
+                data[bool_k] = int(bool(data[bool_k]))
 
         budget_fields = {
             "currency",
@@ -1672,8 +4366,3 @@ class FinanceService:
             if any(k in budget_fields for k in data):
                 self.run_self_updating_sync(reason="Profile settings updated")
         return self.get_settings()
-
-    def load_demo_workspace(self) -> Dict[str, Any]:
-        from chronox_finance.demo_data import seed_demo_data
-
-        return seed_demo_data(self)

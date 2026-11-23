@@ -30,7 +30,7 @@ function scrubSecrets(line) {
   out = out.replace(/(chronox_session=)[^\s;,"']+/gi, "$1[REDACTED]");
   // Generic key/token/secret/password assignments
   out = out.replace(
-    /\b((?:gemini|opencode|polygon|api|auth|access|refresh|session)[_-]?(?:api[_-]?)?(?:key|token|secret)|password|passcode)\s*([:=])\s*["']?[^\s"',;}{]+["']?/gi,
+    /\b((?:gemini|opencode|openai|codex|plaid|schwab|coinbase|robinhood|imap|polygon|api|auth|access|refresh|session|recovery|csrf)[_-]?(?:api[_-]?)?(?:key|token|secret)|password|passcode)\s*([:=])\s*["']?[^\s"',;}{]+["']?/gi,
     "$1$2[REDACTED]"
   );
   return out;
@@ -119,7 +119,6 @@ class BackendManager extends EventEmitter {
     this.host = "127.0.0.1";
     this.port = null;
     this.dbPath = options.dbPath;
-    this.demo = Boolean(options.demo);
     this.repoRoot = options.repoRoot || path.resolve(__dirname, "..", "..", "..");
     this.desktopRoot = options.desktopRoot || path.resolve(__dirname, "..", "..");
 
@@ -210,7 +209,6 @@ class BackendManager extends EventEmitter {
     for (const sidecarPath of sidecarCandidates) {
       if (fileExistsExecutable(sidecarPath)) {
         const args = ["--host", this.host, "--port", String(port), "--db", this.dbPath];
-        if (this.demo) args.push("--demo");
         return {
           mode: "packaged-sidecar",
           command: sidecarPath,
@@ -248,7 +246,6 @@ class BackendManager extends EventEmitter {
             "--port",
             String(port),
           ];
-          if (this.demo) args.push("--demo");
           return {
             mode: "repo-venv",
             command: venvPython,
@@ -298,7 +295,6 @@ class BackendManager extends EventEmitter {
           "--port",
           String(port),
         ];
-        if (this.demo) args.push("--demo");
         return {
           mode: "system-python",
           command: candidate.cmd,
@@ -324,9 +320,6 @@ class BackendManager extends EventEmitter {
       CHRONOX_FINANCE_PORT: String(port),
       CHRONOX_FINANCE_DB_PATH: this.dbPath,
     };
-    if (this.demo) {
-      env.CHRONOX_DEMO = "1";
-    }
     if (includeRepoPythonPath) {
       env.PYTHONPATH = env.PYTHONPATH
         ? `${this.repoRoot}${path.delimiter}${env.PYTHONPATH}`
@@ -385,7 +378,7 @@ class BackendManager extends EventEmitter {
     this.backendMode = launchSpec.mode;
     this._pushLog(
       "system",
-      `Launching backend (${launchSpec.mode}) on ${this.baseUrl} with DB ${this.dbPath}${this.demo ? " [demo]" : ""}`
+      `Launching backend (${launchSpec.mode}) on ${this.baseUrl} with DB ${this.dbPath}`
     );
 
     this._emitStatus({

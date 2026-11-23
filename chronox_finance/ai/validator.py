@@ -19,9 +19,21 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from chronox_finance.engines.autobudget import AutoBudgetResult
 from chronox_finance.models import ImpulseOut, JarKind, SuggestionActionType, ValidatedSuggestion
+from chronox_finance.security import sanitize_untrusted_text
 
 _DOLLAR_RE = re.compile(r"\$((?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]{1,2})?)(?!\d)")
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
+_UNTRUSTED_TAG_RE = re.compile(r"</?\s*UNTRUSTED_DATA\s*>", re.IGNORECASE)
+
+# Extended prompt-injection patterns beyond base security.py filters
+_EXTRA_INJECTION_PATTERNS: List[re.Pattern[str]] = [
+    re.compile(r"</?\s*(?:UNTRUSTED_DATA|VERIFIED_FACTS|VERIFIED_CONTEXT|ACCOUNT_CONTEXT|SYSTEM|DEVELOPER|USER_QUESTION|GOAL_PLAN)\s*>", re.IGNORECASE),
+    re.compile(r"\[/?INST\]|<<\s*/?SYS\s*>>", re.IGNORECASE),
+    re.compile(r"\b(?:developer|assistant|tool_call|function_call)\s*:", re.IGNORECASE),
+    re.compile(r"\b(?:forget|override|bypass)\s+(?:all\s+)?(?:(?:previous|prior|your|the)\s+)?(?:rules?|instructions?|safety|guardrails?|firewall|validator)\b", re.IGNORECASE),
+    re.compile(r"\bnew\s+(?:system\s+)?instructions?\s*:", re.IGNORECASE),
+    re.compile(r"\bact\s+as\s+(?:a|an)\s+(?:unrestricted|admin|root|bank)\b", re.IGNORECASE),
+]
 
 # RSD-hostile phrases neutralized into supportive ADHD-friendly framing
 _SHAME_REPLACEMENTS: List[Tuple[re.Pattern[str], str]] = [
@@ -51,6 +63,30 @@ def sanitize_rsd_tone(text: str) -> Tuple[str, bool]:
             cleaned = rx.sub(replacement, cleaned)
             changed = True
     return cleaned, changed
+
+
+def sanitize_prompt_injection(text: str, max_len: int = 240) -> str:
+    """
+    Redact PII and neutralize prompt-injection & delimiter-breakout attempts
+    inside untrusted external strings (merchants, memos, comments, email subjects/bodies).
+    """
+    cleaned = sanitize_untrusted_text(str(text or ""), max_len=max(max_len * 2, 480))
+    for rx in _EXTRA_INJECTION_PATTERNS:
+        cleaned = rx.sub("[filtered]", cleaned)
+    # Collapse redundant whitespace after replacements
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:max_len]
+
+
+def wrap_untrusted_data(value: Any, max_len: int = 200) -> str:
+    """Sanitize and wrap an untrusted string in explicit `<UNTRUSTED_DATA>` delimiters."""
+    cleaned = sanitize_prompt_injection("" if value is None else str(value), max_len=max_len)
+    return f"<UNTRUSTED_DATA>{cleaned}</UNTRUSTED_DATA>"
+
+
+def strip_untrusted_delimiters(text: str) -> str:
+    """Strip echoed `<UNTRUSTED_DATA>` wrapper tags from post-LLM text fields."""
+    return _UNTRUSTED_TAG_RE.sub("", str(text or "")).strip()
 
 
 def extract_json_object(raw_text: str) -> Dict[str, Any]:

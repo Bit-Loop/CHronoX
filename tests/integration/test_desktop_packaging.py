@@ -121,7 +121,8 @@ class TestElectronSecurityInvariants:
         index_js = _read_text(DESKTOP_SRC / "main" / "index.js")
         preload_js = _read_text(DESKTOP_SRC / "preload" / "preload.js")
         hud_preload_js = _read_text(DESKTOP_SRC / "preload" / "hud-preload.js")
-        app_js = _read_text(WEB_DIR / "app.js")
+        web_js_files = [WEB_DIR / "app.js"] + sorted((WEB_DIR / "js").glob("*.js"))
+        web_js_combined = "\n".join(_read_text(p) for p in web_js_files)
         splash_js = _read_text(DESKTOP_SRC / "splash" / "splash.js")
         hud_js = _read_text(DESKTOP_SRC / "quick-capture" / "quick-capture.js")
 
@@ -137,12 +138,12 @@ class TestElectronSecurityInvariants:
             f"Preload subscribes to unsent IPC channels: {sorted(preload_subs - main_sends)}"
         )
 
-        # Verify every window.chronoxDesktop property called in app.js exists on preload.js
+        # Verify every window.chronoxDesktop property called across app.js + web/js/*.js exists on preload.js
         preload_props = set(re.findall(r"^\s+([A-Za-z0-9_]+)\s*:", preload_js, re.M))
-        used_desktop_props = set(re.findall(r"\bdesktop\.([A-Za-z0-9_]+)", app_js))
-        assert len(used_desktop_props) >= 10
+        used_desktop_props = set(re.findall(r"\bdesktop\.([A-Za-z0-9_]+)", web_js_combined))
+        assert len(used_desktop_props) >= 15
         assert used_desktop_props <= preload_props, (
-            f"app.js references missing chronoxDesktop methods: {sorted(used_desktop_props - preload_props)}"
+            f"Web frontend references missing chronoxDesktop methods: {sorted(used_desktop_props - preload_props)}"
         )
 
         # Verify splash.js & quick-capture.js bridge methods exist on hud-preload.js
@@ -219,19 +220,30 @@ class TestDesktopAndWebHygieneContract:
             assert "unsafe-eval" not in html
 
         dom_pairs = [
-            (DESKTOP_SRC / "splash" / "splash.html", DESKTOP_SRC / "splash" / "splash.js", r'getElementById\("([^"]+)"\)'),
+            (DESKTOP_SRC / "splash" / "splash.html", [DESKTOP_SRC / "splash" / "splash.js"], r'getElementById\("([^"]+)"\)'),
             (
                 DESKTOP_SRC / "quick-capture" / "quick-capture.html",
-                DESKTOP_SRC / "quick-capture" / "quick-capture.js",
+                [DESKTOP_SRC / "quick-capture" / "quick-capture.js"],
                 r'getElementById\("([^"]+)"\)',
             ),
-            (WEB_DIR / "index.html", WEB_DIR / "app.js", r'\$\("([^"]+)"\)'),
+            (
+                WEB_DIR / "index.html",
+                [WEB_DIR / "app.js"] + sorted((WEB_DIR / "js").glob("*.js")),
+                r'\$\("([^"]+)"\)',
+            ),
         ]
-        for html_path, js_path, pattern in dom_pairs:
+        for html_path, js_paths, pattern in dom_pairs:
             html_ids = set(re.findall(r'\bid="([^"]+)"', _read_text(html_path)))
-            js_ids = set(re.findall(pattern, _read_text(js_path)))
-            missing = sorted(js_ids - html_ids)
-            assert missing == [], f"{js_path.name} references missing IDs in {html_path.name}: {missing}"
+            dynamic_ids: Set[str] = set()
+            for jp in js_paths:
+                jtxt = _read_text(jp)
+                dynamic_ids.update(re.findall(r'\bid\s*:\s*"([^"]+)"', jtxt))
+                dynamic_ids.update(re.findall(r'\.id\s*=\s*"([^"]+)"', jtxt))
+            valid_ids = html_ids | dynamic_ids
+            for jp in js_paths:
+                js_ids = set(re.findall(pattern, _read_text(jp)))
+                missing = sorted(js_ids - valid_ids)
+                assert missing == [], f"{jp.name} references missing IDs in {html_path.name}: {missing}"
 
         for css_path in [
             DESKTOP_SRC / "splash" / "splash.css",
@@ -253,8 +265,10 @@ class TestSyntaxAndBrandIcons:
             sorted(DESKTOP_SRC.rglob("*.js"))
             + sorted((DESKTOP_DIR / "scripts").glob("*.mjs"))
             + [WEB_DIR / "app.js"]
+            + sorted((WEB_DIR / "js").glob("*.js"))
         )
-        assert len(js_files) >= 10
+        assert (DESKTOP_SRC / "main" / "watch-folder.js") in js_files
+        assert len(js_files) >= 16
         for js_file in js_files:
             res = subprocess.run(  # noqa: S603
                 [node_bin, "--check", str(js_file)],
@@ -367,10 +381,10 @@ class TestCrossPlatformPackagingConfiguration:
         pkg = json.loads(_read_text(DESKTOP_DIR / "package.json"))
         assert pkg["main"] == "src/main/index.js"
         assert pkg.get("desktopName") == "chronox-finance.desktop"
+        assert "demo" not in pkg["scripts"], "User-facing desktop demo script must remain purged"
         for script_name in (
             "start",
             "dev",
-            "demo",
             "icons",
             "build:backend",
             "pack",
@@ -380,10 +394,25 @@ class TestCrossPlatformPackagingConfiguration:
             "dist:linux",
             "dist:win",
             "dist:mac",
+            "check",
         ):
             assert script_name in pkg["scripts"], f"Missing npm script: {script_name}"
+        assert "watch-folder.js" in pkg["scripts"]["check"]
+        assert (DESKTOP_SRC / "main" / "watch-folder.js").is_file()
         assert "electron" in pkg["devDependencies"]
         assert "electron-builder" in pkg["devDependencies"]
+
+        # PyInstaller backend.spec bundles cryptography + connectors + imaplib
+        backend_spec = _read_text(DESKTOP_DIR / "packaging" / "backend.spec")
+        for token in (
+            'collect_dynamic_libs("cryptography")',
+            'collect_data_files("cryptography")',
+            '"cryptography.hazmat.primitives.ciphers.aead"',
+            '"cryptography.hazmat.primitives.asymmetric.ed25519"',
+            '"imaplib"',
+            'collect_submodules("chronox_finance.connectors")',
+        ):
+            assert token in backend_spec, f"backend.spec missing required bundle token: {token}"
 
         # Arch PKGBUILD & desktop entry
         pkgbuild = _read_text(DESKTOP_DIR / "packaging" / "arch" / "PKGBUILD")
@@ -410,9 +439,10 @@ class TestCrossPlatformPackagingConfiguration:
         assert win_arches == {"x64", "arm64"}
         assert mac_arches == {"x64", "arm64"}
 
-        # Windows PowerShell installer exists with expected switches
+        # Windows PowerShell installer exists with expected switches (and zero Demo switch)
         ps1 = _read_text(REPO_ROOT / "scripts" / "install-windows.ps1")
-        assert "BuildInstaller" in ps1 and "Demo" in ps1 and "arm64" in ps1.lower()
+        assert "BuildInstaller" in ps1 and "Launch" in ps1 and "arm64" in ps1.lower()
+        assert "[switch]$Demo" not in ps1
 
         # Root .gitignore ignores build output/node_modules while keeping desktop/build/icons tracked
         gitignore = _read_text(REPO_ROOT / ".gitignore")
@@ -432,8 +462,15 @@ class TestCrossPlatformPackagingConfiguration:
         assert web_dir is not None and (web_dir / "index.html").is_file()
 
         sample_db = str(tmp_path / "sidecar_test.sqlite3")
-        args = module.parse_args(["--host", "127.0.0.1", "--port", "19421", "--db", sample_db, "--demo"])
+        args = module.parse_args(
+            ["--host", "127.0.0.1", "--port", "19421", "--db", sample_db, "--mode", "hybrid", "--provider", "auto"]
+        )
         assert args.host == "127.0.0.1"
         assert args.port == 19421
         assert args.db == sample_db
-        assert args.demo is True
+        assert args.mode == "hybrid"
+        assert args.provider == "auto"
+
+        # Purged --demo flag must be rejected
+        with pytest.raises(SystemExit):
+            module.parse_args(["--host", "127.0.0.1", "--port", "19421", "--demo"])

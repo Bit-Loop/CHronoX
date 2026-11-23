@@ -26,7 +26,7 @@ from __future__ import annotations
 import calendar
 import math
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from chronox_finance.models import (
     AutopayMode,
@@ -34,14 +34,25 @@ from chronox_finance.models import (
     BalanceTransferRequest,
     BalanceTransferResult,
     CreditAdvisorAlert,
+    CreditDerogatoryOut,
+    CreditFactorBreakdown,
+    CreditFactorItem,
+    CreditInquiryOut,
     CreditLineOut,
     CreditOptimizationReport,
+    CreditReportOut,
+    CreditSimulatedAction,
     DebtKind,
     DebtStrategyResult,
+    FiveTwentyFourStatus,
     utc_now_iso,
 )
 
 MAX_SIM_MONTHS = 360  # 30-year safety cap
+FACTOR_SIMULATOR_DISCLAIMER = (
+    "Directional factor simulator only — not an official FICO or VantageScore calculation."
+)
+FICO_UTILIZATION_CLIFFS: Tuple[float, ...] = (1.0, 9.0, 29.0, 49.0, 69.0, 89.0)
 
 
 def next_occurrence_of_day(day_of_month: int, today: date) -> date:
@@ -117,6 +128,636 @@ def _months_since(opened_iso: Optional[str], ref: date) -> Optional[int]:
     return max(0, months)
 
 
+def _get_field(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def compute_derogatory_drop_off(kind: str, opened_date_iso: str) -> str:
+    """
+    Compute statutory FCRA credit report drop-off date based on derogatory kind:
+    - Chapter 7 Bankruptcy (`bankruptcy_ch7`): +10 years (+120 months)
+    - Late payments (`late_30/60/90`), Charge-Offs (`charge_off`), Collections (`collection`),
+      Chapter 13 Bankruptcy (`bankruptcy_ch13`), and other derogatories: +7 years (+84 months)
+    """
+    dt = date.fromisoformat(str(opened_date_iso)[:10])
+    months = 120 if str(kind).strip().lower() == "bankruptcy_ch7" else 84
+    return _add_months_date(dt, months).isoformat()
+
+
+def compute_inquiry_dates(inquiry_date_iso: str) -> Tuple[str, str]:
+    """Return `(counts_until (+12m scoring), drops_off (+24m report))` for a hard inquiry."""
+    dt = date.fromisoformat(str(inquiry_date_iso)[:10])
+    counts_until = _add_months_date(dt, 12).isoformat()
+    drops_off = _add_months_date(dt, 24).isoformat()
+    return counts_until, drops_off
+
+
+def _normalize_credit_reports(raw_reports: Optional[Sequence[Any]]) -> List[CreditReportOut]:
+    out: List[CreditReportOut] = []
+    for idx, r in enumerate(raw_reports or (), start=1):
+        if isinstance(r, CreditReportOut):
+            out.append(r)
+            continue
+        out.append(
+            CreditReportOut(
+                id=int(_get_field(r, "id", idx) or idx),
+                bureau=str(_get_field(r, "bureau", "other")),  # type: ignore[arg-type]
+                model=str(_get_field(r, "model", "fico8")),  # type: ignore[arg-type]
+                score=int(_get_field(r, "score", 300)),
+                pulled_date=str(_get_field(r, "pulled_date", date.today().isoformat()))[:10],
+                source=str(_get_field(r, "source", "manual")),
+                notes=str(_get_field(r, "notes", "") or ""),
+                created_at=str(_get_field(r, "created_at", "") or ""),
+            )
+        )
+    out.sort(key=lambda x: (x.pulled_date, x.id), reverse=True)
+    return out
+
+
+def _normalize_credit_inquiries(
+    raw_inquiries: Optional[Sequence[Any]],
+    ref: date,
+) -> List[CreditInquiryOut]:
+    out: List[CreditInquiryOut] = []
+    for idx, q in enumerate(raw_inquiries or (), start=1):
+        inq_date = str(_get_field(q, "inquiry_date", ""))[:10]
+        if not inq_date:
+            continue
+        try:
+            default_counts, default_drops = compute_inquiry_dates(inq_date)
+        except ValueError:
+            continue
+        counts_until = str(_get_field(q, "counts_until", None) or default_counts)[:10]
+        drops_off = str(_get_field(q, "drops_off", None) or default_drops)[:10]
+        try:
+            scoring_active = ref <= date.fromisoformat(counts_until)
+        except ValueError:
+            scoring_active = False
+        out.append(
+            CreditInquiryOut(
+                id=int(_get_field(q, "id", idx) or idx),
+                lender=str(_get_field(q, "lender", "Unknown Lender")),
+                bureau=str(_get_field(q, "bureau", "experian")),  # type: ignore[arg-type]
+                inquiry_date=inq_date,
+                counts_until=counts_until,
+                drops_off=drops_off,
+                is_scoring_active=scoring_active,
+                created_at=str(_get_field(q, "created_at", "") or ""),
+            )
+        )
+    out.sort(key=lambda x: x.inquiry_date, reverse=True)
+    return out
+
+
+def _normalize_credit_derogatories(
+    raw_derogs: Optional[Sequence[Any]],
+) -> List[CreditDerogatoryOut]:
+    out: List[CreditDerogatoryOut] = []
+    for idx, d in enumerate(raw_derogs or (), start=1):
+        kind = str(_get_field(d, "kind", "other"))
+        opened = str(_get_field(d, "opened_date", ""))[:10]
+        if not opened:
+            continue
+        try:
+            default_drop = compute_derogatory_drop_off(kind, opened)
+        except ValueError:
+            continue
+        drops_off = str(_get_field(d, "drops_off", None) or default_drop)[:10]
+        out.append(
+            CreditDerogatoryOut(
+                id=int(_get_field(d, "id", idx) or idx),
+                kind=kind,  # type: ignore[arg-type]
+                lender=str(_get_field(d, "lender", "") or ""),
+                opened_date=opened,
+                drops_off=drops_off,
+                active=bool(_get_field(d, "active", True)),
+                notes=str(_get_field(d, "notes", "") or ""),
+                created_at=str(_get_field(d, "created_at", "") or ""),
+            )
+        )
+    out.sort(key=lambda x: x.drops_off)
+    return out
+
+
+def evaluate_five_twenty_four(
+    *,
+    credit_lines: Sequence[CreditLineOut],
+    inquiries: Sequence[CreditInquiryOut] = (),
+    include_authorized_user: bool = True,
+    today: Optional[date] = None,
+) -> FiveTwentyFourStatus:
+    """
+    Compute Chase 5/24 status & issuer inquiry velocity across ALL issuers.
+
+    - Counts personal revolving accounts (`DebtKind.CREDIT_CARD`) opened in the
+      trailing 24 months across all issuers.
+    - Respects `include_authorized_user` toggle (`True` by default, matching Chase's
+      automated underwriting behavior; toggle `False` to model AU recon exclusion).
+    - Tracks trailing 6-month and 12-month hard inquiry velocity + Chase 2/30 guard.
+    """
+    ref = today or date.today()
+    counted: List[Dict[str, Any]] = []
+    opened_last_30d = 0
+    au_counted = 0
+
+    for line in credit_lines:
+        if line.kind != DebtKind.CREDIT_CARD or not line.opened_date:
+            continue
+        if line.is_authorized_user and not include_authorized_user:
+            continue
+        try:
+            open_dt = date.fromisoformat(line.opened_date[:10])
+        except ValueError:
+            continue
+        if open_dt > ref:
+            continue
+        drop_dt = _add_months_date(open_dt, 24)
+        if drop_dt > ref:
+            if line.is_authorized_user:
+                au_counted += 1
+            if (ref - open_dt).days <= 30:
+                opened_last_30d += 1
+            counted.append(
+                {
+                    "credit_line_id": line.id,
+                    "name": line.name,
+                    "issuer": line.issuer,
+                    "opened_date": line.opened_date[:10],
+                    "is_authorized_user": line.is_authorized_user,
+                    "drops_from_5_24_on": drop_dt.isoformat(),
+                }
+            )
+
+    counted.sort(key=lambda x: (x["opened_date"], x["credit_line_id"]))
+    count_5_24 = len(counted)
+    under_5_24 = count_5_24 < 5
+    next_slot_drop = counted[0]["drops_from_5_24_on"] if counted else None
+
+    inquiries_6m = 0
+    inquiries_12m = 0
+    for inq in inquiries:
+        try:
+            inq_dt = date.fromisoformat(inq.inquiry_date[:10])
+        except ValueError:
+            continue
+        age_days = (ref - inq_dt).days
+        if 0 <= age_days <= 183:
+            inquiries_6m += 1
+        if inq.is_scoring_active and age_days >= 0:
+            inquiries_12m += 1
+
+    warnings: List[str] = []
+    if count_5_24 >= 5:
+        warnings.append(
+            f"At {count_5_24}/24 — Chase 5/24 velocity cap active (next slot drops on {next_slot_drop})."
+        )
+    elif count_5_24 == 4:
+        warnings.append(
+            f"At 4/24 — only 1 Chase 5/24 slot remaining before lock-out (oldest slot drops {next_slot_drop})."
+        )
+    if au_counted > 0 and include_authorized_user:
+        warnings.append(
+            f"Includes {au_counted} Authorized User account(s) in 5/24 count — toggle AU off to preview Chase reconsideration."
+        )
+    if opened_last_30d >= 2:
+        warnings.append(
+            f"2/30 issuer velocity warning: {opened_last_30d} revolving cards opened within the last 30 days."
+        )
+    if inquiries_6m >= 3:
+        warnings.append(
+            f"High recent inquiry velocity ({inquiries_6m} hard inquiries in 6m / {inquiries_12m} in 12m) — pause new applications."
+        )
+
+    return FiveTwentyFourStatus(
+        count_5_24=count_5_24,
+        under_5_24=under_5_24,
+        include_authorized_user=include_authorized_user,
+        counted_accounts=counted,
+        next_slot_drop_date=next_slot_drop,
+        inquiries_6m=inquiries_6m,
+        inquiries_12m=inquiries_12m,
+        velocity_warnings=warnings,
+    )
+
+
+def _util_cliff_band(util_pct: float) -> int:
+    """Map utilization percentage to FICO cliff band index (0=0%, 1=<9%, 2=<29%, 3=<49%, 4=<69%, 5=<89%, 6=89%+)."""
+    if util_pct <= 0.0:
+        return 0
+    if util_pct < 9.0:
+        return 1
+    if util_pct < 29.0:
+        return 2
+    if util_pct < 49.0:
+        return 3
+    if util_pct < 69.0:
+        return 4
+    if util_pct < 89.0:
+        return 5
+    return 6
+
+
+class CreditFactorSimulator:
+    """
+    Honest Directional 5-Factor Credit Simulator (FICO 8 + VantageScore 3.0 weights).
+
+    NEVER computes or displays a fabricated trademarked FICO/Vantage numeric score.
+    Instead, pairs imported actual bureau scores (`credit_reports`) with directional
+    factor health ratings and estimated action impact ranges (`delta_min_pts..delta_max_pts`).
+    """
+
+    def simulate(
+        self,
+        *,
+        credit_lines: Sequence[CreditLineOut],
+        aggregate_utilization_pct: float,
+        all_zero_penalty_risk: bool,
+        avg_account_age_months: Optional[float],
+        oldest_account_name: Optional[str],
+        autopay_missing_count: int,
+        five_twenty_four: FiveTwentyFourStatus,
+        credit_reports: Sequence[CreditReportOut] = (),
+        credit_inquiries: Sequence[CreditInquiryOut] = (),
+        credit_derogatories: Sequence[CreditDerogatoryOut] = (),
+        today: Optional[date] = None,
+    ) -> CreditFactorBreakdown:
+        ref = today or date.today()
+
+        # Keep latest actual imported score per (bureau, model)
+        latest_by_key: Dict[Tuple[str, str], CreditReportOut] = {}
+        for rep in sorted(credit_reports, key=lambda r: (r.pulled_date, r.id), reverse=True):
+            key = (rep.bureau, rep.model)
+            if key not in latest_by_key:
+                latest_by_key[key] = rep
+        latest_actual_scores = list(latest_by_key.values())
+
+        # Active derogatories (not yet past FCRA drops_off date)
+        active_derogs = [
+            d
+            for d in credit_derogatories
+            if d.active and d.drops_off > ref.isoformat()
+        ]
+        severe_derogs = [
+            d
+            for d in active_derogs
+            if d.kind in ("late_90", "charge_off", "collection", "bankruptcy_ch7", "bankruptcy_ch13")
+        ]
+
+        cards = [c for c in credit_lines if c.kind == DebtKind.CREDIT_CARD]
+        installments = [c for c in credit_lines if c.kind != DebtKind.CREDIT_CARD]
+        max_card_util = max(((c.utilization_pct or 0.0) for c in cards), default=0.0)
+        cards_with_bal = sum(1 for c in cards if c.balance_cents > 0)
+        total_limit = sum(c.credit_limit_cents for c in cards)
+        total_bal = sum(c.balance_cents for c in cards)
+        available_credit = max(0, total_limit - total_bal)
+        oldest_months = max(((c.age_months or 0) for c in credit_lines), default=0)
+
+        # --- 1. Payment History (FICO 35% / Vantage 40%) ---
+        if severe_derogs:
+            pay_status = "drag"
+            earliest_drop = min(d.drops_off for d in severe_derogs)
+            pay_summary = (
+                f"{len(active_derogs)} active derogatory mark(s) including severe item(s); "
+                f"next statutory drop-off on {earliest_drop}."
+            )
+            pay_delta = "Severe drag until aged/dropped (+25 to +70 pts upon drop-off)"
+        elif active_derogs:
+            pay_status = "fair"
+            earliest_drop = min(d.drops_off for d in active_derogs)
+            pay_summary = (
+                f"{len(active_derogs)} active late-payment mark(s); drops off {earliest_drop} (+7y FCRA rule)."
+            )
+            pay_delta = "Moderate drag fading with on-time months (+10 to +35 pts over time)"
+        elif autopay_missing_count > 0:
+            pay_status = "good"
+            pay_summary = (
+                f"0 active derogatories, but {autopay_missing_count} account(s) lack autopay protection."
+            )
+            pay_delta = "Clean record; enable autopay to eliminate -60 to -110 pt late-payment risk"
+        else:
+            pay_status = "optimal"
+            pay_summary = "0 active derogatories and autopay shields active across tracked accounts."
+            pay_delta = "Optimal — 0 pts drag"
+
+        # --- 2. Utilization / AZEO Cliffs (FICO 30% / Vantage 20%) ---
+        agg_band = _util_cliff_band(aggregate_utilization_pct)
+        max_band = _util_cliff_band(max_card_util)
+        worst_band = max(agg_band, max_band)
+
+        if all_zero_penalty_risk:
+            util_status = "good"
+            util_summary = (
+                "0.0% aggregate utilization across all cards triggers the FICO All-Zero inactivity dip."
+            )
+            util_delta = "Letting 1 card report 1%–4.9% (AZEO): est. +10 to +20 pts directional impact"
+        elif worst_band <= 1:
+            util_status = "optimal"
+            util_summary = (
+                f"{aggregate_utilization_pct:.1f}% aggregate util (max card {max_card_util:.1f}%) — "
+                f"inside the 1%–8.9% top-tier AZEO band ({cards_with_bal}/{len(cards)} cards reporting)."
+            )
+            util_delta = "Optimal cliff tier (1%–8.9%)"
+        elif worst_band == 2:
+            util_status = "good"
+            util_summary = (
+                f"{aggregate_utilization_pct:.1f}% aggregate util (max card {max_card_util:.1f}%) — "
+                f"below 29% cliff, room to optimize under 8.9% via AZEO."
+            )
+            util_delta = "Crossing 9% cliff via AZEO: est. +6 to +18 pts directional impact"
+        elif worst_band == 3:
+            util_status = "fair"
+            util_summary = (
+                f"{aggregate_utilization_pct:.1f}% aggregate util (max card {max_card_util:.1f}%) — "
+                f"crossed the 29% FICO utilization cliff."
+            )
+            util_delta = "Dropping below 29% / 9% cliffs: est. +15 to +35 pts directional impact"
+        else:
+            util_status = "drag"
+            util_summary = (
+                f"{aggregate_utilization_pct:.1f}% aggregate util (max card {max_card_util:.1f}%) — "
+                f"elevated utilization cliff drag (49%/69%/89% tiers)."
+            )
+            util_delta = "Paying high-util cards under 9% before close: est. +25 to +65 pts directional impact"
+
+        # --- 3. Length of Credit History: AAoA / AoOA (FICO 15%) ---
+        aaoa = avg_account_age_months or 0.0
+        if aaoa >= 84.0:
+            age_status = "optimal"
+            age_delta = "Mature file (7+ yr AAoA)"
+        elif aaoa >= 48.0:
+            age_status = "good"
+            age_delta = "Healthy aging trajectory (+3 to +10 pts over next 12–24m)"
+        elif aaoa >= 24.0:
+            age_status = "fair"
+            age_delta = "Young file — avoid unnecessary new cards or closing oldest line"
+        else:
+            age_status = "drag"
+            age_delta = "Thin/young credit history — protect oldest account and let accounts age"
+        age_summary = (
+            f"AAoA {aaoa:.1f} mo · AoOA {oldest_months} mo"
+            + (f" (anchor: {oldest_account_name})." if oldest_account_name else ".")
+        )
+
+        # --- 4. New Credit & Hard Inquiries (FICO 10% / Vantage 5%) ---
+        inq_12m = five_twenty_four.inquiries_12m
+        inq_24m = sum(1 for q in credit_inquiries if q.drops_off > ref.isoformat())
+        if inq_12m <= 1 and five_twenty_four.count_5_24 <= 2:
+            new_status = "optimal"
+            new_delta = "Minimal new-credit drag"
+        elif inq_12m <= 3 and five_twenty_four.count_5_24 <= 4:
+            new_status = "good"
+            new_delta = "Light velocity (+3 to +8 pts as 12m inquiries age out)"
+        elif inq_12m <= 5 or five_twenty_four.count_5_24 >= 5:
+            new_status = "fair"
+            new_delta = "Elevated new-account velocity (+5 to +15 pts after 12m inquiry aging)"
+        else:
+            new_status = "drag"
+            new_delta = "High inquiry drag — garden existing lines for 6–12 months"
+        new_summary = (
+            f"{inq_12m} scoring inquiries (<12m), {inq_24m} on report (<24m), "
+            f"Chase velocity {five_twenty_four.count_5_24}/24."
+        )
+
+        # --- 5. Credit Mix (FICO 10%) ---
+        has_rev = len(cards) > 0
+        has_inst = len(installments) > 0
+        if has_rev and has_inst:
+            mix_status = "optimal"
+            mix_summary = f"Balanced mix: {len(cards)} revolving card(s) + {len(installments)} installment account(s)."
+            mix_delta = "Optimal credit mix"
+        elif len(credit_lines) >= 2:
+            mix_status = "good"
+            mix_summary = (
+                f"{len(cards)} revolving card(s), {len(installments)} installment account(s) — "
+                f"solid profile (never take on interest just for mix)."
+            )
+            mix_delta = "Strong mix — no need to borrow for mix"
+        else:
+            mix_status = "fair"
+            mix_summary = f"{len(credit_lines)} tracked tradeline(s); thin file mix."
+            mix_delta = "Thin file — improves naturally over time"
+
+        fico8_factors = [
+            CreditFactorItem(
+                factor="payment_history",
+                label="Payment History",
+                weight_pct=35,
+                status=pay_status,  # type: ignore[arg-type]
+                summary=pay_summary,
+                estimated_delta_range=pay_delta,
+            ),
+            CreditFactorItem(
+                factor="utilization",
+                label="Amounts Owed / Utilization (AZEO)",
+                weight_pct=30,
+                status=util_status,  # type: ignore[arg-type]
+                summary=util_summary,
+                estimated_delta_range=util_delta,
+            ),
+            CreditFactorItem(
+                factor="credit_age",
+                label="Length of Credit History (AAoA / AoOA)",
+                weight_pct=15,
+                status=age_status,  # type: ignore[arg-type]
+                summary=age_summary,
+                estimated_delta_range=age_delta,
+            ),
+            CreditFactorItem(
+                factor="new_credit",
+                label="New Credit & Hard Inquiries",
+                weight_pct=10,
+                status=new_status,  # type: ignore[arg-type]
+                summary=new_summary,
+                estimated_delta_range=new_delta,
+            ),
+            CreditFactorItem(
+                factor="credit_mix",
+                label="Credit Mix",
+                weight_pct=10,
+                status=mix_status,  # type: ignore[arg-type]
+                summary=mix_summary,
+                estimated_delta_range=mix_delta,
+            ),
+        ]
+
+        # VantageScore 3.0 directional weights (40 + 21 + 20 + 11 + 5 + 3 = 100%)
+        depth_status = "optimal" if (age_status == "optimal" and mix_status == "optimal") else (
+            "good" if age_status in ("optimal", "good") else age_status
+        )
+        total_debt_all = sum(c.balance_cents for c in credit_lines)
+        bal_status = "optimal" if total_debt_all == 0 else ("good" if total_bal < 250_000 else ("fair" if total_bal < 1_000_000 else "drag"))
+        avail_status = "optimal" if available_credit >= 1_000_000 else ("good" if available_credit >= 300_000 else "fair")
+
+        vantage3_factors = [
+            CreditFactorItem(
+                factor="payment_history",
+                label="Payment History",
+                weight_pct=40,
+                status=pay_status,  # type: ignore[arg-type]
+                summary=pay_summary,
+                estimated_delta_range=pay_delta,
+            ),
+            CreditFactorItem(
+                factor="depth_of_credit",
+                label="Age & Type of Credit (Depth)",
+                weight_pct=21,
+                status=depth_status,  # type: ignore[arg-type]
+                summary=f"{age_summary} {mix_summary}",
+                estimated_delta_range=age_delta,
+            ),
+            CreditFactorItem(
+                factor="utilization",
+                label="Credit Utilization",
+                weight_pct=20,
+                status=util_status,  # type: ignore[arg-type]
+                summary=util_summary,
+                estimated_delta_range=util_delta,
+            ),
+            CreditFactorItem(
+                factor="balances",
+                label="Total Balances",
+                weight_pct=11,
+                status=bal_status,  # type: ignore[arg-type]
+                summary=f"${total_debt_all / 100:,.2f} total debt (${total_bal / 100:,.2f} revolving).",
+                estimated_delta_range="Paying down revolving balances improves both utilization & total balance factor",
+            ),
+            CreditFactorItem(
+                factor="recent_credit",
+                label="Recent Credit & Inquiries",
+                weight_pct=5,
+                status=new_status,  # type: ignore[arg-type]
+                summary=new_summary,
+                estimated_delta_range=new_delta,
+            ),
+            CreditFactorItem(
+                factor="available_credit",
+                label="Available Credit",
+                weight_pct=3,
+                status=avail_status,  # type: ignore[arg-type]
+                summary=f"${available_credit / 100:,.2f} unused revolving credit across {len(cards)} card(s).",
+                estimated_delta_range="Higher unused credit buffers utilization swings",
+            ),
+        ]
+
+        # --- Directional Simulated Action Deltas ---
+        simulated_actions: List[CreditSimulatedAction] = []
+
+        # Per-card pre-close drop actions (sorted by highest utilization cliff crossed)
+        high_util_cards = sorted(
+            [c for c in cards if (c.utilization_pct or 0.0) >= 9.0 and c.balance_cents > 0],
+            key=lambda c: -(c.utilization_pct or 0.0),
+        )
+        for c in high_util_cards[:3]:
+            u = c.utilization_pct or 0.0
+            band = _util_cliff_band(u)
+            if band >= 6:
+                d_min, d_max = 35, 65
+            elif band == 5:
+                d_min, d_max = 25, 50
+            elif band == 4:
+                d_min, d_max = 20, 40
+            elif band == 3:
+                d_min, d_max = 18, 35
+            else:
+                d_min, d_max = 6, 15
+            simulated_actions.append(
+                CreditSimulatedAction(
+                    action=f"Dropping {c.name} {u:.0f}% -> 0% before close",
+                    delta_min_pts=d_min,
+                    delta_max_pts=d_max,
+                    explanation=(
+                        f"Dropping {c.name} {u:.0f}% -> 0% before statement close ({c.next_statement_close_date}): "
+                        f"est. +{d_min} to +{d_max} pts directional impact by clearing FICO utilization cliff(s)."
+                    ),
+                )
+            )
+
+        if all_zero_penalty_risk:
+            simulated_actions.append(
+                CreditSimulatedAction(
+                    action="Report 1%–4.9% on 1 primary card (AZEO)",
+                    delta_min_pts=10,
+                    delta_max_pts=20,
+                    explanation=(
+                        "Moving from 0% across all cards to 1%–4.9% on one primary card removes the "
+                        "FICO All-Zero inactivity penalty: est. +10 to +20 pts directional impact."
+                    ),
+                )
+            )
+        elif cards_with_bal >= 2 and aggregate_utilization_pct >= 9.0:
+            simulated_actions.append(
+                CreditSimulatedAction(
+                    action="Apply full AZEO (1 card at 1%–4.9%, others $0)",
+                    delta_min_pts=12,
+                    delta_max_pts=30,
+                    explanation=(
+                        f"Reducing Accounts With Balances from {cards_with_bal} -> 1 and aggregate util "
+                        f"from {aggregate_utilization_pct:.1f}% -> <4.9% before close: est. +12 to +30 pts directional impact."
+                    ),
+                )
+            )
+
+        # Scoring inquiry aging milestone
+        scoring_inqs = sorted(
+            [q for q in credit_inquiries if q.is_scoring_active],
+            key=lambda q: q.counts_until,
+        )
+        if scoring_inqs:
+            oldest_inq = scoring_inqs[0]
+            simulated_actions.append(
+                CreditSimulatedAction(
+                    action=f"Hard inquiry aging past 12m ({oldest_inq.lender} on {oldest_inq.counts_until})",
+                    delta_min_pts=3,
+                    delta_max_pts=10,
+                    explanation=(
+                        f"FICO 8 stops scoring hard inquiries after 12 months ({oldest_inq.counts_until}); "
+                        f"full report drop-off occurs at 24 months ({oldest_inq.drops_off}): est. +3 to +10 pts."
+                    ),
+                )
+            )
+
+        # Derogatory drop-off milestone if any active derogatory exists
+        if active_derogs:
+            next_derog = min(active_derogs, key=lambda d: d.drops_off)
+            is_severe = next_derog.kind in ("charge_off", "collection", "bankruptcy_ch7", "bankruptcy_ch13", "late_90")
+            d_min, d_max = (25, 70) if is_severe else (10, 30)
+            simulated_actions.append(
+                CreditSimulatedAction(
+                    action=f"Derogatory drop-off: {next_derog.kind} ({next_derog.drops_off})",
+                    delta_min_pts=d_min,
+                    delta_max_pts=d_max,
+                    explanation=(
+                        f"Scheduled FCRA drop-off on {next_derog.drops_off} "
+                        f"({'10-year Ch7 rule' if next_derog.kind == 'bankruptcy_ch7' else '7-year rule'}): "
+                        f"est. +{d_min} to +{d_max} pts directional impact."
+                    ),
+                )
+            )
+
+        # Honest short-term cost of opening a new card
+        simulated_actions.append(
+            CreditSimulatedAction(
+                action="Opening a new credit card (hard pull + AAoA dilution)",
+                delta_min_pts=-12,
+                delta_max_pts=-3,
+                explanation=(
+                    f"Hard inquiry (-3 to -12 pts for 12m) plus AAoA reduction and +1 Chase 5/24 slot "
+                    f"(would move you from {five_twenty_four.count_5_24}/24 to {five_twenty_four.count_5_24 + 1}/24)."
+                ),
+            )
+        )
+
+        return CreditFactorBreakdown(
+            disclaimer=FACTOR_SIMULATOR_DISCLAIMER,
+            latest_actual_scores=latest_actual_scores,
+            fico8_factors=fico8_factors,
+            vantage3_factors=vantage3_factors,
+            simulated_actions=simulated_actions,
+        )
+
+
 class CreditDebtOptimizer:
     """Deterministic expert credit & debt optimization engine."""
 
@@ -126,6 +767,10 @@ class CreditDebtOptimizer:
         raw_lines: List[Dict[str, Any]],
         smoothed_monthly_income_cents: int,
         extra_monthly_budget_cents: int = 25_000,
+        credit_reports: Optional[Sequence[Any]] = None,
+        credit_inquiries: Optional[Sequence[Any]] = None,
+        credit_derogatories: Optional[Sequence[Any]] = None,
+        include_authorized_user: bool = True,
         today: Optional[date] = None,
     ) -> CreditOptimizationReport:
         ref = today or date.today()
@@ -204,6 +849,7 @@ class CreditDebtOptimizer:
                     autopay_mode=AutopayMode(r.get("autopay_mode", AutopayMode.STATEMENT.value)),
                     rewards_note=r.get("rewards_note", ""),
                     account_id=r.get("account_id"),
+                    is_authorized_user=bool(r.get("is_authorized_user", 0)),
                     monthly_interest_cents=monthly_int,
                 )
             )
@@ -235,7 +881,36 @@ class CreditDebtOptimizer:
         dti_pct = round((total_mins / income_base) * 100.0, 1) if total_mins > 0 else 0.0
         dti_tier = classify_dti_tier(dti_pct)
 
-        autopay_missing = sum(1 for d in enriched if d.autopay_mode == AutopayMode.NONE and (d.balance_cents > 0 or d.kind == DebtKind.CREDIT_CARD))
+        autopay_missing = sum(
+            1
+            for d in enriched
+            if d.autopay_mode == AutopayMode.NONE and (d.balance_cents > 0 or d.kind == DebtKind.CREDIT_CARD)
+        )
+
+        # Normalize bureau reports, inquiries, derogatories & compute honest 5-factor + 5/24
+        norm_reports = _normalize_credit_reports(credit_reports)
+        norm_inquiries = _normalize_credit_inquiries(credit_inquiries, ref)
+        norm_derogs = _normalize_credit_derogatories(credit_derogatories)
+
+        five_twenty_four = evaluate_five_twenty_four(
+            credit_lines=enriched,
+            inquiries=norm_inquiries,
+            include_authorized_user=include_authorized_user,
+            today=ref,
+        )
+        factor_simulator = CreditFactorSimulator().simulate(
+            credit_lines=enriched,
+            aggregate_utilization_pct=agg_util,
+            all_zero_penalty_risk=all_zero_risk,
+            avg_account_age_months=avg_age,
+            oldest_account_name=oldest_name,
+            autopay_missing_count=autopay_missing,
+            five_twenty_four=five_twenty_four,
+            credit_reports=norm_reports,
+            credit_inquiries=norm_inquiries,
+            credit_derogatories=norm_derogs,
+            today=ref,
+        )
 
         azeo_plan = self._build_azeo_plan(cards, total_rev_lim, ref)
         strategies, rec_strategy = self._simulate_all_strategies(
@@ -248,6 +923,7 @@ class CreditDebtOptimizer:
             all_zero_risk=all_zero_risk,
             dti_pct=dti_pct,
             oldest_name=oldest_name,
+            five_twenty_four=five_twenty_four,
         )
 
         return CreditOptimizationReport(
@@ -273,6 +949,11 @@ class CreditDebtOptimizer:
             strategies=strategies,
             recommended_strategy=rec_strategy,
             alerts=alerts,
+            factor_simulator=factor_simulator,
+            five_twenty_four=five_twenty_four,
+            credit_reports=norm_reports,
+            credit_inquiries=norm_inquiries,
+            credit_derogatories=norm_derogs,
         )
 
     def _build_azeo_plan(
@@ -585,6 +1266,7 @@ class CreditDebtOptimizer:
         all_zero_risk: bool,
         dti_pct: float,
         oldest_name: Optional[str],
+        five_twenty_four: Optional[FiveTwentyFourStatus] = None,
     ) -> List[CreditAdvisorAlert]:
         alerts: List[CreditAdvisorAlert] = []
 
@@ -698,6 +1380,44 @@ class CreditDebtOptimizer:
                 )
             )
 
+        # 5b. Chase 5/24 & Inquiry Velocity Guard
+        if five_twenty_four is not None:
+            if five_twenty_four.count_5_24 >= 4:
+                drop_hint = (
+                    f" Next slot drops on {five_twenty_four.next_slot_drop_date}."
+                    if five_twenty_four.next_slot_drop_date
+                    else ""
+                )
+                alerts.append(
+                    CreditAdvisorAlert(
+                        severity="high" if five_twenty_four.count_5_24 >= 5 else "medium",
+                        category="five_twenty_four",
+                        title=f"Chase 5/24 Velocity at {five_twenty_four.count_5_24}/24",
+                        detail=(
+                            f"You have opened {five_twenty_four.count_5_24} personal revolving card(s) across all issuers "
+                            f"in the trailing 24 months.{drop_hint} Avoid opening new store/promo cards right now."
+                        ),
+                        micro_step=(
+                            f"Pause new card applications until {five_twenty_four.next_slot_drop_date or 'slots age out'} "
+                            f"to preserve Chase/issuer eligibility."
+                        ),
+                    )
+                )
+            if five_twenty_four.inquiries_6m >= 3:
+                alerts.append(
+                    CreditAdvisorAlert(
+                        severity="medium",
+                        category="inquiry_velocity",
+                        title=f"Elevated Hard Inquiry Velocity ({five_twenty_four.inquiries_6m} in 6m)",
+                        detail=(
+                            f"{five_twenty_four.inquiries_6m} hard inquiries in 6 months "
+                            f"({five_twenty_four.inquiries_12m} scoring active in 12m). "
+                            f"High velocity triggers issuer denials and short-term score drag."
+                        ),
+                        micro_step="Garden existing cards and wait 6 months before applying for new credit.",
+                    )
+                )
+
         if oldest_name:
             alerts.append(
                 CreditAdvisorAlert(
@@ -712,7 +1432,7 @@ class CreditDebtOptimizer:
                 )
             )
 
-        return alerts[:8]
+        return alerts[:10]
 
     def evaluate_balance_transfer(self, req: BalanceTransferRequest) -> BalanceTransferResult:
         """Exact amortization breakeven analysis for a 0% balance transfer offer."""

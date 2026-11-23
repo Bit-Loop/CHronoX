@@ -23,6 +23,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
+from urllib.parse import urlparse
 
 import httpx
 
@@ -31,6 +32,195 @@ from chronox_finance.security import validate_external_api_url
 logger = logging.getLogger(__name__)
 
 DEFAULT_OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go/v1"
+
+# Published per-1M-token pricing in exact integer microdollars ($1.00 = 1_000_000 microdollars):
+# (input_rate, cached_input_rate, output_rate)
+MODEL_PRICING_MICRODOLLARS_PER_1M: Dict[str, Tuple[int, int, int]] = {
+    # OpenAI / Codex
+    "gpt-5.3-codex": (1_500_000, 150_000, 12_000_000),
+    "gpt-5.2-codex": (1_500_000, 150_000, 12_000_000),
+    "gpt-5.1-codex": (1_250_000, 125_000, 10_000_000),
+    "gpt-5-codex": (1_250_000, 125_000, 10_000_000),
+    "gpt-5-mini": (250_000, 25_000, 2_000_000),
+    "gpt-5-nano": (50_000, 5_000, 400_000),
+    "gpt-5": (1_250_000, 125_000, 10_000_000),
+    "gpt-4.1-mini": (400_000, 100_000, 1_600_000),
+    "gpt-4.1-nano": (100_000, 25_000, 400_000),
+    "gpt-4.1": (2_000_000, 500_000, 8_000_000),
+    "gpt-4o-mini": (150_000, 75_000, 600_000),
+    "gpt-4o": (2_500_000, 1_250_000, 10_000_000),
+    "o4-mini": (1_100_000, 275_000, 4_400_000),
+    "o3-mini": (1_100_000, 275_000, 4_400_000),
+    "o3": (2_000_000, 500_000, 8_000_000),
+    # Google Gemini
+    "gemini-2.5-flash-lite": (100_000, 25_000, 400_000),
+    "gemini-2.5-flash": (300_000, 75_000, 2_500_000),
+    "gemini-2.5-pro": (1_250_000, 312_500, 10_000_000),
+    "gemini-2.0-flash": (100_000, 25_000, 400_000),
+    # OpenCode Go / Anthropic / Open-weight routed models
+    "claude-haiku-5-5": (800_000, 80_000, 4_000_000),
+    "claude-3-5-haiku": (800_000, 80_000, 4_000_000),
+    "claude-sonnet": (3_000_000, 300_000, 15_000_000),
+    "claude-opus": (15_000_000, 1_500_000, 75_000_000),
+    "glm-5.3-flash": (100_000, 20_000, 300_000),
+    "glm-5.3": (500_000, 100_000, 1_500_000),
+    "deepseek-v4.1-flash": (140_000, 14_000, 280_000),
+    "deepseek": (270_000, 70_000, 1_100_000),
+    "kimi-k3": (600_000, 150_000, 2_000_000),
+    "qwen3.8-flash": (100_000, 20_000, 300_000),
+    "qwen3.8-max": (800_000, 200_000, 2_400_000),
+    "minimax-m3.1-flash": (200_000, 40_000, 800_000),
+    "minimax-m3": (300_000, 60_000, 1_200_000),
+}
+
+_SORTED_PRICING_KEYS: Tuple[str, ...] = tuple(
+    sorted(MODEL_PRICING_MICRODOLLARS_PER_1M.keys(), key=len, reverse=True)
+)
+
+_PROVIDER_DEFAULT_PRICING: Dict[str, Tuple[int, int, int]] = {
+    "openai_codex": MODEL_PRICING_MICRODOLLARS_PER_1M["gpt-4.1-mini"],
+    "gemini": MODEL_PRICING_MICRODOLLARS_PER_1M["gemini-2.5-flash"],
+    "opencode_go": MODEL_PRICING_MICRODOLLARS_PER_1M["glm-5.3-flash"],
+}
+
+
+def is_local_url(url: str) -> bool:
+    """Return True if URL targets loopback (Ollama / local vLLM / local gateway)."""
+    try:
+        host = (urlparse((url or "").strip()).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
+def lookup_model_pricing(
+    model: str,
+    *,
+    provider: str = "",
+    is_local_endpoint: bool = False,
+) -> Tuple[int, int, int]:
+    """
+    Look up `(input_rate, cached_input_rate, output_rate)` in microdollars per 1M tokens.
+    Returns `(0, 0, 0)` for local self-hosted endpoints or unknown wrapper models so cost
+    and savings are never fabricated.
+    """
+    if is_local_endpoint:
+        return (0, 0, 0)
+    cleaned = (model or "").strip().lower()
+    if "/" in cleaned:
+        cleaned = cleaned.rsplit("/", 1)[-1]
+    if cleaned.startswith("models/"):
+        cleaned = cleaned[len("models/") :]
+    if cleaned in MODEL_PRICING_MICRODOLLARS_PER_1M:
+        return MODEL_PRICING_MICRODOLLARS_PER_1M[cleaned]
+    for prefix in _SORTED_PRICING_KEYS:
+        if cleaned.startswith(prefix):
+            return MODEL_PRICING_MICRODOLLARS_PER_1M[prefix]
+    return _PROVIDER_DEFAULT_PRICING.get((provider or "").strip().lower(), (0, 0, 0))
+
+
+def calculate_token_costs(
+    *,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cached_tokens: int = 0,
+    provider: str = "",
+    is_local_endpoint: bool = False,
+) -> Tuple[int, int, int]:
+    """
+    Compute exact integer microdollar costs from real provider-reported token counts.
+
+    Returns `(cost_microdollars, saved_microdollars, full_uncached_cost_microdollars)`.
+    - `saved_microdollars` is strictly `clamped_cached_tokens * provider_cache_price_delta`.
+    - Never fabricates savings when `cached_tokens == 0` or token usage is missing.
+    """
+    in_tok = max(0, int(input_tokens or 0))
+    out_tok = max(0, int(output_tokens or 0))
+    cached_tok = max(0, int(cached_tokens or 0))
+    if in_tok > 0:
+        cached_tok = min(cached_tok, in_tok)
+    else:
+        cached_tok = 0
+
+    if in_tok == 0 and out_tok == 0:
+        return (0, 0, 0)
+
+    in_rate, cached_rate, out_rate = lookup_model_pricing(
+        model, provider=provider, is_local_endpoint=is_local_endpoint
+    )
+    if in_rate == 0 and cached_rate == 0 and out_rate == 0:
+        return (0, 0, 0)
+
+    uncached_in_tok = max(0, in_tok - cached_tok)
+    uncached_in_cost = (uncached_in_tok * in_rate + 500_000) // 1_000_000
+    cached_in_cost = (cached_tok * cached_rate + 500_000) // 1_000_000
+    out_cost = (out_tok * out_rate + 500_000) // 1_000_000
+    actual_cost = uncached_in_cost + cached_in_cost + out_cost
+
+    full_in_cost = (in_tok * in_rate + 500_000) // 1_000_000
+    full_uncached_cost = full_in_cost + out_cost
+
+    price_delta = max(0, in_rate - cached_rate)
+    saved = (
+        (cached_tok * price_delta + 500_000) // 1_000_000
+        if cached_tok > 0 and price_delta > 0
+        else 0
+    )
+    return (actual_cost, saved, full_uncached_cost)
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        if isinstance(value, bool):
+            return 0
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def extract_openai_usage(data: Dict[str, Any]) -> Tuple[int, int, int]:
+    """
+    Extract `(input_tokens, output_tokens, cached_tokens)` from OpenAI Responses API
+    or OpenAI-compatible Chat Completions / OpenCode Go responses.
+    """
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return (0, 0, 0)
+    input_tokens = _safe_int(usage.get("input_tokens") or usage.get("prompt_tokens"))
+    output_tokens = _safe_int(usage.get("output_tokens") or usage.get("completion_tokens"))
+    in_details = usage.get("input_tokens_details")
+    prompt_details = usage.get("prompt_tokens_details")
+    cached_tokens = 0
+    if isinstance(in_details, dict) and in_details.get("cached_tokens") is not None:
+        cached_tokens = _safe_int(in_details.get("cached_tokens"))
+    elif isinstance(prompt_details, dict) and prompt_details.get("cached_tokens") is not None:
+        cached_tokens = _safe_int(prompt_details.get("cached_tokens"))
+    elif usage.get("cached_input_tokens") is not None:
+        cached_tokens = _safe_int(usage.get("cached_input_tokens"))
+    elif usage.get("prompt_cache_hit_tokens") is not None:
+        cached_tokens = _safe_int(usage.get("prompt_cache_hit_tokens"))
+    elif usage.get("cached_tokens") is not None:
+        cached_tokens = _safe_int(usage.get("cached_tokens"))
+    if input_tokens > 0:
+        cached_tokens = min(cached_tokens, input_tokens)
+    return (input_tokens, output_tokens, cached_tokens)
+
+
+def extract_anthropic_usage(data: Dict[str, Any]) -> Tuple[int, int, int]:
+    """
+    Extract `(input_tokens, output_tokens, cached_tokens)` from Anthropic Messages API responses.
+    """
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return (0, 0, 0)
+    base_in = _safe_int(usage.get("input_tokens"))
+    cache_read = _safe_int(usage.get("cache_read_input_tokens"))
+    cache_create = _safe_int(usage.get("cache_creation_input_tokens"))
+    input_tokens = base_in + cache_read + cache_create
+    output_tokens = _safe_int(usage.get("output_tokens"))
+    cached_tokens = min(cache_read, input_tokens) if input_tokens > 0 else 0
+    return (input_tokens, output_tokens, cached_tokens)
 
 # Curated fallback roster matching active OpenCode Go model catalog
 CURATED_OPENCODE_GO_MODELS: List[Dict[str, str]] = [
@@ -61,11 +251,17 @@ class CompletionResult:
     protocol_used: str
     cached: bool = False
     provider: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0
+    cost_microdollars: int = 0
+    saved_microdollars: int = 0
+    latency_ms: int = 0
 
 
 @runtime_checkable
 class LLMClient(Protocol):
-    """Common protocol shared by OpenCodeGoClient and GeminiClient."""
+    """Common protocol shared by all ChronoX AI provider clients."""
 
     provider_name: str
     model: str
@@ -280,15 +476,23 @@ class OpenCodeGoClient:
                     protocol_used=cached["protocol_used"],
                     cached=True,
                     provider=self.provider_name,
+                    input_tokens=0,
+                    output_tokens=0,
+                    cached_tokens=0,
+                    cost_microdollars=0,
+                    saved_microdollars=int(cached.get("full_uncached_cost_microdollars", 0)),
+                    latency_ms=0,
                 )
 
         protocols = self._choose_protocols(target_model)
         last_error: Optional[Exception] = None
+        local_ep = is_local_url(self.base_url)
 
         for proto in protocols:
             try:
+                t0 = time.monotonic()
                 if proto == "openai":
-                    text = self._call_openai_compat(
+                    text, in_tok, out_tok, cached_tok = self._call_openai_compat(
                         model=target_model,
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,
@@ -297,17 +501,31 @@ class OpenCodeGoClient:
                         json_mode=json_mode,
                     )
                 else:
-                    text = self._call_anthropic_compat(
+                    text, in_tok, out_tok, cached_tok = self._call_anthropic_compat(
                         model=target_model,
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,
                         temperature=temperature,
                         max_tokens=max_tokens,
                     )
+                latency_ms = max(0, int(round((time.monotonic() - t0) * 1000)))
+                cost_ud, saved_ud, full_uncached_ud = calculate_token_costs(
+                    model=target_model,
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                    cached_tokens=cached_tok,
+                    provider=self.provider_name,
+                    is_local_endpoint=local_ep,
+                )
                 if use_cache and self.cache_ttl_seconds > 0:
                     self._cache.set(
                         cache_hash,
-                        {"content": text, "model": target_model, "protocol_used": proto},
+                        {
+                            "content": text,
+                            "model": target_model,
+                            "protocol_used": proto,
+                            "full_uncached_cost_microdollars": full_uncached_ud,
+                        },
                         ttl_seconds=self.cache_ttl_seconds,
                     )
                 return CompletionResult(
@@ -316,6 +534,12 @@ class OpenCodeGoClient:
                     protocol_used=proto,
                     cached=False,
                     provider=self.provider_name,
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                    cached_tokens=cached_tok,
+                    cost_microdollars=cost_ud,
+                    saved_microdollars=saved_ud,
+                    latency_ms=latency_ms,
                 )
             except httpx.TimeoutException as exc:
                 raise OpenCodeGoError(f"OpenCode Go request timed out after {self.timeout_seconds:.0f}s.") from exc
@@ -342,7 +566,7 @@ class OpenCodeGoClient:
         temperature: float,
         max_tokens: int,
         json_mode: bool,
-    ) -> str:
+    ) -> Tuple[str, int, int, int]:
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -390,7 +614,8 @@ class OpenCodeGoClient:
 
         if not content:
             raise OpenCodeGoError("OpenCode Go returned empty message content")
-        return str(content)
+        in_tok, out_tok, cached_tok = extract_openai_usage(data if isinstance(data, dict) else {})
+        return str(content), in_tok, out_tok, cached_tok
 
     def _call_anthropic_compat(
         self,
@@ -400,7 +625,7 @@ class OpenCodeGoClient:
         user_prompt: str,
         temperature: float,
         max_tokens: int,
-    ) -> str:
+    ) -> Tuple[str, int, int, int]:
         # Handle both .../zen/go/v1 and .../zen/go base URLs cleanly
         base = self.base_url.rstrip("/")
         url = f"{base}/messages" if base.endswith("/v1") else f"{base}/v1/messages"
@@ -429,7 +654,8 @@ class OpenCodeGoClient:
         combined = "\n".join(t for t in texts if t).strip()
         if not combined:
             raise OpenCodeGoError("OpenCode Go Anthropic route returned empty content")
-        return combined
+        in_tok, out_tok, cached_tok = extract_anthropic_usage(data if isinstance(data, dict) else {})
+        return combined, in_tok, out_tok, cached_tok
 
     def _check_status(self, resp: httpx.Response) -> None:
         if resp.status_code == 401:

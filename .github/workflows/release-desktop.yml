@@ -32,7 +32,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Install Python app & dev dependencies
         run: |
@@ -47,6 +47,7 @@ jobs:
       - name: Validate desktop JS, scripts, PKGBUILD & YAML configs
         run: |
           node --check chronox_finance/web/app.js
+          find chronox_finance/web/js -type f -name '*.js' -print0 | xargs -0 -n1 node --check
           node --check desktop/scripts/build-backend.mjs
           find desktop/src -type f -name '*.js' -print0 | xargs -0 -n1 node --check
           bash -n scripts/install-linux.sh
@@ -74,7 +75,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Install Linux packaging system tools
         run: |
@@ -100,7 +101,7 @@ jobs:
           npm run build:backend
           ./build/backend/chronox-backend --help
           TMP_DB="$(mktemp -u /tmp/chronox-smoke-XXXXXX.sqlite3)"
-          ./build/backend/chronox-backend --host 127.0.0.1 --port 18742 --db "${TMP_DB}" --demo &
+          ./build/backend/chronox-backend --host 127.0.0.1 --port 18742 --db "${TMP_DB}" &
           SIDECAR_PID=$!
           trap 'kill "${SIDECAR_PID}" 2>/dev/null || true; rm -f "${TMP_DB}" "${TMP_DB}-wal" "${TMP_DB}-shm"' EXIT
           for i in $(seq 1 30); do
@@ -162,7 +163,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Create .venv & install ChronoX Finance + PyInstaller
         shell: pwsh
@@ -186,7 +187,7 @@ jobs:
           .\build\backend\chronox-backend.exe --help
           $tmpDb = Join-Path $env:TEMP "chronox-smoke-$([guid]::NewGuid().ToString('N')).sqlite3"
           $proc = Start-Process -FilePath ".\build\backend\chronox-backend.exe" `
-            -ArgumentList @("--host", "127.0.0.1", "--port", "18743", "--db", $tmpDb, "--demo") `
+            -ArgumentList @("--host", "127.0.0.1", "--port", "18743", "--db", $tmpDb) `
             -PassThru -NoNewWindow
           try {
             $ready = $false
@@ -252,7 +253,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Create .venv & install ChronoX Finance + PyInstaller
         run: |

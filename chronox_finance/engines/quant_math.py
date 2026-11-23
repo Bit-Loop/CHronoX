@@ -25,13 +25,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from pydantic import BaseModel
 
-from chronox_finance.engines.autobudget import AutoBudgetResult
+from chronox_finance.engines.autobudget import AutoBudgetResult, iter_effective_tx_allocations
 from chronox_finance.engines.credit_debt import (
     compute_effective_min_payment,
     next_occurrence_of_day,
 )
 from chronox_finance.engines.goal_planner import GoalOptimizerEngine
-from chronox_finance.engines.recurring import detect_payday_schedule
+from chronox_finance.engines.recurring import detect_payday_schedule, forecast_bill_amount_cents
 from chronox_finance.models import (
     ADHDStats,
     AutopayMode,
@@ -63,6 +63,7 @@ __all__ = [
     "OptimalAllocationStep",
     "QuantForecastReport",
     "QuantMathEngine",
+    "SeasonalBaseline",
     "SpendingVolatilityMetrics",
     "to_dict",
 ]
@@ -297,6 +298,18 @@ def _allocate_proportional_exact_cents(
 
 
 @dataclass
+class SeasonalBaseline:
+    """730-day seasonal discretionary spending baseline layered beneath 90-day volatility."""
+
+    has_seasonal_data: bool = False
+    history_span_days: int = 0
+    overall_730d_weekly_mean_cents: int = 0
+    same_season_weekly_mean_cents: int = 0
+    seasonal_multiplier: float = 1.0
+    seasonal_buffer_uplift_cents: int = 0
+
+
+@dataclass
 class CashflowRunwayResult:
     """Exact day-by-day projected cashflow runway & overdraft simulation output."""
 
@@ -355,13 +368,14 @@ class QuantMathEngine:
         estimated_paycheck_cents: int = 0,
         emergency_buffer_cents: int = 0,
         days: int = 30,
+        max_horizon_days: int = 90,
         include_azeo_paydowns: bool = True,
         azeo_respect_buffer: bool = True,
         daily_discretionary_cents: int = 0,
         today: Optional[date] = None,
     ) -> CashflowRunwayResult:
         """
-        Project exact daily closing cash balance from `today` across `days` (1..90).
+        Project exact daily closing cash balance from `today` across `days` (1..max_horizon_days).
 
         Incorporates:
         - All 8 recurring bill cadences (weekly, biweekly, semimonthly, monthly,
@@ -372,7 +386,8 @@ class QuantMathEngine:
           same-cycle minimums and respecting emergency cash shields by default)
         """
         ref = today or date.today()
-        horizon = max(1, min(90, int(days)))
+        cap_days = max(1, min(730, int(max_horizon_days)))
+        horizon = max(1, min(cap_days, int(days)))
         end_dt = ref + timedelta(days=horizon - 1)
         start_bal = int(starting_balance_cents)
         buffer_floor = max(0, int(emergency_buffer_cents))
@@ -419,11 +434,11 @@ class QuantMathEngine:
 
             anchor_pay_day = pay_dt.day
             guard = 0
-            while pay_dt < ref and guard < 120:
+            while pay_dt < ref and guard < 400:
                 pay_dt = _step_payday_date(pay_dt, pay_cadence, anchor_pay_day)
                 guard += 1
 
-            while pay_dt <= end_dt and guard < 240:
+            while pay_dt <= end_dt and guard < 600:
                 inflows_by_day[pay_dt] += pay_amt
                 events_by_day[pay_dt].append(f"Paycheck (+{_fmt(pay_amt)})")
                 payday_dates.append(pay_dt)
@@ -450,7 +465,8 @@ class QuantMathEngine:
         for bill in recurring_bills:
             if not _get(bill, "active", True):
                 continue
-            amt = int(_get(bill, "amount_cents", 0))
+            bill_map = bill if isinstance(bill, dict) else to_dict(bill)
+            amt = forecast_bill_amount_cents(bill_map)
             if amt <= 0:
                 continue
             due_str = str(_get(bill, "next_due_date", ""))
@@ -475,7 +491,7 @@ class QuantMathEngine:
                     events_by_day[ref].append(f"Overdue bill: {name} (-{_fmt(amt)})")
                 # Advance to next future cycle strictly after `ref`
                 guard = 0
-                while due_dt <= ref and guard < 120:
+                while due_dt <= ref and guard < 400:
                     due_dt = _step_bill_date(due_dt, cadence, anchor_day)
                     guard += 1
             elif overdue_days == 0 and norm in recent_paid_merchants:
@@ -483,7 +499,7 @@ class QuantMathEngine:
                 due_dt = _step_bill_date(due_dt, cadence, anchor_day)
 
             guard = 0
-            while due_dt <= end_dt and guard < 120:
+            while due_dt <= end_dt and guard < 400:
                 if due_dt >= ref:
                     outflows_by_day[due_dt] += amt
                     events_by_day[due_dt].append(f"Bill: {name} (-{_fmt(amt)})")
@@ -523,7 +539,7 @@ class QuantMathEngine:
                 sim_rem = bal
                 due_dt = next_occurrence_of_day(due_day, ref)
                 step_idx = 0
-                while due_dt <= end_dt and sim_rem > 0 and step_idx < 6:
+                while due_dt <= end_dt and sim_rem > 0 and step_idx < 30:
                     pay = min(sim_rem, eff_min)
                     min_events_by_line[cl_id].append((due_dt, pay, name))
                     sim_rem -= pay
@@ -698,8 +714,143 @@ class QuantMathEngine:
         )
 
     # =========================================================================
-    # 2. Spending Volatility & Statistical Buffer Sizing
+    # 2. Spending Volatility, 730-Day Seasonal Baseline & Statistical Buffer
     # =========================================================================
+
+    def _collect_split_aware_discretionary(
+        self,
+        *,
+        transactions: Sequence[Any],
+        window_start: date,
+        ref: date,
+        non_disc_jar_ids: set[int],
+        essential_merchants: set[str],
+        splits_by_tx_id: Optional[Dict[int, List[Any]]] = None,
+    ) -> Tuple[Dict[date, int], Optional[date]]:
+        """Collect split-aware discretionary expense totals by date with zero double-counting."""
+        disc_by_day: Dict[date, int] = defaultdict(int)
+        earliest_disc: Optional[date] = None
+
+        for tx in transactions:
+            if _enum_val(_get(tx, "tx_type")) != "expense":
+                continue
+            dt_str = str(_get(tx, "tx_date", ""))
+            try:
+                tx_dt = date.fromisoformat(dt_str[:10])
+            except ValueError:
+                continue
+            if tx_dt < window_start or tx_dt > ref:
+                continue
+
+            norm = str(_get(tx, "normalized_merchant") or "").strip().lower()
+            if norm and norm in essential_merchants:
+                continue
+
+            tx_disc_amt = 0
+            for jid, _goal_id, alloc_amt, _memo in iter_effective_tx_allocations(tx, splits_by_tx_id):
+                if jid is not None and jid in non_disc_jar_ids:
+                    continue
+                tx_disc_amt += alloc_amt
+
+            if tx_disc_amt <= 0:
+                continue
+            disc_by_day[tx_dt] += tx_disc_amt
+            if earliest_disc is None or tx_dt < earliest_disc:
+                earliest_disc = tx_dt
+
+        return disc_by_day, earliest_disc
+
+    def compute_seasonal_baseline(
+        self,
+        *,
+        transactions: Sequence[Any],
+        jars: Optional[Sequence[Any]] = None,
+        recurring_bills: Optional[Sequence[Any]] = None,
+        splits_by_tx_id: Optional[Dict[int, List[Any]]] = None,
+        recent_lookback_days: int = 90,
+        seasonal_lookback_days: int = 730,
+        today: Optional[date] = None,
+    ) -> SeasonalBaseline:
+        """
+        Inspect up to 730 days (2 full annual cycles) of split-aware discretionary spending
+        to quantify prior-year same-season spending pressure without diluting recent 90d volatility.
+        """
+        ref = today or date.today()
+        span_cap = max(recent_lookback_days, min(730, int(seasonal_lookback_days)))
+        seasonal_start = ref - timedelta(days=span_cap - 1)
+
+        non_disc_jar_ids: set[int] = set()
+        if jars:
+            for j in jars:
+                kind = _enum_val(_get(j, "kind"))
+                if kind in (JarKind.BILLS.value, JarKind.SAFETY.value, JarKind.INVEST.value):
+                    jid = _get(j, "id")
+                    if jid is not None:
+                        non_disc_jar_ids.add(int(jid))
+
+        essential_merchants: set[str] = set()
+        if recurring_bills:
+            for b in recurring_bills:
+                if _get(b, "active", True) and _get(b, "is_essential", True):
+                    norm = str(_get(b, "normalized_merchant") or "").strip().lower()
+                    if norm:
+                        essential_merchants.add(norm)
+
+        all_disc, earliest = self._collect_split_aware_discretionary(
+            transactions=transactions,
+            window_start=seasonal_start,
+            ref=ref,
+            non_disc_jar_ids=non_disc_jar_ids,
+            essential_merchants=essential_merchants,
+            splits_by_tx_id=splits_by_tx_id,
+        )
+        if earliest is None:
+            return SeasonalBaseline()
+
+        history_span_days = (ref - earliest).days + 1
+        # Only activate seasonal baseline when history genuinely reaches back > 180 days (prior season/year)
+        if history_span_days <= max(180, recent_lookback_days):
+            return SeasonalBaseline(has_seasonal_data=False, history_span_days=history_span_days)
+
+        # Overall 730d weekly mean across active history span
+        num_weeks_all = max(1, (history_span_days - 1) // 7 + 1)
+        overall_weekly_mean = int(round(sum(all_disc.values()) / num_weeks_all))
+
+        # Same-calendar-season windows from 1 year ago (~365d +/- 21d) and 2 years ago (~730d +/- 21d)
+        same_season_totals: List[int] = []
+        for year_back in (1, 2):
+            anchor = ref - timedelta(days=365 * year_back)
+            win_lo = anchor - timedelta(days=21)
+            win_hi = anchor + timedelta(days=21)
+            if win_hi < earliest:
+                continue
+            window_spend = sum(amt for d, amt in all_disc.items() if win_lo <= d <= win_hi)
+            if window_spend > 0:
+                # 43-day window = 43 / 7 weeks
+                same_season_totals.append(int(round(window_spend / (43.0 / 7.0))))
+
+        if not same_season_totals or overall_weekly_mean <= 0:
+            return SeasonalBaseline(
+                has_seasonal_data=False,
+                history_span_days=history_span_days,
+                overall_730d_weekly_mean_cents=overall_weekly_mean,
+            )
+
+        same_season_weekly_mean = int(round(mean(same_season_totals)))
+        raw_mult = same_season_weekly_mean / max(1, overall_weekly_mean)
+        seasonal_mult = round(max(0.75, min(1.50, raw_mult)), 3)
+        excess_weekly = max(0, same_season_weekly_mean - overall_weekly_mean)
+        # Blend 30% of 2-week seasonal excess into emergency buffer sizing
+        buffer_uplift = int(round(excess_weekly * 2.0 * 0.30))
+
+        return SeasonalBaseline(
+            has_seasonal_data=True,
+            history_span_days=history_span_days,
+            overall_730d_weekly_mean_cents=overall_weekly_mean,
+            same_season_weekly_mean_cents=same_season_weekly_mean,
+            seasonal_multiplier=seasonal_mult,
+            seasonal_buffer_uplift_cents=buffer_uplift,
+        )
 
     def compute_spending_volatility(
         self,
@@ -713,15 +864,18 @@ class QuantMathEngine:
         monthly_essential_bills_cents: int = 0,
         smoothed_monthly_income_cents: int = 0,
         lookback_days: int = 90,
+        seasonal_lookback_days: int = 730,
+        splits_by_tx_id: Optional[Dict[int, List[Any]]] = None,
         today: Optional[date] = None,
     ) -> SpendingVolatilityMetrics:
         """
-        Analyze trailing 90-day discretionary spending to compute mean, std dev, CV,
-        P50/P75/P90 weekly spend, statistically sized emergency buffer, and
-        volatility-adjusted P50/P90 daily Safe-to-Spend confidence bands.
+        Analyze trailing 90-day split-aware discretionary spending to keep short-term
+        volatility sharp (mean, std dev, CV, P50/P75/P90 weekly spend, P50/P90 daily safe
+        confidence bands) while blending a 730-day seasonal baseline into statistical
+        emergency buffer sizing when multi-year history is available.
         """
         ref = today or date.today()
-        window_days = max(7, min(365, int(lookback_days)))
+        window_days = max(7, min(730, int(lookback_days)))
         window_start = ref - timedelta(days=window_days - 1)
         safe_total = max(0, int(safe_to_spend_cents))
         pay_days = max(1, int(days_until_payday))
@@ -748,34 +902,15 @@ class QuantMathEngine:
                     if norm:
                         essential_merchants.add(norm)
 
-        # Collect trailing discretionary expense transactions
-        disc_by_day: Dict[date, int] = defaultdict(int)
-        earliest_disc: Optional[date] = None
-
-        for tx in transactions:
-            if _enum_val(_get(tx, "tx_type")) != "expense":
-                continue
-            amt = int(_get(tx, "amount_cents", 0))
-            if amt <= 0:
-                continue
-            dt_str = str(_get(tx, "tx_date", ""))
-            try:
-                tx_dt = date.fromisoformat(dt_str)
-            except ValueError:
-                continue
-            if tx_dt < window_start or tx_dt > ref:
-                continue
-
-            jid = _get(tx, "jar_id")
-            if jid is not None and int(jid) in non_disc_jar_ids:
-                continue
-            norm = str(_get(tx, "normalized_merchant") or "").strip().lower()
-            if norm and norm in essential_merchants:
-                continue
-
-            disc_by_day[tx_dt] += amt
-            if earliest_disc is None or tx_dt < earliest_disc:
-                earliest_disc = tx_dt
+        # Collect trailing split-aware discretionary expense transactions
+        disc_by_day, earliest_disc = self._collect_split_aware_discretionary(
+            transactions=transactions,
+            window_start=window_start,
+            ref=ref,
+            non_disc_jar_ids=non_disc_jar_ids,
+            essential_merchants=essential_merchants,
+            splits_by_tx_id=splits_by_tx_id,
+        )
 
         # Empty discretionary history: calm defaults with prudent 15% P90 cushion
         if earliest_disc is None:
@@ -831,10 +966,25 @@ class QuantMathEngine:
         else:
             stability = max(5, min(100, int(round(100.0 * math.exp(-0.85 * cv)))))
 
+        # Incorporate 730-day seasonal baseline uplift if prior-year seasonal history exists
+        seasonal = self.compute_seasonal_baseline(
+            transactions=transactions,
+            jars=jars,
+            recurring_bills=recurring_bills,
+            splits_by_tx_id=splits_by_tx_id,
+            recent_lookback_days=window_days,
+            seasonal_lookback_days=seasonal_lookback_days,
+            today=ref,
+        )
+
         # Statistically sized dynamic emergency buffer:
-        # 50% of essential monthly obligations + 2 weeks of P90 discretionary spend + 95% one-sided weekly shock (1.645 * sigma)
+        # 50% of essential monthly obligations + 2 weeks of P90 discretionary spend
+        # + 95% one-sided weekly shock (1.645 * sigma) + optional 730d seasonal uplift
         baseline_bills_need = max(ess_bills, MIN_EMERGENCY_BUFFER_CENTS)
-        raw_buffer = int(round(0.5 * baseline_bills_need + 2.0 * p90_week + 1.645 * weekly_std_float))
+        raw_buffer = (
+            int(round(0.5 * baseline_bills_need + 2.0 * p90_week + 1.645 * weekly_std_float))
+            + seasonal.seasonal_buffer_uplift_cents
+        )
         upper_cap = max(500_000, monthly_inc * 3) if monthly_inc > 0 else max(500_000, raw_buffer)
         recommended_buffer_cents = max(MIN_EMERGENCY_BUFFER_CENTS, min(upper_cap, raw_buffer))
 
@@ -1280,12 +1430,14 @@ class QuantMathEngine:
         settings: Dict[str, Any],
         credit_report: Optional[CreditOptimizationReport] = None,
         goals: Optional[Sequence[GoalOut]] = None,
+        splits_by_tx_id: Optional[Dict[int, List[Any]]] = None,
         days: int = 30,
         today: Optional[date] = None,
     ) -> QuantForecastReport:
         """
         Compute the full `QuantForecastReport` combining 30/60/90-day cashflow runway,
-        trailing 90-day spending volatility, and optimal marginal-ROI surplus allocation.
+        trailing 90-day split-aware spending volatility (+ 730d seasonal baseline), and
+        optimal marginal-ROI surplus allocation.
         """
         ref = today or date.today()
         horizon = max(7, min(90, int(days)))
@@ -1322,6 +1474,7 @@ class QuantMathEngine:
             current_emergency_buffer_cents=s.emergency_buffer_cents,
             monthly_essential_bills_cents=bills_alloc,
             smoothed_monthly_income_cents=budget.smoothed_monthly_income_cents,
+            splits_by_tx_id=splits_by_tx_id,
             today=ref,
         )
 

@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-ChronoX — Unified Entry Point (ADHD Personal Finance & Algorithmic Trading Platform).
+ChronoX -- Unified Entry Point (Local-First Industrial Personal Finance & Algorithmic Trading Platform).
 
 Primary modes:
-    # Start the ADHD-Friendly Self-Updating Auto-Budgeting Web App (default)
+    # Start the ChronoX Finance Command Center web app (default, fixed port 8742)
     python main.py
-    python main.py --action finance --port 8742 --demo
+    python main.py --action finance --port 8742
 
-    # Terminal ADHD quick-capture & OpenCode Go coach
+    # Terminal quick-capture, portfolio, AI usage & coach
     python main.py --action budget --quick "coffee 6.50"
     python main.py --action budget --ask "Can I afford a $90 dinner tonight?"
     python main.py --action budget --suggest
+    python main.py --action budget --portfolio
+    python main.py --action budget --usage
 
     # ChronoX Market Data & Trading Core (TimescaleDB + Polygon.io)
     python main.py --action backfill --tickers AAPL,MSFT,NVDA --start 2022-01-01
@@ -89,11 +91,10 @@ class ChronoXOrchestrator:
         host: Optional[str] = None,
         port: Optional[int] = None,
         db_path: Optional[str] = None,
-        load_demo: bool = False,
         intelligence_mode: Optional[str] = None,
         ai_provider: Optional[str] = None,
     ) -> None:
-        """Launch the ADHD-Friendly Self-Updating Auto-Budgeting Web App."""
+        """Launch the ChronoX Industrial Finance Web App on a fixed loopback port."""
         import uvicorn
 
         from chronox_finance.api import create_app
@@ -101,7 +102,7 @@ class ChronoXOrchestrator:
         from chronox_finance.service import FinanceService
 
         resolved_host = host or self.config.finance.host
-        resolved_port = port or self.config.finance.port
+        resolved_port = int(port if port is not None else self.config.finance.port)
         resolved_db = db_path or self.config.finance.db_path
 
         svc = FinanceService(db_path=resolved_db)
@@ -112,14 +113,16 @@ class ChronoXOrchestrator:
                     ai_provider=AIProvider(ai_provider) if ai_provider else None,
                 )
             )
-        if load_demo and not svc.storage.list_transactions(limit=1):
-            svc.load_demo_workspace()
-            self.logger.info("Loaded 90-day ADHD demo workspace into %s", resolved_db)
 
-        app = create_app(db_path=resolved_db, service=svc)
+        app = create_app(
+            db_path=resolved_db,
+            service=svc,
+            enforce_vault_lock=True,
+            allowed_port=resolved_port,
+        )
         self.logger.info("Starting ChronoX Finance at http://%s:%s", resolved_host, resolved_port)
-        print("\n🌿 ChronoX Finance (ADHD Auto-Budget, Quant Math & Multi-Provider AI Coach)")
-        print(f"   Open in browser: http://{resolved_host}:{resolved_port}\n")
+        print("\n[CHRONOX] ChronoX Industrial Finance Command Center")
+        print(f"   Open in browser: http://{resolved_host}:{resolved_port} (vault={svc.secrets.vault_state()})\n")
         uvicorn.run(app, host=resolved_host, port=resolved_port, log_level="info")
 
     def run_backfill(
@@ -168,7 +171,7 @@ class ChronoXOrchestrator:
         return get_safe_trading_capital(self.config.finance.db_path)
 
     def run_health_check(self) -> Dict[str, Any]:
-        """Verify configuration, Finance DB, AI providers, and optional trading stack."""
+        """Verify configuration, Finance DB, vault state, AI providers, and optional trading stack."""
         from chronox_finance.service import FinanceService
 
         svc = FinanceService(db_path=self.config.finance.db_path)
@@ -179,15 +182,17 @@ class ChronoXOrchestrator:
             report = {
                 "status": health.status,
                 "db_ok": health.db_ok,
+                "vault_state": health.vault_state,
                 "finance_db": self.config.finance.db_path,
                 "intelligence_mode": health.intelligence_mode,
                 "active_provider": health.active_provider,
                 "safe_to_spend_dollars": round(dash.safe_to_spend.safe_to_spend_cents / 100.0, 2),
                 "safe_to_invest_dollars": round(dash.safe_to_invest_cents / 100.0, 2),
                 "opencode_go_configured": ai_status["opencode_key_configured"],
-                "opencode_go_model": ai_status["opencode_model"],
                 "gemini_configured": ai_status["gemini_api_key_set"],
-                "gemini_model": ai_status["gemini_model"],
+                "codex_configured": ai_status["codex_key_configured"],
+                "chat_wrapper_configured": ai_status["wrapper_key_configured"] or bool(ai_status["wrapper_base_url"]),
+                "codex_cli_enabled": ai_status["codex_cli_enabled"],
                 "polygon_configured": bool(self.config.polygon.api_key),
                 "timescale_configured": bool(self.config.timescale.password),
             }
@@ -204,7 +209,7 @@ class ChronoXOrchestrator:
 
 def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="ChronoX — ADHD Self-Updating Auto-Budgeting, OpenCode Go AI Coach & Market Data Platform",
+        description="ChronoX -- Local-First Industrial Personal Finance, Multi-Provider AI Coach & Market Data Platform",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -216,9 +221,8 @@ def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--config", type=str, help="Path to YAML/JSON configuration file")
     parser.add_argument("--host", type=str, help="Finance server host (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, help="Finance server port (default: 8742)")
+    parser.add_argument("--port", type=int, help="Fixed finance server port (default: 8742)")
     parser.add_argument("--db", type=str, help="Path to ChronoX Finance SQLite database")
-    parser.add_argument("--demo", action="store_true", help="Seed 90-day ADHD demo workspace if empty")
 
     # Quick CLI budget & intelligence options
     parser.add_argument(
@@ -229,16 +233,18 @@ def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--provider",
-        choices=["auto", "opencode_go", "gemini"],
+        choices=["auto", "opencode_go", "gemini", "openai_codex", "chat_wrapper", "codex_cli"],
         default=None,
-        help="AI provider (auto | opencode_go | gemini)",
+        help="AI provider (auto | opencode_go | gemini | openai_codex | chat_wrapper | codex_cli)",
     )
     parser.add_argument("--quick", type=str, help="Quick-add phrase, e.g. 'coffee 6.50' or 'impulse 180 keyboard'")
     parser.add_argument("--ask", type=str, help="Ask the ChronoX Financial Coach a question")
     parser.add_argument("--suggest", action="store_true", help="Print verified AI/quant auto-budget suggestions")
-    parser.add_argument("--quant", action="store_true", help="Show 30-day cashflow runway & optimal marginal-ROI allocation")
-    parser.add_argument("--days", type=int, default=30, help="Forecast horizon in days for --quant (7-90, default: 30)")
-    parser.add_argument("--credit", action="store_true", help="Show FICO/AZEO credit & debt optimization report")
+    parser.add_argument("--quant", action="store_true", help="Show cashflow runway & optimal marginal-ROI allocation")
+    parser.add_argument("--portfolio", action="store_true", help="Show Stocks & Crypto portfolio holdings")
+    parser.add_argument("--usage", action="store_true", help="Show AI token usage, cache hit rate & verified savings")
+    parser.add_argument("--days", type=int, default=30, help="Lookback/forecast horizon in days (default: 30)")
+    parser.add_argument("--credit", action="store_true", help="Show Credit Factor Simulator, Chase 5/24 & AZEO report")
     parser.add_argument("--extra", type=float, default=250.0, help="Extra monthly dollars for --credit simulator")
     parser.add_argument("--goal", nargs=2, metavar=("NAME", "PRICE"), help="Plan a credit-safe goal purchase")
 
@@ -260,7 +266,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 host=args.host,
                 port=args.port,
                 db_path=args.db,
-                load_demo=args.demo,
                 intelligence_mode=args.mode,
                 ai_provider=args.provider,
             )
@@ -284,12 +289,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 cli_args.append("suggest")
             elif args.quant:
                 cli_args.extend(["quant", "--days", str(args.days)])
+            elif args.portfolio:
+                cli_args.append("portfolio")
+            elif args.usage:
+                cli_args.extend(["usage", "--days", str(args.days)])
             elif args.credit:
                 cli_args.extend(["credit", "--extra", str(args.extra)])
             elif args.goal:
                 cli_args.extend(["goal", args.goal[0], args.goal[1]])
-            elif args.demo:
-                cli_args.append("demo")
             else:
                 cli_args.append("status")
             return run_cli(cli_args)

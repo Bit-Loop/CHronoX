@@ -48,12 +48,12 @@ _BUILTIN_RULES: List[Tuple[re.Pattern[str], str, str, float, bool, bool]] = [
     (re.compile(r"\b(rent|mortgage|apartment|property mgmt|landlord|hoa)\b", re.I), "bills", "Housing", 0.96, True, True),
     (re.compile(r"\b(electric|power|water|sewer|gas bill|coned|pge|duke energy|xcel|utility|utilities)\b", re.I), "bills", "Utilities", 0.95, True, True),
     (re.compile(r"\b(comcast|xfinity|verizon|at&t|att|t-mobile|tmobile|spectrum|google fiber|starlink|internet|phone bill)\b", re.I), "bills", "Internet & Phone", 0.94, True, True),
-    (re.compile(r"\b(geico|progressive|state farm|allstate|usaa|lemonade|insurance|health ins|dental|vision)\b", re.I), "bills", "Insurance", 0.94, True, True),
-    (re.compile(r"\b(student loan|navient|nelnet|mohela|auto loan|car payment|minimum payment)\b", re.I), "bills", "Debt Minimum", 0.93, True, True),
+    (re.compile(r"\b(geico|progressive|state farm|allstate|usaa|tricare|lemonade|insurance|health ins|dental|vision)\b", re.I), "bills", "Insurance", 0.94, True, True),
+    (re.compile(r"\b(student loan|navient|nelnet|mohela|auto loan|car payment|minimum payment|nfcu auto|navy federal loan)\b", re.I), "bills", "Debt Minimum", 0.93, True, True),
     (re.compile(r"\b(netflix|spotify|hulu|disney\+?|max|hbo|apple\.com/bill|icloud|youtube premium|amazon prime|audible|chatgpt|openai|claude|opencode|github|notion|dropbox|adobe|xbox|playstation|nintendo|gym|planet fitness|la fitness|equinox)\b", re.I), "bills", "Subscriptions", 0.90, True, False),
 
     # --- Daily Living (Flexible Necessities) ---
-    (re.compile(r"\b(trader joe|whole foods|kroger|safeway|publix|aldi|lidl|wegmans|heb|costco|sam'?s club|sprouts|grocery|groceries|supermarket|market|walmart|target|meijer|winco)\b", re.I), "daily", "Groceries & Household", 0.92, False, True),
+    (re.compile(r"\b(trader joe|whole foods|kroger|safeway|publix|aldi|lidl|wegmans|heb|costco|sam'?s club|sprouts|commissary|deca|navy exchange|nex\b|aafes|grocery|groceries|supermarket|market|walmart|target|meijer|winco)\b", re.I), "daily", "Groceries & Household", 0.92, False, True),
     (re.compile(r"\b(shell|chevron|exxon|mobil|bp|arco|sunoco|circle k|wawa|sheetz|7-eleven|gas station|fuel|supercharger|ev charging)\b", re.I), "daily", "Fuel & Transit", 0.92, False, True),
     (re.compile(r"\b(uber|lyft|metro|transit|subway|mta|bart|parking|toll|ezpass)\b", re.I), "daily", "Transit", 0.88, False, True),
     (re.compile(r"\b(cvs|walgreens|rite aid|pharmacy|doctor|clinic|hospital|therapy|therapist|psychiatry|adderall|vyvanse|rx|medical|urgent care)\b", re.I), "daily", "Health & Meds", 0.95, False, True),
@@ -117,3 +117,14 @@ class TransactionCategorizer:
             if pattern.search(haystack):
                 return sub_hint, ess_hint
         return False, False
+
+    def classify_income_subcategory(self, merchant: str, memo: str = "") -> str:
+        """Recognize Navy Federal dividends, military/VA/federal paychecks, and standard payroll."""
+        haystack = f"{merchant} {memo}".strip()
+        if re.search(r"\b(dfas|mil\s*pay|active\s+duty\s+pay|vaed\s+treas|vacp\s+treas|navy\s+pay|bah\b|bas\b)\b", haystack, re.I):
+            return "Military / Federal Pay"
+        if re.search(r"\b(dividend|share\s+dividend|nfcu\s+dividend|interest\s+paid|apy\s+interest)\b", haystack, re.I):
+            return "Credit Union Dividend"
+        if re.search(r"\b(payroll|direct\s+deposit|salary|paycheck|adp|gusto|workday)\b", haystack, re.I):
+            return "Paycheck"
+        return "Income"

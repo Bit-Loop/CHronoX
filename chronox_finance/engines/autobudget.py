@@ -20,7 +20,12 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from chronox_finance.engines.recurring import DetectedPayday, detect_payday_schedule
+from chronox_finance.engines.recurring import (
+    DetectedPayday,
+    detect_payday_schedule,
+    forecast_bill_amount_cents,
+    match_transaction_to_bill,
+)
 from chronox_finance.models import (
     AccountType,
     JarHealth,
@@ -106,18 +111,83 @@ def _estimate_smoothed_monthly_income(
     return current_month_income, max(current_month_income, projected)
 
 
+def _field(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def iter_effective_tx_allocations(
+    tx: Any,
+    splits_by_tx_id: Optional[Dict[int, List[Any]]] = None,
+) -> List[Tuple[Optional[int], Optional[int], int, str]]:
+    """
+    Return effective `(jar_id, goal_id, amount_cents, memo)` allocations for a transaction.
+
+    Split-transaction invariant (Proposal A §4):
+    - When child `splits` exist (attached as `tx["splits"]` / `tx.splits` or via `splits_by_tx_id`),
+      return ONLY the child splits so parent + children NEVER double-count.
+    - Otherwise return the single parent allocation.
+    """
+    raw_splits = _field(tx, "splits", None)
+    if not raw_splits and splits_by_tx_id is not None:
+        tx_id = _field(tx, "id", None)
+        if tx_id is not None:
+            raw_splits = splits_by_tx_id.get(int(tx_id))
+
+    if raw_splits:
+        out: List[Tuple[Optional[int], Optional[int], int, str]] = []
+        for sp in raw_splits:
+            sp_amt = int(_field(sp, "amount_cents", 0) or 0)
+            if sp_amt <= 0:
+                continue
+            sp_jar = _field(sp, "jar_id", None)
+            sp_goal = _field(sp, "goal_id", None)
+            sp_memo = str(_field(sp, "memo", "") or "")
+            out.append(
+                (
+                    int(sp_jar) if sp_jar is not None else None,
+                    int(sp_goal) if sp_goal is not None else None,
+                    sp_amt,
+                    sp_memo,
+                )
+            )
+        if out:
+            return out
+
+    parent_amt = int(_field(tx, "amount_cents", 0) or 0)
+    if parent_amt <= 0:
+        return []
+    p_jar = _field(tx, "jar_id", None)
+    p_goal = _field(tx, "goal_id", None)
+    p_memo = str(_field(tx, "memo", "") or "")
+    return [
+        (
+            int(p_jar) if p_jar is not None else None,
+            int(p_goal) if p_goal is not None else None,
+            parent_amt,
+            p_memo,
+        )
+    ]
+
+
 def _compute_trailing_jar_spend_ema(
     transactions: List[Dict[str, Any]],
     today: date,
+    splits_by_tx_id: Optional[Dict[int, List[Any]]] = None,
 ) -> Dict[int, int]:
-    """3-month EMA of historical spending per jar_id for self-updating target adaptation."""
+    """3-month split-aware EMA of historical spending per jar_id for self-updating target adaptation."""
     by_jar_month: Dict[int, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     ym_now = current_cycle_ym(today)
     for tx in transactions:
-        if tx.get("tx_type") == "expense" and tx.get("jar_id") is not None:
-            ym = tx["tx_date"][:7]
-            if ym != ym_now:
-                by_jar_month[int(tx["jar_id"])][ym] += int(tx["amount_cents"])
+        if tx.get("tx_type") != "expense":
+            continue
+        ym = tx["tx_date"][:7]
+        if ym == ym_now:
+            continue
+        for jar_id, _goal_id, amt, _memo in iter_effective_tx_allocations(tx, splits_by_tx_id):
+            if jar_id is not None:
+                by_jar_month[jar_id][ym] += amt
 
     result: Dict[int, int] = {}
     for jar_id, months in by_jar_month.items():
@@ -183,6 +253,7 @@ class AutoBudgetEngine:
         transfers: List[Dict[str, Any]],
         settings: Dict[str, Any],
         credit_lines: Optional[List[Dict[str, Any]]] = None,
+        splits_by_tx_id: Optional[Dict[int, List[Any]]] = None,
         today: Optional[date] = None,
     ) -> AutoBudgetResult:
         ref = today or date.today()
@@ -213,20 +284,21 @@ class AutoBudgetEngine:
         unpaid_bills_until_payday_cents = 0
         monthly_bills_obligation_cents = 0
 
-        # Track bills already paid in last 7 days so we don't double-count a bill due today
-        recent_paid_merchants = {
-            t["normalized_merchant"]
+        # Track bills already paid in last 5 days so we don't double-count a bill due today
+        recent_expenses = [
+            t
             for t in transactions
             if t.get("tx_type") == "expense"
-            and (ref - date.fromisoformat(t["tx_date"])).days <= 5
-        }
+            and 0 <= (ref - date.fromisoformat(t["tx_date"])).days <= 5
+        ]
+        recent_paid_merchants = {t["normalized_merchant"] for t in recent_expenses}
 
         for b in recurring_bills:
             if not b.get("active", 1):
                 continue
             due_dt = date.fromisoformat(b["next_due_date"])
             days_until_due = (due_dt - ref).days
-            amt = int(b["amount_cents"])
+            amt = forecast_bill_amount_cents(b)
             prev_amt = b.get("previous_amount_cents")
             hike = max(0, amt - int(prev_amt)) if prev_amt is not None else 0
 
@@ -234,7 +306,11 @@ class AutoBudgetEngine:
 
             if due_dt <= next_payday_dt:
                 # If due date is today or past-due and NOT just paid, reserve it
-                if not (days_until_due <= 0 and b["normalized_merchant"] in recent_paid_merchants):
+                just_paid = days_until_due <= 0 and (
+                    b["normalized_merchant"] in recent_paid_merchants
+                    or any(match_transaction_to_bill(t, b, require_date_window=True) for t in recent_expenses)
+                )
+                if not just_paid:
                     unpaid_bills_until_payday_cents += amt
 
             upcoming_bills.append(
@@ -243,6 +319,9 @@ class AutoBudgetEngine:
                     name=b["name"],
                     normalized_merchant=b["normalized_merchant"],
                     amount_cents=amt,
+                    amount_min_cents=int(b["amount_min_cents"]) if b.get("amount_min_cents") is not None else None,
+                    amount_max_cents=int(b["amount_max_cents"]) if b.get("amount_max_cents") is not None else None,
+                    due_window_days=int(b["due_window_days"]) if b.get("due_window_days") is not None else 4,
                     previous_amount_cents=int(prev_amt) if prev_amt is not None else None,
                     price_hike_cents=hike,
                     cadence=RecurrenceCadence(b["cadence"]),
@@ -289,7 +368,7 @@ class AutoBudgetEngine:
                     unpaid_bills_until_payday_cents += min_pay
 
         # 4. Self-Updating Adaptive Jar Allocations (Bills-First + 3-Month EMA Blending)
-        trailing_ema = _compute_trailing_jar_spend_ema(transactions, ref)
+        trailing_ema = _compute_trailing_jar_spend_ema(transactions, ref, splits_by_tx_id=splits_by_tx_id)
         adaptive_allocations: Dict[int, int] = {}
         adaptive_updates: List[Dict[str, Any]] = []
 
@@ -354,15 +433,15 @@ class AutoBudgetEngine:
                     }
                 )
 
-        # 5. Compute current-month spending & intra-cycle rebalance transfers per jar
+        # 5. Compute current-month split-aware spending & intra-cycle rebalance transfers per jar
         spent_by_jar: Dict[int, int] = defaultdict(int)
         monthly_spent_cents = 0
         for tx in transactions:
             if tx.get("tx_type") == "expense" and tx["tx_date"][:7] == ym_now:
-                amt = int(tx["amount_cents"])
-                monthly_spent_cents += amt
-                if tx.get("jar_id") is not None:
-                    spent_by_jar[int(tx["jar_id"])] += amt
+                for jar_id, _goal_id, amt, _memo in iter_effective_tx_allocations(tx, splits_by_tx_id):
+                    monthly_spent_cents += amt
+                    if jar_id is not None:
+                        spent_by_jar[jar_id] += amt
 
         transfer_delta_by_jar: Dict[int, int] = defaultdict(int)
         for tr in transfers:

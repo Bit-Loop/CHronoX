@@ -1,5 +1,5 @@
-.PHONY: help install dev finance demo test lint clean docker-finance docker-trading docker-down \
-	desktop-install desktop desktop-demo desktop-icons desktop-backend \
+.PHONY: help install dev finance test lint clean docker-finance docker-trading docker-down \
+	desktop-install desktop desktop-icons desktop-backend \
 	desktop-deb desktop-pacman desktop-appimage desktop-linux desktop-win desktop-mac
 
 PYTHON ?= .venv/bin/python
@@ -12,8 +12,7 @@ help:
 	@echo "========================================================"
 	@echo "Web & Core:"
 	@echo "  make dev              Create .venv and install app + dev deps"
-	@echo "  make finance          Run ADHD Auto-Budgeting Web App (port 8742)"
-	@echo "  make demo             Run Web App preloaded with 90-day ADHD demo"
+	@echo "  make finance          Run ChronoX Finance Web App (port 8742)"
 	@echo "  make test             Run full automated pytest suite"
 	@echo "  make lint             Run ruff security & code quality checks"
 	@echo "  make docker-finance   Start ChronoX Finance container (127.0.0.1:8742)"
@@ -23,7 +22,6 @@ help:
 	@echo "Desktop App (Electron — Windows, Linux & macOS):"
 	@echo "  make desktop-install  Install desktop/ Electron dependencies & icons"
 	@echo "  make desktop          Launch ChronoX Finance Desktop App"
-	@echo "  make desktop-demo     Launch Desktop App with 90-day ADHD demo data"
 	@echo "  make desktop-icons    Regenerate cross-platform PNG, ICO & ICNS icons"
 	@echo "  make desktop-backend  Bundle standalone zero-Python PyInstaller sidecar"
 	@echo "  make desktop-deb      Build Debian/Ubuntu .deb package in desktop/dist/"
@@ -39,13 +37,10 @@ help:
 dev:
 	uv venv .venv --python 3.12
 	uv pip install --python $(PYTHON) -e ".[dev]"
-	@echo "Ready! Copy .env.example to .env and add OPENCODE_GO_API_KEY or GEMINI_API_KEY (optional)."
+	@echo "Ready! Copy .env.example to .env and configure your vault and providers."
 
 finance:
 	$(PYTHON) main.py --action finance
-
-demo:
-	$(PYTHON) main.py --action finance --demo
 
 test:
 	$(PYTEST) tests/ -v
@@ -67,9 +62,6 @@ desktop-install:
 
 desktop:
 	cd desktop && $(NPM) start
-
-desktop-demo:
-	cd desktop && $(NPM) run demo
 
 desktop-icons:
 	cd desktop && $(NPM) run icons

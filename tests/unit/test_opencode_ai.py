@@ -8,12 +8,24 @@ import httpx
 import pytest
 
 from chronox_finance.ai.coach import FinancialCoach
+from chronox_finance.ai.codex_client import (
+    CHRONOX_STATIC_KNOWLEDGE_PREFIX,
+    CodexCLIClient,
+    CodexCLIError,
+    CodexError,
+    CodexResponsesClient,
+    estimate_token_count,
+)
 from chronox_finance.ai.gemini_client import (
     CURATED_GEMINI_MODELS,
     GeminiClient,
     GeminiError,
 )
-from chronox_finance.ai.opencode_client import LLMClient, OpenCodeGoClient
+from chronox_finance.ai.opencode_client import (
+    LLMClient,
+    OpenCodeGoClient,
+    calculate_token_costs,
+)
 from chronox_finance.ai.validator import SuggestionValidator, sanitize_rsd_tone
 from chronox_finance.models import (
     OptimalAllocationStep,
@@ -21,6 +33,7 @@ from chronox_finance.models import (
     SpendingVolatilityMetrics,
 )
 from chronox_finance.service import FinanceService
+from tests.fixtures.seed_workspace import seed_workspace
 
 
 class TestOpenCodeGoClient:
@@ -91,7 +104,7 @@ class TestSuggestionValidatorAndCoach:
     def test_validator_rejects_hallucinated_dollars_and_bills_raid_and_cleans_rsd_tone(self):
         svc = FinanceService(db_path=":memory:")
         try:
-            svc.load_demo_workspace()
+            seed_workspace(svc)
             budget = svc._compute_budget()
             impulses = svc.list_impulses()
             bills_jar = next(j for j in budget.jars if j.slug == "bills")
@@ -153,7 +166,7 @@ class TestSuggestionValidatorAndCoach:
     def test_coach_end_to_end_with_mocked_opencode_go_and_affordability_qa(self):
         svc = FinanceService(db_path=":memory:")
         try:
-            svc.load_demo_workspace()
+            seed_workspace(svc)
             budget = svc._compute_budget()
             fun_jar = next(j for j in budget.jars if j.slug == "fun")
             daily_jar = next(j for j in budget.jars if j.slug == "daily")
@@ -230,7 +243,7 @@ class TestSuggestionValidatorAndCoach:
     def test_timeout_falls_back_cleanly_to_verified_local_suggestions(self, tmp_path):
         svc = FinanceService(db_path=str(tmp_path / "timeout_test.sqlite3"))
         try:
-            svc.load_demo_workspace()
+            seed_workspace(svc)
             budget = svc._compute_budget()
             impulses = svc.list_impulses()
             stats = svc.get_dashboard().adhd_stats
@@ -516,7 +529,7 @@ class TestMultiModeAndProviderRouting:
     def test_deterministic_only_makes_zero_external_calls(self, tmp_path):
         svc = FinanceService(db_path=str(tmp_path / "det_only.sqlite3"))
         try:
-            svc.load_demo_workspace()
+            seed_workspace(svc)
             budget = svc._compute_budget()
             impulses = svc.list_impulses()
             stats = svc.get_dashboard().adhd_stats
@@ -602,7 +615,7 @@ class TestMultiModeAndProviderRouting:
     def test_hybrid_mode_with_gemini_and_quant_anchors(self, tmp_path):
         svc = FinanceService(db_path=str(tmp_path / "hybrid_gemini.sqlite3"))
         try:
-            svc.load_demo_workspace()
+            seed_workspace(svc)
             budget = svc._compute_budget()
             impulses = svc.list_impulses()
             stats = svc.get_dashboard().adhd_stats
@@ -685,7 +698,7 @@ class TestMultiModeAndProviderRouting:
     def test_auto_provider_failover_from_opencode_to_gemini(self, tmp_path):
         svc = FinanceService(db_path=str(tmp_path / "failover.sqlite3"))
         try:
-            svc.load_demo_workspace()
+            seed_workspace(svc)
             budget = svc._compute_budget()
             impulses = svc.list_impulses()
             stats = svc.get_dashboard().adhd_stats
@@ -754,7 +767,7 @@ class TestMultiModeAndProviderRouting:
     def test_ai_standalone_allows_creative_advice_sanitizes_rsd_and_blocks_bills_raid(self, tmp_path):
         svc = FinanceService(db_path=str(tmp_path / "standalone.sqlite3"))
         try:
-            svc.load_demo_workspace()
+            seed_workspace(svc)
             budget = svc._compute_budget()
             impulses = svc.list_impulses()
             stats = svc.get_dashboard().adhd_stats
@@ -863,7 +876,7 @@ class TestMultiModeAndProviderRouting:
     def test_ai_standalone_unconfigured_falls_back_gracefully_with_notice(self, tmp_path):
         svc = FinanceService(db_path=str(tmp_path / "standalone_offline.sqlite3"))
         try:
-            svc.load_demo_workspace()
+            seed_workspace(svc)
             budget = svc._compute_budget()
             impulses = svc.list_impulses()
             stats = svc.get_dashboard().adhd_stats
@@ -901,7 +914,7 @@ class TestMultiModeAndProviderRouting:
     def test_unconfigured_primary_routes_directly_to_configured_fallback_gemini(self, tmp_path):
         svc = FinanceService(db_path=str(tmp_path / "fallback_direct.sqlite3"))
         try:
-            svc.load_demo_workspace()
+            seed_workspace(svc)
             budget = svc._compute_budget()
             impulses = svc.list_impulses()
             stats = svc.get_dashboard().adhd_stats
@@ -964,3 +977,404 @@ class TestMultiModeAndProviderRouting:
         assert conn["provider"] == "gemini"
         assert "401" in conn["message"]
         assert secret not in conn["message"]
+
+
+class TestTokenTelemetryAndHonestSavings:
+    def test_opencode_openai_and_anthropic_usage_parsing_and_local_cache_savings(self):
+        # OpenAI-compat route with real cached tokens (prompt_tokens_details.cached_tokens)
+        def openai_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": '{"suggestions": []}'}}],
+                    "usage": {
+                        "prompt_tokens": 2000,
+                        "completion_tokens": 400,
+                        "prompt_tokens_details": {"cached_tokens": 1500},
+                    },
+                },
+            )
+
+        oc = OpenCodeGoClient(
+            api_key="go-key",
+            model="glm-5.3-flash",
+            transport=httpx.MockTransport(openai_handler),
+        )
+        r1 = oc.chat_completion("sys", "usr", json_mode=True)
+        assert r1.input_tokens == 2000
+        assert r1.output_tokens == 400
+        assert r1.cached_tokens == 1500
+        # glm-5.3-flash: input $0.10/1M (100k), cached $0.02/1M (20k), output $0.30/1M (300k)
+        # uncached_in: 500 * 100k / 1M = 50; cached_in: 1500 * 20k / 1M = 30; out: 400 * 300k / 1M = 120 -> cost = 200
+        # saved = 1500 * (100k - 20k) / 1M = 120
+        assert r1.cost_microdollars == 200
+        assert r1.saved_microdollars == 120
+        assert r1.latency_ms >= 0
+
+        # Local TTL cache hit saves full uncached input+output cost (200 + 120 = 320) and spends $0!
+        r2 = oc.chat_completion("sys", "usr", json_mode=True)
+        assert r2.cached is True
+        assert r2.cost_microdollars == 0
+        assert r2.input_tokens == 0
+        assert r2.output_tokens == 0
+        assert r2.cached_tokens == 0
+        assert r2.saved_microdollars == 320
+
+        # Anthropic-compat route with cache_read_input_tokens
+        def anthropic_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "content": [{"type": "text", "text": "Anthropic calm answer"}],
+                    "usage": {
+                        "input_tokens": 500,
+                        "cache_read_input_tokens": 1500,
+                        "output_tokens": 250,
+                    },
+                },
+            )
+
+        oc_anth = OpenCodeGoClient(
+            api_key="go-key",
+            model="claude-haiku-5-5",
+            protocol="anthropic",
+            transport=httpx.MockTransport(anthropic_handler),
+        )
+        ra = oc_anth.chat_completion("sys", "usr", use_cache=False)
+        assert ra.input_tokens == 2000
+        assert ra.cached_tokens == 1500
+        assert ra.output_tokens == 250
+        # claude-haiku-5-5: 800k / 80k / 4_000k -> saved = 1500 * 720k / 1M = 1080
+        assert ra.saved_microdollars == 1080
+        assert ra.cost_microdollars == (500 * 800_000 + 1500 * 80_000 + 250 * 4_000_000) // 1_000_000
+
+    def test_gemini_usage_metadata_cached_tokens_and_zero_fabricated_savings(self):
+        calls = {"n": 0}
+
+        def gem_handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            cached_count = 0 if calls["n"] == 1 else 2000
+            return httpx.Response(
+                200,
+                json={
+                    "candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": "OK"}]}}],
+                    "usageMetadata": {
+                        "promptTokenCount": 3000,
+                        "candidatesTokenCount": 300,
+                        "thoughtsTokenCount": 100,
+                        "cachedContentTokenCount": cached_count,
+                    },
+                },
+            )
+
+        gm = GeminiClient(
+            api_key="gm-key",
+            model="gemini-2.5-flash",
+            transport=httpx.MockTransport(gem_handler),
+        )
+        # First call: cachedContentTokenCount == 0 -> saved_microdollars MUST be strictly 0!
+        r_no_cache = gm.chat_completion("sys", "q1", use_cache=False)
+        assert r_no_cache.input_tokens == 3000
+        assert r_no_cache.output_tokens == 400
+        assert r_no_cache.cached_tokens == 0
+        assert r_no_cache.saved_microdollars == 0
+        # gemini-2.5-flash: 300k / 75k / 2_500k -> 3000*0.3 + 400*2.5 = 900 + 1000 = 1900
+        assert r_no_cache.cost_microdollars == 1900
+
+        # Second call: cachedContentTokenCount == 2000 -> saved = 2000 * (300k - 75k) / 1M = 450
+        r_with_cache = gm.chat_completion("sys", "q2", use_cache=True)
+        assert r_with_cache.cached_tokens == 2000
+        assert r_with_cache.saved_microdollars == 450
+        assert r_with_cache.cost_microdollars == 1450
+
+        # Third call (local TTL hit on q2) -> saved = full uncached cost (1900), cost = 0
+        r_local_hit = gm.chat_completion("sys", "q2", use_cache=True)
+        assert r_local_hit.cached is True
+        assert r_local_hit.cost_microdollars == 0
+        assert r_local_hit.saved_microdollars == 1900
+
+    def test_zero_tokens_or_local_endpoint_never_fabricate_cost_or_savings(self):
+        assert calculate_token_costs(model="gpt-4.1-mini", input_tokens=0, output_tokens=0, cached_tokens=0) == (0, 0, 0)
+        assert calculate_token_costs(
+            model="qwen2.5:14b",
+            input_tokens=4000,
+            output_tokens=500,
+            cached_tokens=3000,
+            provider="chat_wrapper",
+            is_local_endpoint=True,
+        ) == (0, 0, 0)
+
+
+class TestCodexResponsesAndChatWrapperClient:
+    def test_static_prefix_is_over_1024_tokens_and_timestamp_uuid_free(self):
+        import re
+
+        assert estimate_token_count(CHRONOX_STATIC_KNOWLEDGE_PREFIX) >= 1024
+        # Must NEVER contain dynamic ISO dates or UUIDs
+        assert not re.search(r"\b20\d{2}-\d{2}-\d{2}\b", CHRONOX_STATIC_KNOWLEDGE_PREFIX)
+        assert not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", CHRONOX_STATIC_KNOWLEDGE_PREFIX, re.I)
+
+    def test_codex_responses_api_enforces_store_false_stable_prefix_and_usage(self):
+        seen_bodies = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path.endswith("/responses")
+            assert request.headers["Authorization"] == "Bearer sk-test-codex-123"
+            body = json.loads(request.content.decode("utf-8"))
+            seen_bodies.append(body)
+            # BINDING PRIVACY RULE (#53): store MUST be False and NO previous_response_id!
+            assert body["store"] is False
+            assert "previous_response_id" not in body
+            assert body["input"][0]["role"] == "developer"
+            assert body["input"][0]["content"].startswith(CHRONOX_STATIC_KNOWLEDGE_PREFIX)
+            assert estimate_token_count(body["input"][0]["content"]) >= 1024
+            return httpx.Response(
+                200,
+                json={
+                    "id": "resp_test_001",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": '{"ok": true}'}],
+                        }
+                    ],
+                    "usage": {
+                        "input_tokens": 2500,
+                        "output_tokens": 200,
+                        "input_tokens_details": {"cached_tokens": 1800},
+                    },
+                },
+            )
+
+        client = CodexResponsesClient(
+            api_key="sk-test-codex-123",
+            model="gpt-4.1-mini",
+            provider_name="openai_codex",
+            wire_api="responses",
+            transport=httpx.MockTransport(handler),
+        )
+        assert isinstance(client, LLMClient)
+        assert client.provider_name == "openai_codex"
+        assert client.is_configured is True
+
+        r1 = client.chat_completion("Be calm.", "Snapshot A", json_mode=True)
+        r2 = client.chat_completion("Be calm.", "Snapshot B", json_mode=True)
+        r1_cached = client.chat_completion("Be calm.", "Snapshot A", json_mode=True)
+
+        assert len(seen_bodies) == 2
+        # Developer prefix is byte-for-byte identical across distinct snapshots for automatic prompt caching!
+        assert seen_bodies[0]["input"][0]["content"] == seen_bodies[1]["input"][0]["content"]
+        assert r1.protocol_used == "responses"
+        assert r1.provider == "openai_codex"
+        assert r1.input_tokens == 2500
+        assert r1.output_tokens == 200
+        assert r1.cached_tokens == 1800
+        # gpt-4.1-mini: 400k / 100k / 1_600k -> saved = 1800 * 300k / 1M = 540
+        assert r1.saved_microdollars == 540
+        assert r1.cost_microdollars == (700 * 400_000 + 1800 * 100_000 + 200 * 1_600_000) // 1_000_000
+        assert r1_cached.cached is True
+        assert r1_cached.cost_microdollars == 0
+        assert r1_cached.saved_microdollars == (2500 * 400_000 + 200 * 1_600_000) // 1_000_000
+        assert r2.cached is False
+
+    def test_chat_wrapper_completions_local_ollama_and_remote_gateway(self):
+        # Empty base_url + empty key must NOT look configured!
+        unconfigured = CodexResponsesClient(api_key="", base_url="", provider_name="chat_wrapper", wire_api="chat_completions")
+        assert unconfigured.is_configured is False
+
+        # Local keyless Ollama / LiteLLM gateway at 127.0.0.1 is allowed without API key and has honest $0 cost
+        def ollama_handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path.endswith("/chat/completions")
+            assert "Authorization" not in request.headers
+            body = json.loads(request.content.decode("utf-8"))
+            assert body["messages"][0]["role"] == "system"
+            assert body["messages"][0]["content"].startswith(CHRONOX_STATIC_KNOWLEDGE_PREFIX)
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": "Local wrapper calm reply"}}],
+                    "usage": {"prompt_tokens": 1800, "completion_tokens": 120, "prompt_tokens_details": {"cached_tokens": 1400}},
+                },
+            )
+
+        local_wrapper = CodexResponsesClient(
+            api_key="",
+            base_url="http://127.0.0.1:11434/v1",
+            model="qwen2.5:14b",
+            provider_name="chat_wrapper",
+            wire_api="chat_completions",
+            transport=httpx.MockTransport(ollama_handler),
+        )
+        assert local_wrapper.is_configured is True
+        res = local_wrapper.chat_completion("Be calm.", "Check runway")
+        assert res.provider == "chat_wrapper"
+        assert res.protocol_used == "chat_completions"
+        assert res.content == "Local wrapper calm reply"
+        assert res.input_tokens == 1800
+        assert res.cached_tokens == 1400
+        # Local hardware costs $0 -> never fabricate savings!
+        assert res.cost_microdollars == 0
+        assert res.saved_microdollars == 0
+
+        # Remote wrapper requires API key and scrubs key on errors
+        remote_no_key = CodexResponsesClient(
+            api_key="",
+            base_url="https://openrouter.ai/api/v1",
+            provider_name="chat_wrapper",
+            wire_api="chat_completions",
+        )
+        assert remote_no_key.is_configured is False
+
+        secret = "sk-or-secret-wrapper-999"
+
+        def err_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(401, json={"error": {"message": f"Bad key {secret}"}})
+
+        remote_err = CodexResponsesClient(
+            api_key=secret,
+            base_url="https://openrouter.ai/api/v1",
+            provider_name="chat_wrapper",
+            wire_api="chat_completions",
+            transport=httpx.MockTransport(err_handler),
+        )
+        with pytest.raises(CodexError) as exc_info:
+            remote_err.chat_completion("s", "u", use_cache=False)
+        assert secret not in str(exc_info.value)
+
+        # SSRF protection
+        with pytest.raises(ValueError):
+            CodexResponsesClient(api_key="k", base_url="http://169.254.169.254/v1")
+
+    def test_coach_failover_with_codex_and_telemetry_hook(self, tmp_path):
+        svc = FinanceService(db_path=str(tmp_path / "codex_coach.sqlite3"))
+        try:
+            seed_workspace(svc)
+            budget = svc._compute_budget()
+            impulses = svc.list_impulses()
+            stats = svc.get_dashboard().adhd_stats
+            captured = []
+
+            def fail_primary(request: httpx.Request) -> httpx.Response:
+                return httpx.Response(429, text="rate limited")
+
+            def codex_ok(request: httpx.Request) -> httpx.Response:
+                body = json.loads(request.content.decode("utf-8"))
+                user_msg = body["input"][1]["content"]
+                # Verify untrusted data tags are present in LLM context!
+                assert "<UNTRUSTED_DATA>" in user_msg
+                return httpx.Response(
+                    200,
+                    json={
+                        "output_text": "Your Safe-to-Spend stays calm and protected.",
+                        "usage": {
+                            "input_tokens": 2200,
+                            "output_tokens": 110,
+                            "input_tokens_details": {"cached_tokens": 1500},
+                        },
+                    },
+                )
+
+            oc_bad = OpenCodeGoClient(api_key="go-key", transport=httpx.MockTransport(fail_primary))
+            cx_ok = CodexResponsesClient(api_key="sk-test", model="gpt-4.1-mini", transport=httpx.MockTransport(codex_ok))
+            coach = FinancialCoach(clients=[oc_bad, cx_ok], on_completion=captured.append)
+
+            qa = coach.answer_question(
+                question="How does my buffer look?",
+                budget=budget,
+                impulses=impulses,
+                adhd_stats=stats,
+                hourly_wage_cents=3400,
+                needs_triage_count=0,
+                reset_done_this_week=True,
+                intelligence_mode="hybrid",
+            )
+            assert qa.source == "openai_codex"
+            assert qa.provider_used == "openai_codex"
+            assert coach.last_completion is not None
+            assert coach.last_completion.cached_tokens == 1500
+            assert coach.last_completion.saved_microdollars == 450
+            assert len(captured) == 1
+        finally:
+            svc.close()
+
+
+class TestCodexCLIClient:
+    def test_codex_cli_disabled_by_default_and_protocol_conformant(self):
+        cli = CodexCLIClient()
+        assert isinstance(cli, LLMClient)
+        assert cli.provider_name == "codex_cli"
+        assert cli.is_configured is False
+        with pytest.raises(CodexCLIError):
+            cli.chat_completion("sys", "usr")
+
+    def test_codex_cli_sandboxed_empty_cwd_devnull_timeout_and_pii_secret_redaction(self, monkeypatch, tmp_path):
+        import os
+        import subprocess
+        from pathlib import Path
+
+        observed = {}
+        monkeypatch.setenv("PLAID_SECRET", "plaid-super-secret-xyz")
+        monkeypatch.setenv("GEMINI_API_KEY", "AIzaSySecretGemini123456789012345")
+        monkeypatch.setenv("CHRONOX_FINANCE_SECRET_KEY", "vault-secret-signing-key")
+
+        def fake_which(name: str):
+            return "/usr/local/bin/codex"
+
+        def fake_run(cmd, *, cwd, stdin, capture_output, text, timeout, env, check):
+            observed["cmd"] = list(cmd)
+            observed["cwd"] = cwd
+            observed["cwd_contents"] = os.listdir(cwd)
+            observed["stdin"] = stdin
+            observed["timeout"] = timeout
+            observed["env"] = dict(env)
+            stdout_jsonl = "\n".join(
+                [
+                    json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": '{"ok": true}'}}),
+                    json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1600, "cached_input_tokens": 1000, "output_tokens": 90}}),
+                ]
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout_jsonl, stderr="")
+
+        monkeypatch.setattr("shutil.which", fake_which)
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        cli = CodexCLIClient(enabled=True, model="gpt-5.3-codex", timeout_seconds=60.0)
+        assert cli.is_configured is True
+
+        sensitive_prompt = (
+            "User email alice@example.com SSN 123-45-6789 acct 9876543210 "
+            "key sk-proj-supersecretkey1234567890 access-production-12345678-1234-1234-1234-1234567890ab\n"
+            "From: bank@chase.com\nSubject: Statement"
+        )
+        res = cli.chat_completion("System rules", sensitive_prompt, json_mode=True)
+
+        # Verify exact sandbox flags, empty temp cwd, DEVNULL stdin, and 60s timeout
+        assert observed["cmd"][0] == "/usr/local/bin/codex"
+        assert observed["cmd"][1] == "exec"
+        assert "--sandbox" in observed["cmd"]
+        assert observed["cmd"][observed["cmd"].index("--sandbox") + 1] == "read-only"
+        assert "--json" in observed["cmd"]
+        assert observed["stdin"] is subprocess.DEVNULL
+        assert observed["timeout"] == 60.0
+        assert observed["cwd_contents"] == []
+        assert str(Path.cwd()) != observed["cwd"]
+
+        # Verify ChronoX / Plaid / Gemini secrets stripped from subprocess env
+        assert "PLAID_SECRET" not in observed["env"]
+        assert "GEMINI_API_KEY" not in observed["env"]
+        assert "CHRONOX_FINANCE_SECRET_KEY" not in observed["env"]
+
+        # Verify ALL PII, keys, tokens, and email headers redacted from CLI prompt!
+        sent_prompt = observed["cmd"][-1]
+        for leaked in ("alice@example.com", "123-45-6789", "9876543210", "sk-proj-supersecretkey", "access-production-", "bank@chase.com"):
+            assert leaked not in sent_prompt
+
+        # Verify JSONL output & real usage parsed
+        assert res.content == '{"ok": true}'
+        assert res.provider == "codex_cli"
+        assert res.input_tokens == 1600
+        assert res.cached_tokens == 1000
+        assert res.output_tokens == 90
+        assert res.saved_microdollars > 0
+

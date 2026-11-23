@@ -43,6 +43,12 @@ const chronoxDesktop = Object.freeze({
   openStatementDialog: () => ipcRenderer.invoke("dialog:openStatement"),
   saveFileDialog: (options) => ipcRenderer.invoke("dialog:saveFile", options),
 
+  // Optional local Auto-Import Watch Folder (Zero-3rd-Party NFCU / Plaid drop folder)
+  getWatchFolderStatus: () => ipcRenderer.invoke("watch:getStatus"),
+  pickWatchFolder: () => ipcRenderer.invoke("watch:pickFolder"),
+  scanWatchFolderNow: () => ipcRenderer.invoke("watch:scanNow"),
+  openWatchFolder: () => ipcRenderer.invoke("watch:openFolder"),
+
   // System Tray live snapshot sync
   updateTraySnapshot: (snapshot) => ipcRenderer.invoke("tray:updateSnapshot", snapshot),
 
