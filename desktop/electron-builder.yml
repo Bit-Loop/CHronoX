@@ -1,0 +1,156 @@
+appId: com.chronox.finance
+productName: ChronoX Finance
+copyright: Copyright © 2026 ChronoX Contributors
+asar: true
+compression: normal
+
+directories:
+  buildResources: build
+  output: dist
+
+files:
+  - "src/**/*"
+  - "package.json"
+  - "build/icons/*"
+  - "!**/*.map"
+  - "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}"
+  - "!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}"
+  - "!build/backend/**"
+  - "!build/pyinstaller-work/**"
+  - "!packaging/**"
+  - "!scripts/**"
+  - "!dist/**"
+
+# Standalone zero-Python PyInstaller sidecar (`npm run build:backend`)
+# Packaged into resources/backend/chronox-backend(.exe) to match backend-manager.js
+extraResources:
+  - from: build/backend
+    to: backend
+    filter:
+      - "**/*"
+
+# --- Windows (x64 & arm64): NSIS Installer + Portable ---
+win:
+  icon: build/icons/icon.ico
+  executableName: chronox-finance
+  target:
+    - target: nsis
+      arch:
+        - x64
+        - arm64
+    - target: portable
+      arch:
+        - x64
+        - arm64
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  allowElevation: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: ChronoX Finance
+  uninstallDisplayName: ChronoX Finance
+  deleteAppDataOnUninstall: false
+  runAfterFinish: true
+  installerIcon: build/icons/icon.ico
+  uninstallerIcon: build/icons/icon.ico
+  artifactName: "${name}-${version}-win-${arch}-setup.${ext}"
+
+portable:
+  artifactName: "${name}-${version}-win-${arch}-portable.${ext}"
+
+# --- Linux (x64 & arm64): Debian/Ubuntu .deb, Arch .pacman & Universal .AppImage ---
+linux:
+  executableName: chronox-finance
+  syncDesktopName: true
+  icon: build/icons
+  category: Finance
+  maintainer: ChronoX Contributors <maintainers@chronox.local>
+  vendor: ChronoX
+  synopsis: Calm ADHD-friendly self-updating auto-budgeting, quant math & credit optimizer
+  description: >-
+    ChronoX Finance is a local-first, ADHD-friendly personal finance, self-updating
+    auto-budgeting, quantitative cashflow runway, and FICO/AZEO credit optimizer with
+    optional OpenCode Go and Google Gemini coaching.
+  mimeTypes:
+    - text/csv
+    - text/tab-separated-values
+    - application/x-ofx
+    - application/vnd.intu.qfx
+    - application/x-qw
+  desktop:
+    entry:
+      Name: ChronoX Finance
+      GenericName: Personal Finance & Auto-Budget
+      StartupNotify: "true"
+      StartupWMClass: chronox-finance
+      Keywords: budget;finance;adhd;credit;fico;azeo;cashflow;money;quant;
+      MimeType: text/csv;text/tab-separated-values;application/x-ofx;application/vnd.intu.qfx;application/x-qw;
+  target:
+    - target: deb
+      arch:
+        - x64
+        - arm64
+    - target: pacman
+      arch:
+        - x64
+        - arm64
+    - target: AppImage
+      arch:
+        - x64
+        - arm64
+
+deb:
+  packageName: chronox-finance
+  priority: optional
+  maintainer: ChronoX Contributors <maintainers@chronox.local>
+  synopsis: Calm ADHD-friendly self-updating auto-budgeting, quant math & credit optimizer
+  depends:
+    - libgtk-3-0 | libgtk-3-0t64
+    - libnotify4
+    - libnss3
+    - libxss1
+    - libxtst6
+    - xdg-utils
+    - libatspi2.0-0 | libatspi2.0-0t64
+    - libuuid1
+    - libsecret-1-0
+    - libgbm1
+    - libasound2 | libasound2t64
+  artifactName: "${name}-${version}-linux-${arch}.${ext}"
+
+pacman:
+  packageName: chronox-finance
+  compression: xz
+  depends:
+    - gtk3
+    - nss
+    - libnotify
+    - libxss
+    - libxtst
+    - xdg-utils
+    - at-spi2-core
+    - util-linux-libs
+    - libsecret
+  artifactName: "${name}-${version}-linux-${arch}.${ext}"
+
+appImage:
+  artifactName: "${name}-${version}-linux-${arch}.${ext}"
+
+# --- macOS (arm64 & x64): DMG ---
+mac:
+  category: public.app-category.finance
+  icon: build/icons/icon.icns
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  darkModeSupport: true
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+
+dmg:
+  artifactName: "${name}-${version}-mac-${arch}.${ext}"

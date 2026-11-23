@@ -1,0 +1,338 @@
+name: Release - ChronoX Finance Desktop (Windows, Linux & macOS)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      draft_release:
+        description: 'Create a draft GitHub Release (tags only)'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-desktop-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  smoke-check:
+    name: Static, Security & Unit Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Python app & dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run Python lint & full test suite
+        run: |
+          ruff check chronox_finance config main.py data/ingestion/polygon/client.py data/ingestion/polygon/__init__.py tests
+          pytest tests/ -v
+
+      - name: Validate desktop JS, scripts, PKGBUILD & YAML configs
+        run: |
+          node --check chronox_finance/web/app.js
+          node --check desktop/scripts/build-backend.mjs
+          find desktop/src -type f -name '*.js' -print0 | xargs -0 -n1 node --check
+          bash -n scripts/install-linux.sh
+          bash -n desktop/packaging/arch/PKGBUILD
+          python -c "import yaml, pathlib; [yaml.safe_load(pathlib.Path(p).read_text()) for p in ('desktop/electron-builder.yml', '.github/workflows/release-desktop.yml')]"
+
+  build-linux:
+    name: Build Linux (${{ matrix.arch }})
+    needs: smoke-check
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Linux packaging system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dpkg fakeroot libarchive-tools zstd xz-utils
+
+      - name: Create .venv & install ChronoX Finance + PyInstaller
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -e . pyinstaller
+
+      - name: Install desktop npm dependencies & generate icons
+        working-directory: desktop
+        run: |
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+          npm run icons
+
+      - name: Build & smoke-test standalone Python backend sidecar
+        working-directory: desktop
+        run: |
+          npm run build:backend
+          ./build/backend/chronox-backend --help
+          TMP_DB="$(mktemp -u /tmp/chronox-smoke-XXXXXX.sqlite3)"
+          ./build/backend/chronox-backend --host 127.0.0.1 --port 18742 --db "${TMP_DB}" --demo &
+          SIDECAR_PID=$!
+          trap 'kill "${SIDECAR_PID}" 2>/dev/null || true; rm -f "${TMP_DB}" "${TMP_DB}-wal" "${TMP_DB}-shm"' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18742/api/health >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.5
+          done
+          curl -fsS http://127.0.0.1:18742/api/health
+          kill "${SIDECAR_PID}"
+          wait "${SIDECAR_PID}" || true
+
+      - name: Package .deb, .pacman & .AppImage (${{ matrix.arch }})
+        working-directory: desktop
+        run: |
+          npx electron-builder \
+            --config electron-builder.yml \
+            --linux deb pacman AppImage \
+            --${{ matrix.arch }} \
+            --publish never
+
+      - name: Inspect built Linux packages & generate SHA256SUMS
+        working-directory: desktop/dist
+        run: |
+          ls -lh *.deb *.pacman *.AppImage
+          for f in *.deb; do dpkg-deb -I "$f"; done
+          for f in *.pacman; do bsdtar -tf "$f" | head -n 40; done
+          sha256sum *.deb *.pacman *.AppImage > "SHA256SUMS-linux-${{ matrix.arch }}.txt"
+
+      - name: Upload Linux (${{ matrix.arch }}) release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronox-desktop-linux-${{ matrix.arch }}
+          path: |
+            desktop/dist/*.deb
+            desktop/dist/*.pacman
+            desktop/dist/*.AppImage
+            desktop/dist/SHA256SUMS-linux-${{ matrix.arch }}.txt
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows (${{ matrix.arch }})
+    needs: smoke-check
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            arch: x64
+          - runner: windows-11-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Create .venv & install ChronoX Finance + PyInstaller
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .venv\Scripts\python.exe -m pip install --upgrade pip
+          .venv\Scripts\python.exe -m pip install -e . pyinstaller
+
+      - name: Install desktop npm dependencies & generate icons
+        working-directory: desktop
+        shell: pwsh
+        run: |
+          if (Test-Path package-lock.json) { npm ci --no-audit --no-fund } else { npm install --no-audit --no-fund }
+          npm run icons
+
+      - name: Build & smoke-test standalone Python backend sidecar
+        working-directory: desktop
+        shell: pwsh
+        run: |
+          npm run build:backend
+          .\build\backend\chronox-backend.exe --help
+          $tmpDb = Join-Path $env:TEMP "chronox-smoke-$([guid]::NewGuid().ToString('N')).sqlite3"
+          $proc = Start-Process -FilePath ".\build\backend\chronox-backend.exe" `
+            -ArgumentList @("--host", "127.0.0.1", "--port", "18743", "--db", $tmpDb, "--demo") `
+            -PassThru -NoNewWindow
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              try {
+                $resp = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:18743/api/health" -TimeoutSec 2
+                if ($resp.StatusCode -eq 200) { $ready = $true; break }
+              } catch { Start-Sleep -Milliseconds 500 }
+            }
+            if (-not $ready) { throw "Windows sidecar failed to become healthy on /api/health" }
+          } finally {
+            if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+            Remove-Item -Force -ErrorAction SilentlyContinue $tmpDb, "$tmpDb-wal", "$tmpDb-shm"
+          }
+
+      - name: Package Windows NSIS & Portable (${{ matrix.arch }})
+        working-directory: desktop
+        shell: pwsh
+        run: |
+          npx electron-builder `
+            --config electron-builder.yml `
+            --win nsis portable `
+            --${{ matrix.arch }} `
+            --publish never
+
+      - name: Generate Windows SHA256SUMS
+        working-directory: desktop/dist
+        shell: pwsh
+        run: |
+          Get-ChildItem -Filter '*.exe' | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content -Encoding utf8 "SHA256SUMS-win-${{ matrix.arch }}.txt"
+          Get-Content "SHA256SUMS-win-${{ matrix.arch }}.txt"
+
+      - name: Upload Windows (${{ matrix.arch }}) release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronox-desktop-win-${{ matrix.arch }}
+          path: |
+            desktop/dist/*.exe
+            desktop/dist/SHA256SUMS-win-${{ matrix.arch }}.txt
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS (${{ matrix.arch }})
+    needs: smoke-check
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Create .venv & install ChronoX Finance + PyInstaller
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -e . pyinstaller
+
+      - name: Install desktop npm dependencies & generate icons
+        working-directory: desktop
+        run: |
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+          npm run icons
+
+      - name: Build & smoke-test standalone Python backend sidecar
+        working-directory: desktop
+        run: |
+          npm run build:backend
+          ./build/backend/chronox-backend --help
+
+      - name: Package macOS .dmg (${{ matrix.arch }})
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: |
+          npx electron-builder \
+            --config electron-builder.yml \
+            --mac dmg \
+            --${{ matrix.arch }} \
+            --publish never
+
+      - name: Generate macOS SHA256SUMS
+        working-directory: desktop/dist
+        run: |
+          shasum -a 256 *.dmg > "SHA256SUMS-mac-${{ matrix.arch }}.txt"
+          cat "SHA256SUMS-mac-${{ matrix.arch }}.txt"
+
+      - name: Upload macOS (${{ matrix.arch }}) release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronox-desktop-mac-${{ matrix.arch }}
+          path: |
+            desktop/dist/*.dmg
+            desktop/dist/SHA256SUMS-mac-${{ matrix.arch }}.txt
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [build-linux, build-windows, build-macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Combine SHA256SUMS
+        working-directory: release-assets
+        run: |
+          cat SHA256SUMS-*.txt | sort -k2 > SHA256SUMS.txt
+          rm -f SHA256SUMS-*.txt
+          ls -lh
+
+      - name: Publish Release to GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: ${{ inputs.draft_release || false }}
+          generate_release_notes: true
+          files: release-assets/*
+          body: |
+            ## ChronoX Finance Desktop Release
+
+            Self-contained desktop builds with the bundled zero-Python ChronoX Finance API sidecar.
+
+            ### Quick Install
+            - **Windows (`x64` / `arm64`)**: Run `*-win-<arch>-setup.exe` (installer) or `*-win-<arch>-portable.exe` (no install).
+            - **Debian / Ubuntu (`x64` / `arm64`)**: `sudo apt install ./chronox-finance-*-linux-<arch>.deb`
+            - **Arch / CachyOS / EndeavourOS (`x64` / `arm64`)**: `sudo pacman -U ./chronox-finance-*-linux-<arch>.pacman`
+            - **Universal Linux (`x64` / `arm64`)**: `chmod +x chronox-finance-*-linux-<arch>.AppImage && ./chronox-finance-*-linux-<arch>.AppImage`
+            - **macOS (`arm64` / `x64`)**: Open `chronox-finance-*-mac-<arch>.dmg` and drag ChronoX Finance to Applications.
+
+            Verify downloads against `SHA256SUMS.txt`.

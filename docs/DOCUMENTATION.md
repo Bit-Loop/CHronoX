@@ -175,7 +175,7 @@ GPU: 5.1 seconds (2x faster)
 **Port:** 5433 (avoids conflicts with system PostgreSQL)  
 **Database:** `chronox`  
 **User:** `postgres`  
-**Password:** `chronox_db_password`
+**Password:** `<SET_TIMESCALE_PASSWORD>`
 
 **Example Query:**
 ```sql
@@ -399,7 +399,7 @@ TIMESCALE_HOST=localhost
 TIMESCALE_PORT=5433
 TIMESCALE_DB=chronox
 TIMESCALE_USER=postgres
-TIMESCALE_PASSWORD=chronox_db_password
+TIMESCALE_PASSWORD=<SET_TIMESCALE_PASSWORD>
 ```
 
 **5. Start TimescaleDB**
@@ -572,7 +572,7 @@ writer = TimescaleWriter(
     port=5433,
     database="chronox",
     user="postgres",
-    password="chronox_db_password",
+    password="<SET_TIMESCALE_PASSWORD>",
     min_connections=2,  # Pool size
     max_connections=10
 )

@@ -1,8 +1,10 @@
 """Unit tests for Polygon.io client"""
 
-import pytest
 from unittest.mock import Mock, patch
-from data.ingestion.polygon.client import PolygonClient, PolygonAPIError
+
+import pytest
+
+from data.ingestion.polygon.client import PolygonAPIError, PolygonClient
 
 
 class TestPolygonClient:

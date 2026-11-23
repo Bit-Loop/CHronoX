@@ -1,17 +1,24 @@
-"""Polygon.io API client package for ChronoX trading bot."""
+"""Polygon.io API client package for ChronoX."""
 
-__version__ = "0.1.0"
+from __future__ import annotations
 
-from .client import PolygonClient
+__version__ = "1.0.0"
+
 from .aggregates import AggregatesClient, SnapshotClient
+from .client import PolygonAPIError, PolygonClient
 from .corporate_actions import CorporateActionsClient
-from .reference import ReferenceClient
-from .news import NewsClient
 from .indicators import IndicatorsClient
-from .websocket_client import PolygonWebSocketClient
+from .news import NewsClient
+from .reference import ReferenceClient
+
+try:
+    from .websocket_client import PolygonWebSocketClient
+except ImportError:  # Optional dependency: websocket-client
+    PolygonWebSocketClient = None  # type: ignore[assignment,misc]
 
 __all__ = [
     "PolygonClient",
+    "PolygonAPIError",
     "AggregatesClient",
     "SnapshotClient",
     "CorporateActionsClient",

@@ -3458,10 +3458,14 @@ def get_aggregated_bars(
         start_time = end_time - timedelta(days=days_back.get(interval, 30))
     
     # SQLAlchemy engine (connection pooling, thread-safe)
+    from urllib.parse import quote_plus
+    db_password = os.getenv('TIMESCALE_PASSWORD', '')
+    if not db_password:
+        raise RuntimeError("TIMESCALE_PASSWORD environment variable must be set")
     db_url = (
         f"postgresql+psycopg2://"
-        f"{os.getenv('TIMESCALE_USER', 'postgres')}:"
-        f"{os.getenv('TIMESCALE_PASSWORD', 'chronox_db_password')}@"
+        f"{quote_plus(os.getenv('TIMESCALE_USER', 'postgres'))}:"
+        f"{quote_plus(db_password)}@"
         f"{os.getenv('TIMESCALE_HOST', 'localhost')}:"
         f"{os.getenv('TIMESCALE_PORT', '5433')}/"
         f"{os.getenv('TIMESCALE_DB', 'chronox')}"

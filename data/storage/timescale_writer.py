@@ -43,10 +43,25 @@ class TimescaleWriter:
     Features:
     - Connection pooling for multi-threaded access
     - Bulk COPY operations for fast inserts
-    - Automatic retry logic
+    - Strict SQL identifier validation (SQL injection protection)
     - Prepared statements for repeated queries
     - Context manager support
     """
+
+    VALID_TIMEFRAMES = frozenset({
+        "1min", "5min", "15min", "30min", "1hour", "4hour",
+        "12hour", "1day", "daily", "1week", "1m", "5m", "15m", "1h", "1d",
+    })
+
+    @classmethod
+    def _validate_timeframe(cls, timeframe: str) -> str:
+        """Validate timeframe against an explicit allowlist to prevent SQL injection."""
+        tf = (timeframe or "").strip().lower()
+        if tf not in cls.VALID_TIMEFRAMES:
+            raise ValueError(
+                f"Invalid timeframe {timeframe!r}. Allowed: {sorted(cls.VALID_TIMEFRAMES)}"
+            )
+        return tf
     
     def __init__(
         self,
@@ -66,59 +81,65 @@ class TimescaleWriter:
             port: PostgreSQL port (defaults to env TIMESCALE_PORT or 5433)
             database: Database name (defaults to env TIMESCALE_DB or 'chronox')
             user: Database user (defaults to env TIMESCALE_USER or 'postgres')
-            password: Database password (defaults to env TIMESCALE_PASSWORD or 'chronox_db_password')
+            password: Database password (defaults to env TIMESCALE_PASSWORD)
             min_connections: Minimum connections in pool
             max_connections: Maximum connections in pool
         """
-        # Read from environment if not provided
         host = host or os.getenv('TIMESCALE_HOST', 'localhost')
         port = port or int(os.getenv('TIMESCALE_PORT', '5433'))
         database = database or os.getenv('TIMESCALE_DB', 'chronox')
         user = user or os.getenv('TIMESCALE_USER', 'postgres')
-        password = password or os.getenv('TIMESCALE_PASSWORD', 'chronox_db_password')
-        
-        self.dsn = f"host={host} port={port} dbname={database} user={user} password={password}"
+        resolved_password = password if password is not None else os.getenv('TIMESCALE_PASSWORD', '')
+        if not resolved_password:
+            raise TimescaleDBError(
+                "TimescaleDB password is required. Set TIMESCALE_PASSWORD in your environment or .env file."
+            )
+
+        self._conn_summary = f"{user}@{host}:{port}/{database}"
         
         try:
-            # Create connection pool
             self.pool = pool.ThreadedConnectionPool(
                 min_connections,
                 max_connections,
-                dsn=self.dsn,
+                host=host,
+                port=port,
+                dbname=database,
+                user=user,
+                password=resolved_password,
                 connect_timeout=10
             )
-            logger.info(f"✓ TimescaleDB connection pool created ({min_connections}-{max_connections} connections)")
+            logger.info(f"✓ TimescaleDB connection pool created ({min_connections}-{max_connections} connections) for {self._conn_summary}")
             
-            # Test connection
             if self.test_connection():
                 logger.info("✓ TimescaleDB connection successful")
             else:
                 raise TimescaleDBError("Connection test failed")
                 
         except psycopg2.Error as e:
-            logger.error(f"✗ Failed to connect to TimescaleDB: {e}")
+            logger.error(f"✗ Failed to connect to TimescaleDB ({self._conn_summary}): {e}")
             raise TimescaleDBError(f"Connection failed: {e}")
     
     @contextmanager
     def get_connection(self):
         """
         Context manager for getting connection from pool.
-        
-        Usage:
-            with writer.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT ...")
         """
         conn = self.pool.getconn()
+        broken = False
         try:
             yield conn
             conn.commit()
+        except psycopg2.OperationalError as e:
+            broken = True
+            logger.error(f"Database operational error: {e}")
+            raise
         except Exception as e:
-            conn.rollback()
+            if not conn.closed:
+                conn.rollback()
             logger.error(f"Transaction rolled back: {e}")
             raise
         finally:
-            self.pool.putconn(conn)
+            self.pool.putconn(conn, close=broken or bool(conn.closed))
     
     def test_connection(self) -> bool:
         """Test database connection and TimescaleDB extension."""
@@ -318,12 +339,15 @@ class TimescaleWriter:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
+                safe_tf = self._validate_timeframe(timeframe)
+                table_name = f"market_data_{safe_tf}"
+
                 # Ensure table exists with all indicator columns
-                self._ensure_enriched_table_exists(cursor, timeframe)
+                self._ensure_enriched_table_exists(cursor, safe_tf)
                 
-                # Build upsert query
-                upsert_query = f"""
-                    INSERT INTO market_data_{timeframe} (
+                # Build identifier-safe upsert query
+                upsert_query = sql.SQL("""
+                    INSERT INTO {table} (
                         time, ticker, open, high, low, close, volume,
                         sma_20, sma_50, ema_20, ema_50, ema_100, ema_200,
                         rsi_14, macd, macd_signal, macd_hist,
@@ -354,7 +378,7 @@ class TimescaleWriter:
                         bb_middle = EXCLUDED.bb_middle,
                         bb_lower = EXCLUDED.bb_lower,
                         vwap = EXCLUDED.vwap
-                """
+                """).format(table=sql.Identifier(table_name))
                 
                 rows = []
                 for bar in bars:
@@ -401,12 +425,16 @@ class TimescaleWriter:
     def _ensure_enriched_table_exists(self, cursor, timeframe: str):
         """
         Ensure market_data_{timeframe} table exists with all indicator columns.
-        Creates wide hypertable for ML-ready data storage.
+        Creates wide hypertable for ML-ready data storage using safe SQL identifiers.
         """
-        table_name = f"market_data_{timeframe}"
-        
-        cursor.execute(f"""
-            CREATE TABLE IF NOT EXISTS {table_name} (
+        safe_tf = self._validate_timeframe(timeframe)
+        table_name = f"market_data_{safe_tf}"
+        table_ident = sql.Identifier(table_name)
+        idx_ticker_time = sql.Identifier(f"idx_{table_name}_ticker_time")
+        idx_ticker = sql.Identifier(f"idx_{table_name}_ticker")
+
+        cursor.execute(sql.SQL("""
+            CREATE TABLE IF NOT EXISTS {table} (
                 time TIMESTAMPTZ NOT NULL,
                 ticker TEXT NOT NULL,
                 open DOUBLE PRECISION,
@@ -430,35 +458,41 @@ class TimescaleWriter:
                 vwap DOUBLE PRECISION,
                 PRIMARY KEY (time, ticker)
             )
-        """)
-        
-        # Convert to hypertable if not already
-        cursor.execute(f"""
-            SELECT * FROM timescaledb_information.hypertables
-            WHERE hypertable_name = '{table_name}'
-        """)
-        
+        """).format(table=table_ident))
+
+        # Convert to hypertable if not already (parameterized)
+        cursor.execute(
+            """
+            SELECT 1 FROM timescaledb_information.hypertables
+            WHERE hypertable_name = %s
+            """,
+            (table_name,),
+        )
+
         if not cursor.fetchone():
-            cursor.execute(f"""
+            cursor.execute(
+                """
                 SELECT create_hypertable(
-                    '{table_name}', 
+                    %s,
                     'time',
                     if_not_exists => TRUE,
                     migrate_data => TRUE
                 )
-            """)
+                """,
+                (table_name,),
+            )
             logger.info(f"✓ Created hypertable: {table_name}")
-        
+
         # Create indexes for efficient queries
-        cursor.execute(f"""
-            CREATE INDEX IF NOT EXISTS idx_{table_name}_ticker_time 
-            ON {table_name} (ticker, time DESC)
-        """)
-        
-        cursor.execute(f"""
-            CREATE INDEX IF NOT EXISTS idx_{table_name}_ticker 
-            ON {table_name} (ticker)
-        """)
+        cursor.execute(sql.SQL("""
+            CREATE INDEX IF NOT EXISTS {idx}
+            ON {table} (ticker, time DESC)
+        """).format(idx=idx_ticker_time, table=table_ident))
+
+        cursor.execute(sql.SQL("""
+            CREATE INDEX IF NOT EXISTS {idx}
+            ON {table} (ticker)
+        """).format(idx=idx_ticker, table=table_ident))
     
     def write_corporate_actions(
         self,
@@ -908,10 +942,10 @@ if __name__ == "__main__":
     # Configuration
     writer = TimescaleWriter(
         host=os.getenv("TIMESCALE_HOST", "localhost"),
-        port=int(os.getenv("TIMESCALE_PORT", 5432)),
+        port=int(os.getenv("TIMESCALE_PORT", "5433")),
         database=os.getenv("TIMESCALE_DB", "chronox"),
         user=os.getenv("TIMESCALE_USER", "postgres"),
-        password=os.getenv("TIMESCALE_PASSWORD", "postgres")
+        password=os.getenv("TIMESCALE_PASSWORD")
     )
     
     # Test with sample data

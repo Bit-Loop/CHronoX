@@ -1,498 +1,330 @@
 #!/usr/bin/env python3
 """
-ChronoX Trading Bot - Main Entry Point
+ChronoX — Unified Entry Point (ADHD Personal Finance & Algorithmic Trading Platform).
 
-This is the central orchestrator for the ChronoX trading bot system.
-It coordinates all subsystems including:
-- Data ingestion (historical & real-time)
-- Feature engineering & preprocessing
-- ML model training & inference
-- Backtesting & performance evaluation
-- Paper trading & live trading
-- Monitoring & alerting
-
-Hardware Context:
-- CPU: AMD Ryzen 9 9950X (16 cores / 32 threads)
-- RAM: 96 GB DDR5-6000
-- GPU: NVIDIA RTX 5070 (12 GB VRAM; ~10 GB usable)
-- Storage: Samsung 990 Pro NVMe (7 GB/s)
-
-Scaling Recommendations:
-- Feature generation: Up to 100 symbols (CPU + RAM)
-- Short-term training (15 min): 10-15 symbols (GPU, FP16)
-- Long-term training (daily): 5-10 symbols (GPU, FP16 + gradient checkpointing)
-- Backtesting: Up to 100 symbols (CPU, multiprocessing)
-- Real-time inference: 20-30 symbols (GPU, no gradients)
-
-Usage:
-    # Interactive mode (future GUI)
+Primary modes:
+    # Start the ADHD-Friendly Self-Updating Auto-Budgeting Web App (default)
     python main.py
+    python main.py --action finance --port 8742 --demo
 
-    # CLI mode with specific action
-    python main.py --action backfill --tickers AAPL,TSLA,NVDA
-    python main.py --action train --model transformer --symbols 15
-    python main.py --action backtest --start 2020-01-01 --end 2023-12-31
-    python main.py --action paper_trade --symbols 10
-    python main.py --action live_trade --symbols 5
+    # Terminal ADHD quick-capture & OpenCode Go coach
+    python main.py --action budget --quick "coffee 6.50"
+    python main.py --action budget --ask "Can I afford a $90 dinner tonight?"
+    python main.py --action budget --suggest
 
-Author: ChronoX Team
-Version: 0.1.0
-Date: 2025-10-16
+    # ChronoX Market Data & Trading Core (TimescaleDB + Polygon.io)
+    python main.py --action backfill --tickers AAPL,MSFT,NVDA --start 2022-01-01
+    python main.py --action health
 """
+
+from __future__ import annotations
 
 import argparse
 import logging
 import sys
+from datetime import date, datetime
 from pathlib import Path
-from typing import Optional, List
-import os
-from datetime import datetime
+from typing import Any, Dict, List, Optional
 
-# Add project root to Python path
 PROJECT_ROOT = Path(__file__).parent
-sys.path.insert(0, str(PROJECT_ROOT))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-# Core imports
-from config.config_manager import ConfigManager
-from utils.logger import setup_logging
-
-# Phase 0: Data Acquisition (COMPLETE)
-from data.ingestion.polygon.client import PolygonClient
-from data.storage.timescale_writer import TimescaleWriter
-
-# Phase 1: Data Pipeline (TODO)
-# from pipelines.data_ingestion_pipeline import DataIngestionPipeline
-# from pipelines.quality_checks import DataQualityChecker
-
-# Phase 2: Preprocessing & Feature Engineering (TODO)
-# from data.preprocessing.feature_engineering import FeatureEngineer
-# from data.preprocessing.multi_resolution_pipeline import MultiResolutionPipeline
-
-# Phase 3: ML Models (TODO)
-# from models.transformers.temporal_fusion_transformer import TemporalFusionTransformer
-# from models.transformers.timescale_fusion import TimeScaleFusion
-# from models.rl_agents.ppo_agent import PPOAgent
-
-# Phase 4: Training (TODO)
-# from training.train_orchestrator import TrainingOrchestrator
-# from training.hyperparameter_tuner import HyperparameterTuner
-
-# Phase 5: Backtesting (TODO)
-# from backtesting.backtester import Backtester
-# from backtesting.performance_metrics import PerformanceAnalyzer
-
-# Phase 6: Trading (TODO)
-# from trading.paper_trading_bot import PaperTradingBot
-# from trading.live_trading_bot import LiveTradingBot
-# from trading.risk_manager import RiskManager
-
-# Phase 7: Monitoring (TODO)
-# from monitoring.prometheus_exporter import PrometheusExporter
-# from monitoring.alert_manager import AlertManager
+from config.config_manager import ConfigManager  # noqa: E402
+from utils.logger import setup_logging  # noqa: E402
 
 
 class ChronoXOrchestrator:
     """
-    Main orchestrator for the ChronoX trading bot.
-    
-    Coordinates all subsystems and manages the application lifecycle.
-    Implements the observer pattern for inter-component communication.
-    
-    Attributes:
-        config (ConfigManager): Configuration manager
-        logger (logging.Logger): Application logger
-        db_writer (TimescaleWriter): Database writer for market data
-        polygon_client (PolygonClient): Polygon.io API client
-        
-    TODO:
-        - data_pipeline: Data ingestion and quality checks
-        - feature_engineer: Feature generation and preprocessing
-        - model_trainer: ML model training orchestrator
-        - backtester: Backtesting engine
-        - trading_bot: Paper/live trading bot
-        - risk_manager: Risk management system
-        - monitor: Monitoring and alerting
+    Central orchestrator for ChronoX.
+
+    Uses lazy subsystem initialization so lightweight personal finance and CLI
+    commands start instantly without requiring TimescaleDB, Redis, or CUDA.
     """
-    
-    def __init__(self, config_path: Optional[str] = None):
-        """
-        Initialize ChronoX orchestrator.
-        
-        Args:
-            config_path: Path to configuration file. If None, uses default config.
-        """
-        # Setup logging first
+
+    def __init__(self, config_path: Optional[str] = None, init_trading_db: bool = False):
         self.logger = setup_logging(
             name="ChronoX",
             log_dir=PROJECT_ROOT / "logs",
-            level=logging.INFO
+            level=logging.INFO,
         )
-        self.logger.info("="*80)
-        self.logger.info("ChronoX Trading Bot - Initializing")
-        self.logger.info("="*80)
-        
-        # Load configuration
         self.config = ConfigManager(config_path)
-        self.logger.info(f"Configuration loaded from: {config_path or 'default'}")
-        
-        # Initialize Phase 0 components (Data Acquisition)
-        self._init_phase0()
-        
-        # TODO: Initialize remaining phases as they are implemented
-        # self._init_phase1()  # Data Pipeline
-        # self._init_phase2()  # Feature Engineering
-        # self._init_phase3()  # ML Models
-        # self._init_phase4()  # Training
-        # self._init_phase5()  # Backtesting
-        # self._init_phase6()  # Trading
-        # self._init_phase7()  # Monitoring
-        
-        self.logger.info("ChronoX initialization complete")
-    
-    def _init_phase0(self):
-        """Initialize Phase 0: Data Acquisition components."""
-        self.logger.info("Initializing Phase 0: Data Acquisition")
-        
-        # Initialize Polygon.io API client
-        api_key = os.getenv("POLYGON_API_KEY")
-        if not api_key:
-            self.logger.warning("POLYGON_API_KEY not found in environment")
-            self.polygon_client = None
-        else:
-            self.polygon_client = PolygonClient(api_key)
-            self.logger.info("✓ Polygon.io API client initialized")
-        
-        # Initialize TimescaleDB writer
-        try:
-            self.db_writer = TimescaleWriter()
-            if self.db_writer.test_connection():
-                self.logger.info("✓ TimescaleDB connection established")
-            else:
-                self.logger.error("✗ TimescaleDB connection failed")
+        self.polygon_client: Any = None
+        self.db_writer: Any = None
+        if init_trading_db:
+            self._init_trading_infrastructure()
+
+    def _init_trading_infrastructure(self) -> None:
+        """Lazily initialize Polygon.io client and TimescaleDB writer when trading ops run."""
+        if self.polygon_client is None and self.config.polygon.api_key:
+            from data.ingestion.polygon.client import PolygonClient
+
+            self.polygon_client = PolygonClient(
+                api_key=self.config.polygon.api_key,
+                rate_limit_calls=self.config.polygon.rate_limit_calls,
+                rate_limit_period=self.config.polygon.rate_limit_period,
+                timeout=self.config.polygon.timeout,
+            )
+
+        if self.db_writer is None and self.config.timescale.password:
+            try:
+                from data.storage.timescale_writer import TimescaleWriter
+
+                self.db_writer = TimescaleWriter(
+                    host=self.config.timescale.host,
+                    port=self.config.timescale.port,
+                    database=self.config.timescale.database,
+                    user=self.config.timescale.user,
+                    password=self.config.timescale.password,
+                    min_connections=self.config.timescale.min_connections,
+                    max_connections=self.config.timescale.max_connections,
+                )
+            except Exception as exc:
+                self.logger.error("TimescaleDB initialization failed: %s", exc)
                 self.db_writer = None
-        except Exception as e:
-            self.logger.error(f"✗ TimescaleDB initialization failed: {e}")
-            self.db_writer = None
-    
+
+    def run_finance_app(
+        self,
+        *,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        db_path: Optional[str] = None,
+        load_demo: bool = False,
+        intelligence_mode: Optional[str] = None,
+        ai_provider: Optional[str] = None,
+    ) -> None:
+        """Launch the ADHD-Friendly Self-Updating Auto-Budgeting Web App."""
+        import uvicorn
+
+        from chronox_finance.api import create_app
+        from chronox_finance.models import AIProvider, IntelligenceMode, ProfileSettingsUpdate
+        from chronox_finance.service import FinanceService
+
+        resolved_host = host or self.config.finance.host
+        resolved_port = port or self.config.finance.port
+        resolved_db = db_path or self.config.finance.db_path
+
+        svc = FinanceService(db_path=resolved_db)
+        if intelligence_mode or ai_provider:
+            svc.update_settings(
+                ProfileSettingsUpdate(
+                    intelligence_mode=IntelligenceMode(intelligence_mode) if intelligence_mode else None,
+                    ai_provider=AIProvider(ai_provider) if ai_provider else None,
+                )
+            )
+        if load_demo and not svc.storage.list_transactions(limit=1):
+            svc.load_demo_workspace()
+            self.logger.info("Loaded 90-day ADHD demo workspace into %s", resolved_db)
+
+        app = create_app(db_path=resolved_db, service=svc)
+        self.logger.info("Starting ChronoX Finance at http://%s:%s", resolved_host, resolved_port)
+        print("\n🌿 ChronoX Finance (ADHD Auto-Budget, Quant Math & Multi-Provider AI Coach)")
+        print(f"   Open in browser: http://{resolved_host}:{resolved_port}\n")
+        uvicorn.run(app, host=resolved_host, port=resolved_port, log_level="info")
+
     def run_backfill(
         self,
         tickers: List[str],
-        start_date: str = "2020-01-01", #shouldnt be static...
+        start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         skip_minute: bool = True,
-        use_flatfiles: bool = False
-    ):
-        """
-        Run historical data backfill.
-        
-        Args:
-            tickers: List of stock symbols to backfill
-            start_date: Start date (YYYY-MM-DD)
-            end_date: End date (YYYY-MM-DD). If None, uses today.
-            skip_minute: If True, skip minute bars (only daily/hourly)
-            use_flatfiles: If True, use Polygon flat files (100-1000x faster)
-        
-        Returns:
-            dict: Backfill results with success/failure counts
-        """
-        self.logger.info(f"Starting backfill for {len(tickers)} tickers")
-        self.logger.info(f"Date range: {start_date} to {end_date or 'today'}")
-        self.logger.info(f"Using flat files: {use_flatfiles}")
-        
-        # Import backfill orchestrator
-        import sys
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from scripts.backfill_historical_data import BackfillOrchestrator
-        
-        # Get API key from environment
-        api_key = os.getenv("POLYGON_API_KEY")
+        use_flatfiles: bool = False,
+    ) -> Dict[str, Any]:
+        """Run historical market data backfill honoring date range and timeframe flags."""
+        self._init_trading_infrastructure()
+        api_key = self.config.polygon.api_key
         if not api_key:
-            self.logger.error("POLYGON_API_KEY not found in environment")
-            return {"status": "failed", "error": "Missing POLYGON_API_KEY"}
-        
+            return {"status": "failed", "error": "Missing POLYGON_API_KEY in environment"}
         if not self.db_writer:
-            self.logger.error("Database writer not initialized")
-            return {"status": "failed", "error": "Database not connected"}
-        
+            return {"status": "failed", "error": "TimescaleDB not connected (check TIMESCALE_PASSWORD)"}
+
+        ref_end = date.fromisoformat(end_date) if end_date else date.today()
+        ref_start = date.fromisoformat(start_date) if start_date else date(ref_end.year - 2, ref_end.month, ref_end.day)
+        years_back = max(1, int(round((ref_end - ref_start).days / 365.25)))
+
+        from scripts.backfill_historical_data import BackfillOrchestrator
+
+        backfill = BackfillOrchestrator(
+            polygon_api_key=api_key,
+            db_writer=self.db_writer,
+            years_back=years_back,
+            max_workers=4,
+            use_flatfiles=use_flatfiles,
+        )
+        self.logger.info(
+            "Running backfill for %s (%s -> %s, skip_minute=%s, flatfiles=%s)",
+            tickers,
+            ref_start.isoformat(),
+            ref_end.isoformat(),
+            skip_minute,
+            use_flatfiles,
+        )
+        return backfill.run_full_backfill(tickers)
+
+    def check_safe_trading_capital(self) -> float:
+        """Query the ChronoX Finance 'Don't Trade Your Rent' capital guardrail."""
+        from chronox_finance import get_safe_trading_capital
+
+        return get_safe_trading_capital(self.config.finance.db_path)
+
+    def run_health_check(self) -> Dict[str, Any]:
+        """Verify configuration, Finance DB, AI providers, and optional trading stack."""
+        from chronox_finance.service import FinanceService
+
+        svc = FinanceService(db_path=self.config.finance.db_path)
         try:
-            # Initialize backfill orchestrator
-            backfill = BackfillOrchestrator(
-                polygon_api_key=api_key,
-                db_writer=self.db_writer,
-                years_back=5,  # Configurable if needed
-                max_workers=4,
-                use_flatfiles=use_flatfiles
-            )
-            
-            # Execute full backfill for specified tickers
-            results = backfill.run_full_backfill(tickers)
-            
-            self.logger.info("Backfill completed successfully")
-            return results
-            
-        except Exception as e:
-            self.logger.error(f"Backfill failed: {e}", exc_info=True)
-            return {"status": "failed", "error": str(e)}
-    
-    def run_training(
-        self,
-        model_type: str = "transformer",
-        symbols: int = 15,
-        timeframe: str = "15min",
-        epochs: int = 100
-    ):
-        """
-        Run ML model training.
-        
-        Args:
-            model_type: Type of model ('transformer', 'tft', 'rl')
-            symbols: Number of symbols to train on (10-15 for short-term)
-            timeframe: Timeframe ('1min', '15min', '1hour', '12hour', 'daily')
-            epochs: Number of training epochs
-        
-        Returns:
-            dict: Training results with metrics
-        """
-        self.logger.info(f"Starting {model_type} training")
-        self.logger.info(f"Symbols: {symbols}, Timeframe: {timeframe}, Epochs: {epochs}")
-        
-        # TODO: Implement training orchestrator
-        self.logger.warning("Training not yet implemented")
-        return {"status": "not_implemented"}
-    
-    def run_backtest(
-        self,
-        start_date: str = "2020-01-01",
-        end_date: str = "2023-12-31",
-        tickers: Optional[List[str]] = None,
-        strategy: str = "ml_ensemble"
-    ):
-        """
-        Run backtesting simulation.
-        
-        Args:
-            start_date: Backtest start date
-            end_date: Backtest end date
-            tickers: List of symbols. If None, uses default watchlist.
-            strategy: Strategy to test ('ml_ensemble', 'momentum', 'mean_reversion')
-        
-        Returns:
-            dict: Backtest results with performance metrics
-        """
-        self.logger.info(f"Starting backtest: {start_date} to {end_date}")
-        self.logger.info(f"Strategy: {strategy}")
-        
-        # TODO: Implement backtesting engine
-        self.logger.warning("Backtesting not yet implemented")
-        return {"status": "not_implemented"}
-    
-    def run_paper_trading(self, symbols: int = 10):
-        """
-        Start paper trading bot.
-        
-        Args:
-            symbols: Number of symbols to trade concurrently
-        
-        Returns:
-            None (runs until interrupted)
-        """
-        self.logger.info(f"Starting paper trading with {symbols} symbols")
-        
-        # TODO: Implement paper trading bot
-        self.logger.warning("Paper trading not yet implemented")
-    
-    def run_live_trading(self, symbols: int = 5):
-        """
-        Start live trading bot.
-        
-        ⚠️ WARNING: This trades with real money!
-        
-        Args:
-            symbols: Number of symbols to trade concurrently
-        
-        Returns:
-            None (runs until interrupted)
-        """
-        self.logger.warning("="*80)
-        self.logger.warning("⚠️  LIVE TRADING MODE - REAL MONEY AT RISK")
-        self.logger.warning("="*80)
-        self.logger.info(f"Starting live trading with {symbols} symbols")
-        
-        # TODO: Implement live trading bot with circuit breakers
-        self.logger.warning("Live trading not yet implemented")
-    
-    def shutdown(self):
-        """Gracefully shutdown all components."""
-        self.logger.info("Shutting down ChronoX...")
-        
-        # Close database connections
+            health = svc.get_health()
+            dash = svc.get_dashboard()
+            ai_status = svc.get_ai_status()
+            report = {
+                "status": health.status,
+                "db_ok": health.db_ok,
+                "finance_db": self.config.finance.db_path,
+                "intelligence_mode": health.intelligence_mode,
+                "active_provider": health.active_provider,
+                "safe_to_spend_dollars": round(dash.safe_to_spend.safe_to_spend_cents / 100.0, 2),
+                "safe_to_invest_dollars": round(dash.safe_to_invest_cents / 100.0, 2),
+                "opencode_go_configured": ai_status["opencode_key_configured"],
+                "opencode_go_model": ai_status["opencode_model"],
+                "gemini_configured": ai_status["gemini_api_key_set"],
+                "gemini_model": ai_status["gemini_model"],
+                "polygon_configured": bool(self.config.polygon.api_key),
+                "timescale_configured": bool(self.config.timescale.password),
+            }
+            return report
+        finally:
+            svc.close()
+
+    def shutdown(self) -> None:
         if self.db_writer:
             self.db_writer.close()
-            self.logger.info("✓ Database connection closed")
-        
-        # Close API connections
         if self.polygon_client:
             self.polygon_client.close()
-            self.logger.info("✓ API client closed")
-        
-        # TODO: Shutdown other components as they are added
-        
-        self.logger.info("ChronoX shutdown complete")
 
 
-def parse_arguments():
-    """Parse command-line arguments."""
+def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="ChronoX Trading Bot - AI-Powered Algorithmic Trading System",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="ChronoX — ADHD Self-Updating Auto-Budgeting, OpenCode Go AI Coach & Market Data Platform",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    
     parser.add_argument(
         "--action",
         type=str,
-        choices=["backfill", "train", "backtest", "paper_trade", "live_trade", "gui"],
-        default="gui",
-        help="Action to perform (default: gui)"
+        choices=["finance", "budget", "gui", "backfill", "health"],
+        default="finance",
+        help="Action to perform (default: finance web app)",
     )
-    
+    parser.add_argument("--config", type=str, help="Path to YAML/JSON configuration file")
+    parser.add_argument("--host", type=str, help="Finance server host (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, help="Finance server port (default: 8742)")
+    parser.add_argument("--db", type=str, help="Path to ChronoX Finance SQLite database")
+    parser.add_argument("--demo", action="store_true", help="Seed 90-day ADHD demo workspace if empty")
+
+    # Quick CLI budget & intelligence options
     parser.add_argument(
-        "--tickers",
-        type=str,
-        help="Comma-separated list of tickers (e.g., AAPL,TSLA,NVDA)"
+        "--mode",
+        choices=["deterministic_only", "hybrid", "ai_standalone"],
+        default=None,
+        help="Intelligence mode (deterministic_only | hybrid | ai_standalone)",
     )
-    
     parser.add_argument(
-        "--symbols",
-        type=int,
-        default=15,
-        help="Number of symbols to process (default: 15)"
+        "--provider",
+        choices=["auto", "opencode_go", "gemini"],
+        default=None,
+        help="AI provider (auto | opencode_go | gemini)",
     )
-    
-    parser.add_argument(
-        "--start",
-        type=str,
-        default="2020-01-01",
-        help="Start date for backfill/backtest (YYYY-MM-DD)"
-    )
-    
-    parser.add_argument(
-        "--end",
-        type=str,
-        help="End date for backfill/backtest (YYYY-MM-DD, default: today)"
-    )
-    
-    parser.add_argument(
-        "--model",
-        type=str,
-        choices=["transformer", "tft", "rl", "ensemble"],
-        default="transformer",
-        help="Model type for training (default: transformer)"
-    )
-    
-    parser.add_argument(
-        "--timeframe",
-        type=str,
-        choices=["1min", "15min", "1hour", "12hour", "daily"],
-        default="15min",
-        help="Timeframe for training (default: 15min)"
-    )
-    
-    parser.add_argument(
-        "--config",
-        type=str,
-        help="Path to configuration file"
-    )
-    
-    parser.add_argument(
-        "--skip-minute",
-        action="store_true",
-        help="Skip minute bars during backfill (faster, less storage)"
-    )
-    
-    parser.add_argument(
-        "--flatfiles",
-        action="store_true",
-        help="Use Polygon flat files (S3) for faster backfill (100-1000x faster)"
-    )
-    
-    return parser.parse_args()
+    parser.add_argument("--quick", type=str, help="Quick-add phrase, e.g. 'coffee 6.50' or 'impulse 180 keyboard'")
+    parser.add_argument("--ask", type=str, help="Ask the ChronoX Financial Coach a question")
+    parser.add_argument("--suggest", action="store_true", help="Print verified AI/quant auto-budget suggestions")
+    parser.add_argument("--quant", action="store_true", help="Show 30-day cashflow runway & optimal marginal-ROI allocation")
+    parser.add_argument("--days", type=int, default=30, help="Forecast horizon in days for --quant (7-90, default: 30)")
+    parser.add_argument("--credit", action="store_true", help="Show FICO/AZEO credit & debt optimization report")
+    parser.add_argument("--extra", type=float, default=250.0, help="Extra monthly dollars for --credit simulator")
+    parser.add_argument("--goal", nargs=2, metavar=("NAME", "PRICE"), help="Plan a credit-safe goal purchase")
+
+    # Market data backfill options
+    parser.add_argument("--tickers", type=str, help="Comma-separated tickers for backfill (e.g., AAPL,MSFT)")
+    parser.add_argument("--start", type=str, help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", type=str, help="End date (YYYY-MM-DD)")
+    parser.add_argument("--skip-minute", action="store_true", help="Skip 1-minute bars during backfill")
+    parser.add_argument("--flatfiles", action="store_true", help="Use Polygon S3 flat files")
+    return parser.parse_args(argv)
 
 
-def main():
-    """Main entry point."""
-    args = parse_arguments()
-    
-    # Initialize orchestrator
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_arguments(argv)
     orchestrator = ChronoXOrchestrator(config_path=args.config)
-    
     try:
-        # Execute requested action
+        if args.action in ("finance", "gui"):
+            orchestrator.run_finance_app(
+                host=args.host,
+                port=args.port,
+                db_path=args.db,
+                load_demo=args.demo,
+                intelligence_mode=args.mode,
+                ai_provider=args.provider,
+            )
+            return 0
+
+        if args.action == "budget":
+            from chronox_finance.cli import run_cli
+
+            cli_args: List[str] = []
+            if args.db:
+                cli_args.extend(["--db", args.db])
+            if args.mode:
+                cli_args.extend(["--mode", args.mode])
+            if args.provider:
+                cli_args.extend(["--provider", args.provider])
+            if args.quick:
+                cli_args.extend(["add", args.quick])
+            elif args.ask:
+                cli_args.extend(["ask", args.ask])
+            elif args.suggest:
+                cli_args.append("suggest")
+            elif args.quant:
+                cli_args.extend(["quant", "--days", str(args.days)])
+            elif args.credit:
+                cli_args.extend(["credit", "--extra", str(args.extra)])
+            elif args.goal:
+                cli_args.extend(["goal", args.goal[0], args.goal[1]])
+            elif args.demo:
+                cli_args.append("demo")
+            else:
+                cli_args.append("status")
+            return run_cli(cli_args)
+
+        if args.action == "health":
+            report = orchestrator.run_health_check()
+            print("\nChronoX Health Summary")
+            print("-" * 40)
+            for k, v in report.items():
+                print(f"  {k:<26}: {v}")
+            print()
+            return 0
+
         if args.action == "backfill":
             if not args.tickers:
-                print("Error: --tickers required for backfill")
-                sys.exit(1)
-            
-            tickers = [t.strip() for t in args.tickers.split(",")]
-            orchestrator.run_backfill(
+                print("Error: --tickers is required for backfill", file=sys.stderr)
+                return 1
+            tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
+            res = orchestrator.run_backfill(
                 tickers=tickers,
                 start_date=args.start,
-                end_date=args.end,
-                skip_minute=args.skip_minute,
-                use_flatfiles=args.flatfiles
-            )
-        
-        elif args.action == "train":
-            orchestrator.run_training(
-                model_type=args.model,
-                symbols=args.symbols,
-                timeframe=args.timeframe
-            )
-        
-        elif args.action == "backtest":
-            tickers = [t.strip() for t in args.tickers.split(",")] if args.tickers else None
-            orchestrator.run_backtest(
-                start_date=args.start,
                 end_date=args.end or datetime.now().strftime("%Y-%m-%d"),
-                tickers=tickers
+                skip_minute=args.skip_minute,
+                use_flatfiles=args.flatfiles,
             )
-        
-        elif args.action == "paper_trade":
-            orchestrator.run_paper_trading(symbols=args.symbols)
-        
-        elif args.action == "live_trade":
-            # Require explicit confirmation for live trading
-            confirmation = input(
-                "\n⚠️  WARNING: You are about to start LIVE TRADING with REAL MONEY.\n"
-                "Type 'I UNDERSTAND THE RISKS' to proceed: "
-            )
-            if confirmation == "I UNDERSTAND THE RISKS":
-                orchestrator.run_live_trading(symbols=args.symbols)
-            else:
-                print("Live trading cancelled.")
-        
-        elif args.action == "gui":
-            print("\n" + "="*80)
-            print("ChronoX Trading Bot - GUI Mode")
-            print("="*80)
-            print("\nGUI not yet implemented. Use CLI mode:")
-            print("\nExamples:")
-            print("  python main.py --action backfill --tickers AAPL,TSLA,NVDA")
-            print("  python main.py --action train --model transformer --symbols 15")
-            print("  python main.py --action backtest --start 2020-01-01 --end 2023-12-31")
-            print("  python main.py --action paper_trade --symbols 10")
-            print("\nFor full help: python main.py --help")
-            print("="*80 + "\n")
-    
+            print(res)
+            return 0 if res.get("status") != "failed" else 1
+
+        return 0
     except KeyboardInterrupt:
-        print("\n\nInterrupted by user")
-    
-    except Exception as e:
-        orchestrator.logger.error(f"Fatal error: {e}", exc_info=True)
-        sys.exit(1)
-    
+        print("\nStopped cleanly.")
+        return 0
     finally:
         orchestrator.shutdown()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

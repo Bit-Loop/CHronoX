@@ -1,0 +1,1451 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ChronoX Finance — Calm ADHD Auto-Budget &amp; Quant Coach</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230b1220'/%3E%3Ccircle cx='16' cy='16' r='10' fill='none' stroke='%2334d399' stroke-width='2.6' stroke-dasharray='50 13' stroke-linecap='round'/%3E%3Cpath d='M16 10v6l4 2.5' fill='none' stroke='%232dd4bf' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <!-- First-Party Native Desktop Titlebar (progressive enhancement: hidden in browsers, revealed in Electron) -->
+  <div id="desktop-titlebar" class="desktop-titlebar hidden" role="region" aria-label="Application titlebar">
+    <div class="titlebar-left">
+      <div class="vault-status-pill" title="ChronoX local SQLite vault and sidecar status">
+        <span id="titlebar-vault-dot" class="vault-dot" aria-hidden="true"></span>
+        <span id="titlebar-vault-label">Local Vault Active</span>
+      </div>
+    </div>
+    <div class="titlebar-center">
+      <svg class="titlebar-emblem" width="15" height="15" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+        <circle cx="14" cy="14" r="10.5" stroke="currentColor" stroke-width="2.5" stroke-dasharray="52 14" stroke-linecap="round" />
+        <path d="M14 8.5V14L17.8 16.4" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
+      </svg>
+      <span class="titlebar-app-name">ChronoX Finance</span>
+      <span class="titlebar-sep" aria-hidden="true">·</span>
+      <span id="titlebar-view-subtitle" class="titlebar-subtitle">Today</span>
+    </div>
+    <div class="titlebar-right">
+      <button id="btn-desktop-hud" type="button" class="titlebar-hud-btn" title="Open Quick Capture HUD" aria-label="Open Quick Capture HUD">
+        <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+        </svg>
+        <span class="titlebar-hud-label">Quick Capture</span>
+        <kbd id="desktop-hud-kbd" class="titlebar-kbd">Ctrl+Shift+Space</kbd>
+      </button>
+      <div id="desktop-win-controls" class="win-controls hidden" role="group" aria-label="Window controls">
+        <button id="btn-win-minimize" type="button" class="win-btn" title="Minimize" aria-label="Minimize window">
+          <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true">
+            <line x1="6" y1="12" x2="18" y2="12" />
+          </svg>
+        </button>
+        <button id="btn-win-maximize" type="button" class="win-btn" title="Maximize" aria-label="Maximize or restore window">
+          <svg id="win-icon-maximize" class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="6" y="6" width="12" height="12" rx="2" />
+          </svg>
+          <svg id="win-icon-restore" class="ui-icon ui-icon-sm hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="5" y="8" width="11" height="11" rx="1.8" />
+            <path d="M8 8V6.8A1.8 1.8 0 0 1 9.8 5h7.4A1.8 1.8 0 0 1 19 6.8v7.4A1.8 1.8 0 0 1 17.2 16H16" />
+          </svg>
+        </button>
+        <button id="btn-win-close" type="button" class="win-btn win-btn-close" title="Close" aria-label="Close window">
+          <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true">
+            <line x1="7" y1="7" x2="17" y2="17" />
+            <line x1="17" y1="7" x2="7" y2="17" />
+          </svg>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Passcode Lock Overlay -->
+  <div id="lock-overlay" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="lock-title">
+    <div class="lock-card glass-card">
+      <div class="lock-icon" aria-hidden="true">
+        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4" y="11" width="16" height="10" rx="3" />
+          <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+          <circle cx="12" cy="16" r="1.2" fill="currentColor" />
+        </svg>
+      </div>
+      <h2 id="lock-title">ChronoX Finance Locked</h2>
+      <p class="muted small">Enter your local passcode to unlock your calm money dashboard.</p>
+      <form id="unlock-form" class="stack-sm">
+        <input id="unlock-passcode" type="password" autocomplete="current-password" placeholder="Enter local passcode" required />
+        <button type="submit" class="btn btn-primary">Unlock</button>
+        <p id="unlock-error" class="error-text hidden" role="alert"></p>
+      </form>
+    </div>
+  </div>
+
+  <!-- Spotlight Command Palette (Cmd+K / Ctrl+K) -->
+  <div id="cmd-palette-overlay" class="overlay palette-overlay hidden" role="dialog" aria-modal="true" aria-label="Command palette">
+    <div id="cmd-palette-dialog" class="palette-card glass-card">
+      <div class="palette-head">
+        <span class="palette-search-icon" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="7" />
+            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+          </svg>
+        </span>
+        <input
+          id="cmd-palette-input"
+          type="text"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder='Jump, switch mode, or type an expense like "coffee 6.50"...'
+          aria-label="Search commands or quick-add expense"
+        />
+        <button id="cmd-palette-close" type="button" class="kbd-btn" aria-label="Close command palette">ESC</button>
+      </div>
+      <div id="cmd-palette-list" class="palette-list" role="listbox" aria-label="Command results"></div>
+      <div class="palette-foot">
+        <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+        <span><kbd>↵</kbd> run</span>
+        <span><kbd>Esc</kbd> close</span>
+        <span class="palette-hint-right">Tip: type <code>coffee 6.50</code> to quick-log</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Backend Diagnostics Log Viewer Modal (Desktop Mode) -->
+  <div id="desktop-logs-overlay" class="overlay modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="desktop-logs-title">
+    <div id="desktop-logs-dialog" class="modal-card glass-card">
+      <div class="modal-head">
+        <div class="row-gap wrap">
+          <h2 id="desktop-logs-title" class="h-title">
+            <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="4 17 10 11 4 5" />
+              <line x1="12" y1="19" x2="20" y2="19" />
+            </svg>
+            Backend Diagnostics &amp; Logs
+          </h2>
+          <span id="desktop-logs-meta" class="pill pill-calm">Local sidecar</span>
+        </div>
+        <button id="btn-desktop-logs-close" type="button" class="kbd-btn" aria-label="Close backend diagnostics">ESC</button>
+      </div>
+      <div class="modal-body">
+        <div id="desktop-logs-path" class="logs-meta-bar muted small">Sanitized local Python sidecar output (secrets &amp; API keys automatically redacted).</div>
+        <pre id="desktop-logs-pre" class="logs-console" tabindex="0">Loading backend logs…</pre>
+      </div>
+      <div class="modal-foot">
+        <button id="btn-desktop-logs-refresh" type="button" class="btn btn-ghost btn-sm">
+          <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+            <polyline points="21 3 21 9 15 9" />
+          </svg>
+          Refresh
+        </button>
+        <button id="btn-desktop-logs-folder" type="button" class="btn btn-ghost btn-sm">
+          <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+          </svg>
+          Open Data Folder
+        </button>
+        <button id="btn-desktop-logs-copy" type="button" class="btn btn-primary btn-sm">
+          <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="9" y="9" width="13" height="13" rx="2" />
+            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+          </svg>
+          Copy Logs
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Container -->
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="false"></div>
+
+  <div class="app-shell">
+    <!-- Top Header -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg width="26" height="26" viewBox="0 0 28 28" fill="none">
+            <defs>
+              <linearGradient id="chronoxBrandGrad" x1="2" y1="2" x2="26" y2="26" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#34d399" />
+                <stop offset="55%" stop-color="#2dd4bf" />
+                <stop offset="100%" stop-color="#38bdf8" />
+              </linearGradient>
+            </defs>
+            <circle cx="14" cy="14" r="10.5" stroke="url(#chronoxBrandGrad)" stroke-width="2.4" stroke-dasharray="52 14" stroke-linecap="round" />
+            <path d="M14 8.5V14L17.8 16.4" stroke="url(#chronoxBrandGrad)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" />
+            <circle cx="14" cy="14" r="2" fill="url(#chronoxBrandGrad)" />
+          </svg>
+        </div>
+        <div>
+          <h1>ChronoX Finance</h1>
+          <span class="brand-sub">Calm ADHD Auto-Budget &amp; Quant Intelligence</span>
+        </div>
+      </div>
+
+      <div class="topbar-right">
+        <button id="btn-open-palette" class="cmd-trigger" type="button" title="Open Command Palette (Cmd+K / Ctrl+K)" aria-label="Open Command Palette">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="11" cy="11" r="7" />
+            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+          </svg>
+          <span class="cmd-trigger-label">Command…</span>
+          <kbd class="cmd-kbd">⌘K</kbd>
+        </button>
+
+        <div id="xp-pill" class="pill pill-xp" title="ADHD Dopamine Progress">
+          <span id="xp-level">Lv 1</span> · <span id="xp-streak">0w streak</span>
+        </div>
+
+        <button id="btn-sync-now" class="btn btn-ghost btn-sm" type="button" title="Run self-updating budget sync">
+          <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+            <polyline points="21 3 21 9 15 9" />
+          </svg>
+          Sync
+        </button>
+
+        <button id="btn-theme-toggle" class="icon-btn" type="button" title="Switch Light / Dark theme" aria-label="Toggle color theme" aria-pressed="false">
+          <svg id="theme-icon-sun" class="hidden" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="4" />
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
+          </svg>
+          <svg id="theme-icon-moon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+          </svg>
+        </button>
+
+        <button id="btn-demo-quick" class="btn btn-soft btn-sm hidden" type="button">
+          <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z" />
+            <path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15z" />
+          </svg>
+          Load Demo
+        </button>
+
+        <button id="btn-lock-now" class="btn btn-ghost btn-sm hidden" type="button" title="Lock app">
+          <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="4" y="11" width="16" height="10" rx="2.5" />
+            <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+          </svg>
+          Lock
+        </button>
+      </div>
+    </header>
+
+    <!-- Primary Navigation -->
+    <nav id="main-tabbar" class="tabbar" role="tablist" aria-label="Main sections">
+      <div id="tab-indicator" class="tab-indicator" aria-hidden="true"></div>
+      <button id="tab-btn-today" class="tab active" data-tab="today" role="tab" aria-selected="true" aria-controls="tab-today">
+        <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="4" />
+          <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
+        </svg>
+        Today
+      </button>
+      <button id="tab-btn-credit" class="tab" data-tab="credit" role="tab" aria-selected="false" aria-controls="tab-credit">
+        <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="2" y="5" width="20" height="14" rx="2.5" />
+          <line x1="2" y1="10" x2="22" y2="10" />
+          <line x1="6" y1="15" x2="10" y2="15" />
+        </svg>
+        Credit &amp; Debt <span id="badge-credit" class="tab-badge hidden">0</span>
+      </button>
+      <button id="tab-btn-goals" class="tab" data-tab="goals" role="tab" aria-selected="false" aria-controls="tab-goals">
+        <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="9" />
+          <circle cx="12" cy="12" r="5" />
+          <circle cx="12" cy="12" r="1.5" />
+        </svg>
+        Goals &amp; Planner
+      </button>
+      <button id="tab-btn-impulse" class="tab" data-tab="impulse" role="tab" aria-selected="false" aria-controls="tab-impulse">
+        <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <line x1="12" y1="2" x2="12" y2="22" />
+          <line x1="4.93" y1="7" x2="19.07" y2="17" />
+          <line x1="19.07" y1="7" x2="4.93" y2="17" />
+          <polyline points="9 4 12 7 15 4" />
+          <polyline points="9 20 12 17 15 20" />
+        </svg>
+        Impulse Vault <span id="badge-impulse" class="tab-badge hidden">0</span>
+      </button>
+      <button id="tab-btn-reset" class="tab" data-tab="reset" role="tab" aria-selected="false" aria-controls="tab-reset">
+        <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+        </svg>
+        5-Min Reset <span id="badge-triage" class="tab-badge hidden">0</span>
+      </button>
+      <button id="tab-btn-activity" class="tab" data-tab="activity" role="tab" aria-selected="false" aria-controls="tab-activity">
+        <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M4 3h16v18l-2.5-1.5L15 21l-3-1.5L9 21l-2.5-1.5L4 21V3z" />
+          <line x1="8" y1="8" x2="16" y2="8" />
+          <line x1="8" y1="12" x2="16" y2="12" />
+          <line x1="8" y1="16" x2="12" y2="16" />
+        </svg>
+        Activity &amp; Bills
+      </button>
+      <button id="tab-btn-settings" class="tab" data-tab="settings" role="tab" aria-selected="false" aria-controls="tab-settings">
+        <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <line x1="4" y1="6" x2="20" y2="6" />
+          <circle cx="9" cy="6" r="2" />
+          <line x1="4" y1="12" x2="20" y2="12" />
+          <circle cx="15" cy="12" r="2" />
+          <line x1="4" y1="18" x2="20" y2="18" />
+          <circle cx="10" cy="18" r="2" />
+        </svg>
+        AI &amp; Settings
+      </button>
+    </nav>
+
+    <!-- =================================================================== -->
+    <!-- TAB 1: TODAY (FOCUS VIEW — LOW COGNITIVE LOAD)                      -->
+    <!-- =================================================================== -->
+    <main id="tab-today" class="tab-panel active" role="tabpanel" aria-labelledby="tab-btn-today">
+      <!-- Zero-Friction Quick-Add Bar -->
+      <section class="card quick-add-card">
+        <form id="quick-add-form" class="quick-add-row">
+          <input
+            id="quick-add-input"
+            type="text"
+            placeholder='Brain-dump anything: "coffee 6.50", "paycheck +2450", or "impulse 189 keyboard"  (press /)'
+            autocomplete="off"
+            required
+          />
+          <button type="submit" class="btn btn-primary">Log It ↵</button>
+        </form>
+        <div class="chip-row" aria-label="One-tap quick examples">
+          <span class="chip-label">One-tap:</span>
+          <button type="button" class="chip" data-quick="coffee 6.50">
+            <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M17 8h1a4 4 0 0 1 0 8h-1" />
+              <path d="M3 8h14v9a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4V8z" />
+              <line x1="6" y1="2" x2="6" y2="4" />
+              <line x1="10" y1="2" x2="10" y2="4" />
+              <line x1="14" y1="2" x2="14" y2="4" />
+            </svg>
+            Coffee $6.50
+          </button>
+          <button type="button" class="chip" data-quick="groceries 65">
+            <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="9" cy="20" r="1.4" />
+              <circle cx="18" cy="20" r="1.4" />
+              <path d="M2 3h3l2.4 12.2a2 2 0 0 0 2 1.6h8.7a2 2 0 0 0 2-1.6L22 7H6" />
+            </svg>
+            Groceries $65
+          </button>
+          <button type="button" class="chip" data-quick="gas 45">
+            <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 20V5a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2v15" />
+              <line x1="2" y1="20" x2="17" y2="20" />
+              <path d="M15 9h2a2 2 0 0 1 2 2v5a1.5 1.5 0 0 0 3 0V9l-3-3" />
+              <rect x="7" y="6" width="5" height="4" rx="0.8" />
+            </svg>
+            Gas $45
+          </button>
+          <button type="button" class="chip" data-quick="paycheck +2400">
+            <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="2" y="6" width="20" height="12" rx="2" />
+              <circle cx="12" cy="12" r="2.6" />
+              <path d="M6 12h.01M18 12h.01" />
+            </svg>
+            Paycheck +$2400
+          </button>
+          <button type="button" class="chip chip-cool" data-quick="impulse 120 ">
+            <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="12" y1="2" x2="12" y2="22" />
+              <line x1="4.93" y1="7" x2="19.07" y2="17" />
+              <line x1="19.07" y1="7" x2="4.93" y2="17" />
+            </svg>
+            Park Impulse
+          </button>
+        </div>
+      </section>
+
+      <!-- Hero Safe-to-Spend Gauge Ring + Guardrail Pulse -->
+      <section class="hero-grid">
+        <div class="card hero-card">
+          <div class="hero-top">
+            <span class="eyebrow">SAFE TO SPEND TODAY</span>
+            <span id="payday-chip" class="pill pill-calm">Next payday in -- days</span>
+          </div>
+
+          <div class="hero-body">
+            <div class="hero-ring-wrap" role="img" aria-label="Safe to Spend cushion gauge">
+              <svg class="ring-svg hero-ring-svg" viewBox="0 0 132 132">
+                <defs>
+                  <linearGradient id="safeRingGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" stop-color="#34d399" />
+                    <stop offset="55%" stop-color="#2dd4bf" />
+                    <stop offset="100%" stop-color="#38bdf8" />
+                  </linearGradient>
+                </defs>
+                <circle class="ring-track" cx="66" cy="66" r="54" />
+                <circle
+                  id="hero-ring-progress"
+                  class="ring-progress"
+                  cx="66"
+                  cy="66"
+                  r="54"
+                  stroke="url(#safeRingGrad)"
+                  stroke-dasharray="339.292"
+                  stroke-dashoffset="339.292"
+                />
+              </svg>
+              <div class="ring-center">
+                <span id="hero-ring-pct" class="ring-value">0%</span>
+                <span id="hero-ring-label" class="ring-caption">cushion</span>
+              </div>
+            </div>
+
+            <div class="hero-copy">
+              <div id="hero-daily-safe" class="hero-number">$0.00</div>
+              <p class="hero-sub">
+                <strong id="hero-total-safe" class="num-inline">$0.00</strong> safe until <span id="hero-payday-date">--</span>
+                <span class="muted">· Bills, cards &amp; buffer shielded.</span>
+              </p>
+            </div>
+          </div>
+
+          <details class="math-drawer">
+            <summary>Show the exact Safe-to-Spend math</summary>
+            <div id="safe-math-breakdown" class="math-grid"></div>
+          </details>
+        </div>
+
+        <!-- ChronoX Trading Firewall + Credit Pulse + ADHD Win Card -->
+        <div class="card side-hero-card">
+          <div class="mini-block">
+            <span class="eyebrow">CHRONOX INVEST / TRADING GUARDRAIL</span>
+            <div id="hero-safe-invest" class="metric-md">$0.00</div>
+            <p class="muted small">
+              Hard cap available for investing/trading AFTER rent, upcoming bills, cards &amp; buffer are 100% protected.
+            </p>
+          </div>
+          <hr class="divider" />
+          <div class="mini-block">
+            <div class="item-row">
+              <span class="eyebrow">CREDIT &amp; GOAL PULSE</span>
+              <div class="row-gap">
+                <button type="button" class="btn btn-ghost btn-xs" data-goto-tab="credit">Credit →</button>
+                <button type="button" class="btn btn-ghost btn-xs" data-goto-tab="goals">Goals →</button>
+              </div>
+            </div>
+            <div id="hero-credit-pulse" class="small muted">Add cards in Credit &amp; Debt to unlock AZEO &amp; payoff plans.</div>
+          </div>
+          <hr class="divider" />
+          <div class="mini-block">
+            <span class="eyebrow">ADHD DOPAMINE WINS</span>
+            <div class="win-row">
+              <div>
+                <div id="hero-impulse-saved" class="metric-sm">$0.00</div>
+                <span class="muted small">saved from skipped impulses</span>
+              </div>
+              <div class="win-badge-col">
+                <div id="hero-level-title" class="pill pill-soft">Calm Starter</div>
+                <div id="hero-grace-note" class="muted small">1 grace freeze ready</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 1-Click Zero-Guilt Rebalance Banner (only shown if a jar dipped) -->
+      <section id="rebalance-banner" class="card calm-banner hidden"></section>
+
+      <!-- Visual 5-Jar Envelope Grid -->
+      <section class="section-block">
+        <div class="section-head">
+          <h2>Your 5 Calm Money Jars</h2>
+          <span class="muted small">Self-updating automatically from income, bills &amp; 3-month reality</span>
+        </div>
+        <div id="jars-grid" class="jars-grid"></div>
+      </section>
+
+      <!-- Interactive 30-Day Cashflow Runway & Quant Intelligence Panel -->
+      <section id="quant-runway-card" class="card section-block quant-card">
+        <div class="section-head">
+          <div>
+            <div class="row-gap wrap">
+              <h2 class="h-title">
+                <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <polyline points="22 7 13.5 15.5 8.5 10.5 2 17" />
+                  <polyline points="16 7 22 7 22 13" />
+                </svg>
+                Cashflow Runway &amp; Quant Intelligence
+              </h2>
+              <span id="quant-status-pill" class="pill pill-calm">Calculating…</span>
+            </div>
+            <p class="muted small">
+              Exact day-by-day balance projection, volatility confidence band &amp; marginal-ROI surplus allocation.
+            </p>
+          </div>
+          <div class="segmented segmented-sm" role="group" aria-label="Forecast horizon">
+            <button id="quant-horizon-30" type="button" class="seg-btn active" data-quant-days="30" aria-pressed="true">30D</button>
+            <button id="quant-horizon-60" type="button" class="seg-btn" data-quant-days="60" aria-pressed="false">60D</button>
+          </div>
+        </div>
+
+        <!-- Quant KPI Micro-Strip -->
+        <div class="quant-kpi-strip">
+          <div class="quant-kpi">
+            <span class="eyebrow">LOWEST NADIR</span>
+            <div id="quant-nadir-val" class="quant-kpi-val">$0.00</div>
+            <span id="quant-nadir-date" class="muted small">--</span>
+          </div>
+          <div class="quant-kpi">
+            <span class="eyebrow">ENDING BALANCE</span>
+            <div id="quant-ending-val" class="quant-kpi-val">$0.00</div>
+            <span id="quant-ending-delta" class="muted small">--</span>
+          </div>
+          <div class="quant-kpi">
+            <span class="eyebrow">VOLATILITY &amp; BAND</span>
+            <div id="quant-stability-val" class="quant-kpi-val">--/100</div>
+            <span id="quant-confidence-band" class="muted small">P50 / P90 daily safe</span>
+          </div>
+          <div class="quant-kpi">
+            <span class="eyebrow">STATISTICAL CUSHION</span>
+            <div id="quant-rec-buffer-val" class="quant-kpi-val">$0.00</div>
+            <span id="quant-rec-buffer-note" class="muted small">Dynamic emergency target</span>
+          </div>
+        </div>
+
+        <!-- Apple Stocks-Style Interactive Scrub Bar -->
+        <div class="quant-scrub-bar" aria-live="polite">
+          <div class="quant-scrub-main">
+            <span id="quant-scrub-date" class="quant-scrub-date">Hover or focus any day</span>
+            <strong id="quant-scrub-balance" class="quant-scrub-bal">$0.00</strong>
+            <span id="quant-scrub-flow" class="quant-scrub-flow muted small"></span>
+          </div>
+          <div id="quant-scrub-events" class="row-gap wrap"></div>
+        </div>
+
+        <!-- Pure SVG Area + Line Chart Container -->
+        <div id="quant-chart-wrap" class="quant-chart-wrap" aria-label="Projected daily cashflow chart"></div>
+
+        <!-- Overdraft Shield / Payday Crunch Calm Notice -->
+        <div id="quant-crunch-notice" class="notice-bar quant-crunch hidden"></div>
+
+        <!-- Optimal Marginal-ROI Surplus Allocation -->
+        <div class="quant-alloc-section">
+          <div class="section-head">
+            <h3>Optimal Marginal-ROI Surplus Allocation</h3>
+            <span class="muted small">Every marginal dollar ranked by guaranteed APR &amp; FICO tier impact</span>
+          </div>
+          <div id="quant-alloc-grid" class="alloc-grid"></div>
+        </div>
+      </section>
+
+      <!-- Verified Intelligence Coach + 14-Day Bill Radar -->
+      <section class="two-col">
+        <div class="card coach-card">
+          <div class="section-head">
+            <div>
+              <h2>Intelligence Coach</h2>
+              <span id="ai-source-badge" class="pill pill-soft">Loading…</span>
+            </div>
+            <button id="btn-refresh-ai" class="btn btn-ghost btn-sm" type="button">
+              <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                <polyline points="21 3 21 9 15 9" />
+              </svg>
+              Refresh
+            </button>
+          </div>
+
+          <!-- 3-Mode Intelligence Switcher -->
+          <div id="coach-mode-switcher" class="segmented mode-switcher" role="group" aria-label="Intelligence mode">
+            <button type="button" class="seg-btn" data-set-mode="deterministic_only" aria-pressed="false">
+              <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="4" y="2" width="16" height="20" rx="2.5" />
+                <line x1="8" y1="6" x2="16" y2="6" />
+                <path d="M8 11h.01M12 11h.01M16 11h.01M8 15h.01M12 15h.01M16 15h.01M8 19h4" />
+              </svg>
+              Quant Math
+            </button>
+            <button type="button" class="seg-btn active" data-set-mode="hybrid" aria-pressed="true">
+              <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+              </svg>
+              Hybrid
+            </button>
+            <button type="button" class="seg-btn" data-set-mode="ai_standalone" aria-pressed="false">
+              <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z" />
+              </svg>
+              AI Only
+            </button>
+          </div>
+
+          <p id="ai-notice" class="notice-bar hidden"></p>
+          <div id="ai-suggestions-list" class="stack-sm"></div>
+
+          <hr class="divider" />
+          <form id="ask-coach-form" class="ask-row">
+            <input
+              id="ask-coach-input"
+              type="text"
+              placeholder='Ask Coach: "Can I afford a $1,000 laptop without hurting my score?"'
+              autocomplete="off"
+              required
+            />
+            <button type="submit" class="btn btn-soft">Ask</button>
+          </form>
+          <div id="ask-coach-answer" class="coach-answer hidden" aria-live="polite"></div>
+        </div>
+
+        <div class="card">
+          <div class="section-head">
+            <div>
+              <h2>14-Day Bill Radar</h2>
+              <span class="muted small">Auto-detected so nothing ambushes you</span>
+            </div>
+            <span id="bills-total-pill" class="pill pill-blue">$0.00 due</span>
+          </div>
+          <div id="bill-radar-list" class="stack-sm"></div>
+        </div>
+      </section>
+    </main>
+
+    <!-- =================================================================== -->
+    <!-- TAB 2: CREDIT SCORE & DEBT OPTIMIZER (NICHE FICO/AZEO ADVISOR)      -->
+    <!-- =================================================================== -->
+    <main id="tab-credit" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-credit">
+      <!-- Top 4 Credit Health Metrics with Apple Card Utilization Arc Ring -->
+      <section class="stat-strip">
+        <div class="card stat-tile stat-tile-ring">
+          <div class="mini-ring-wrap" role="img" aria-label="Credit utilization gauge">
+            <svg class="ring-svg mini-ring-svg" viewBox="0 0 88 88">
+              <circle class="ring-track" cx="44" cy="44" r="35" />
+              <circle
+                id="cred-ring-progress"
+                class="ring-progress"
+                cx="44"
+                cy="44"
+                r="35"
+                stroke-dasharray="219.911"
+                stroke-dashoffset="219.911"
+              />
+            </svg>
+            <div class="ring-center">
+              <span id="cred-agg-util" class="mini-ring-val">0.0%</span>
+            </div>
+          </div>
+          <div class="stat-tile-body">
+            <span class="eyebrow">AGGREGATE UTILIZATION</span>
+            <span id="cred-agg-tier" class="pill pill-soft">No cards yet</span>
+          </div>
+        </div>
+        <div class="card stat-tile">
+          <span class="eyebrow">DEBT-TO-INCOME (DTI)</span>
+          <div id="cred-dti" class="metric-md">0.0%</div>
+          <span id="cred-dti-tier" class="pill pill-soft">Healthy</span>
+        </div>
+        <div class="card stat-tile">
+          <span class="eyebrow">TOTAL DEBT &amp; INTEREST BURN</span>
+          <div id="cred-total-debt" class="metric-md">$0.00</div>
+          <span id="cred-interest-burn" class="muted small">$0.00/mo interest</span>
+        </div>
+        <div class="card stat-tile">
+          <span class="eyebrow">AUTOPAY &amp; ACCOUNT AGE</span>
+          <div id="cred-autopay-stat" class="metric-md">All Safe</div>
+          <span id="cred-age-stat" class="muted small">Avg age: --</span>
+        </div>
+      </section>
+
+      <!-- Niche Advisor Alerts + AZEO Statement-Close Calendar -->
+      <section class="two-col">
+        <div class="card">
+          <div class="section-head">
+            <div>
+              <h2 class="h-title">
+                <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 2l7 4v6c0 5-3.5 8.5-7 10-3.5-1.5-7-5-7-10V6l7-4z" />
+                  <polyline points="9 12 11 14 15 10" />
+                </svg>
+                Niche Credit &amp; Debt Advisor
+              </h2>
+              <span class="muted small">FICO cliffs, grace-period traps, promo APR deadlines &amp; autopay shields</span>
+            </div>
+          </div>
+          <div id="credit-alerts-list" class="stack-sm"></div>
+        </div>
+
+        <div class="card">
+          <div class="section-head">
+            <div>
+              <h2 class="h-title">
+                <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="3" y="4" width="18" height="18" rx="2.5" />
+                  <line x1="16" y1="2" x2="16" y2="6" />
+                  <line x1="8" y1="2" x2="8" y2="6" />
+                  <line x1="3" y1="10" x2="21" y2="10" />
+                </svg>
+                AZEO Statement-Close Calendar
+              </h2>
+              <span class="muted small">Pay 3 days BEFORE statement closing date (when bureaus snapshot balances!)</span>
+            </div>
+          </div>
+          <div id="credit-azeo-list" class="stack-sm"></div>
+        </div>
+      </section>
+
+      <!-- 4-Strategy Debt Payoff Arena -->
+      <section class="card section-block">
+        <div class="section-head">
+          <div>
+            <h2 class="h-title">
+              <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polygon points="12 2 2 7 12 12 22 7 12 2" />
+                <polyline points="2 12 12 17 22 12" />
+                <polyline points="2 17 12 22 22 17" />
+              </svg>
+              4-Strategy Debt Payoff Simulator
+            </h2>
+            <p class="muted small">Compare ADHD Hybrid, Credit-First FICO Turbo, Avalanche, and Snowball with exact monthly amortization.</p>
+          </div>
+          <form id="debt-extra-form" class="row-gap">
+            <label class="muted small" for="debt-extra-input">Extra $/mo:</label>
+            <input id="debt-extra-input" type="number" step="25" min="0" value="250" class="input-xs" />
+            <button type="submit" class="btn btn-soft btn-sm">Recalculate</button>
+          </form>
+        </div>
+        <div id="debt-strategies-grid" class="jars-grid"></div>
+      </section>
+
+      <!-- Credit Lines & Loans Manager + Balance Transfer Breakeven -->
+      <section class="two-col section-block">
+        <div class="card">
+          <h2 class="h-title">
+            <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="2" y="5" width="20" height="14" rx="2.5" />
+              <line x1="2" y1="10" x2="22" y2="10" />
+            </svg>
+            Your Credit Cards &amp; Loans
+          </h2>
+          <div id="credit-lines-list" class="stack-sm"></div>
+          <hr class="divider" />
+          <h3>Add Credit Card or Loan</h3>
+          <form id="credit-line-form" class="form-grid-compact">
+            <input id="cl-name" type="text" placeholder="Card / Loan name" required />
+            <select id="cl-kind">
+              <option value="credit_card">Credit Card</option>
+              <option value="student_loan">Student Loan</option>
+              <option value="auto_loan">Auto Loan</option>
+              <option value="personal_loan">Personal Loan</option>
+              <option value="bnpl">BNPL / Installment</option>
+              <option value="medical">Medical Debt</option>
+            </select>
+            <input id="cl-balance" type="number" step="0.01" min="0" placeholder="Balance ($)" required />
+            <input id="cl-limit" type="number" step="1" min="0" placeholder="Limit ($; 0 for loan)" value="0" />
+            <input id="cl-apr" type="number" step="0.01" min="0" max="99" placeholder="APR (%)" value="24.99" required />
+            <input id="cl-close-day" type="number" min="1" max="31" placeholder="Stmt Close Day (1-31)" value="15" />
+            <input id="cl-due-day" type="number" min="1" max="31" placeholder="Due Day (1-31)" value="10" />
+            <select id="cl-autopay">
+              <option value="statement">Autopay: Statement</option>
+              <option value="minimum">Autopay: Minimum</option>
+              <option value="full">Autopay: Full Balance</option>
+              <option value="none">Autopay: OFF</option>
+            </select>
+            <input id="cl-promo-ends" type="date" title="0% Promo APR End Date (optional)" />
+            <input id="cl-opened" type="date" title="Account Opened Date (for AAoA)" />
+            <label class="checkbox-row">
+              <input id="cl-grace" type="checkbox" checked />
+              <span>Active grace period</span>
+            </label>
+            <button type="submit" class="btn btn-primary">Add Credit Line</button>
+          </form>
+        </div>
+
+        <div class="card">
+          <h2 class="h-title">
+            <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="17 1 21 5 17 9" />
+              <path d="M3 11V9a4 4 0 0 1 4-4h14" />
+              <polyline points="7 23 3 19 7 15" />
+              <path d="M21 13v2a4 4 0 0 1-4 4H3" />
+            </svg>
+            0% Balance Transfer Breakeven Calc
+          </h2>
+          <p class="muted small">Check exact math before paying a 3–5% transfer fee.</p>
+          <form id="bt-form" class="form-grid-compact">
+            <label class="field"><span>Balance ($)</span><input id="bt-balance" type="number" step="10" min="50" value="1680" required /></label>
+            <label class="field"><span>Current APR (%)</span><input id="bt-apr" type="number" step="0.01" min="0" value="26.99" required /></label>
+            <label class="field"><span>Transfer Fee (%)</span><input id="bt-fee" type="number" step="0.1" min="0" max="15" value="3.0" required /></label>
+            <label class="field"><span>0% Promo Months</span><input id="bt-months" type="number" min="3" max="36" value="15" required /></label>
+            <label class="field"><span>Planned $/mo</span><input id="bt-pay" type="number" step="10" min="25" value="200" required /></label>
+            <button type="submit" class="btn btn-soft align-end">Check Breakeven</button>
+          </form>
+          <div id="bt-result" class="coach-answer hidden" aria-live="polite"></div>
+        </div>
+      </section>
+    </main>
+
+    <!-- =================================================================== -->
+    <!-- TAB 3: GOAL OPTIMIZER & CREDIT-SAFE PURCHASE PLANNER                -->
+    <!-- =================================================================== -->
+    <main id="tab-goals" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-goals">
+      <section class="card">
+        <h2 class="h-title">
+          <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" />
+            <circle cx="12" cy="12" r="5" />
+            <circle cx="12" cy="12" r="1.5" />
+          </svg>
+          Credit-Safe Goal &amp; Purchase Optimizer
+        </h2>
+        <p class="muted">
+          Want a $1,000 gadget, trip, or emergency cushion? Enter it below to get 3 exact math-verified paths that keep your auto-budget protected AND abide by FICO/AZEO credit rules.
+        </p>
+        <form id="goal-plan-form" class="form-grid">
+          <input id="gp-name" type="text" placeholder="What do you want? (e.g. $1000 Mac Mini / Gadget)" required />
+          <input id="gp-price" type="number" step="0.01" min="1" placeholder="Target ($)" value="1000" required />
+          <input id="gp-saved" type="number" step="0.01" min="0" placeholder="Already saved ($)" value="0" />
+          <input id="gp-date" type="date" title="Target date (optional)" />
+          <button type="submit" class="btn btn-primary">
+            <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z" />
+            </svg>
+            Optimize Plan
+          </button>
+        </form>
+        <div id="goal-plan-output" class="section-block hidden"></div>
+      </section>
+
+      <section class="section-block">
+        <div class="section-head">
+          <h3>Your Tracked Goals</h3>
+          <span class="muted small">Tap +$50 anytime to build momentum &amp; earn Dopamine XP</span>
+        </div>
+        <div id="goals-grid" class="jars-grid"></div>
+      </section>
+    </main>
+
+    <!-- =================================================================== -->
+    <!-- TAB 4: IMPULSE COOLING-OFF VAULT                                    -->
+    <!-- =================================================================== -->
+    <main id="tab-impulse" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-impulse">
+      <section class="card">
+        <h2 class="h-title">
+          <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="12" y1="2" x2="12" y2="22" />
+            <line x1="4.93" y1="7" x2="19.07" y2="17" />
+            <line x1="19.07" y1="7" x2="4.93" y2="17" />
+            <polyline points="9 4 12 7 15 4" />
+            <polyline points="9 20 12 17 15 20" />
+          </svg>
+          Impulse Cooling-Off Vault ("Park It, Don't Fight It")
+        </h2>
+        <p class="muted">
+          Telling an ADHD brain "NO" backfires. Park the craving here for 48 hours instead — if you still genuinely want it when the timer ends and it fits Safe-to-Spend, buy guilt-free. If the urge fades, claim your Dopamine Win!
+        </p>
+        <form id="impulse-form" class="form-grid">
+          <input id="imp-name" type="text" placeholder="What are you tempted to buy?" required />
+          <input id="imp-price" type="number" step="0.01" min="0.50" placeholder="Price ($)" required />
+          <select id="imp-hours">
+            <option value="24">24h cooldown</option>
+            <option value="48" selected>48h cooldown (recommended)</option>
+            <option value="72">72h cooldown</option>
+            <option value="168">7-day big-purchase shield</option>
+          </select>
+          <input id="imp-reason" type="text" placeholder="Trigger / note (optional, e.g. late-night scroll)" />
+          <button type="submit" class="btn btn-primary">
+            <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="12" y1="2" x2="12" y2="22" />
+              <line x1="4.93" y1="7" x2="19.07" y2="17" />
+              <line x1="19.07" y1="7" x2="4.93" y2="17" />
+            </svg>
+            Park It (+15 XP)
+          </button>
+        </form>
+      </section>
+
+      <section class="section-block">
+        <div class="section-head">
+          <h3>Parked Items</h3>
+          <span id="impulse-vault-stats" class="muted small"></span>
+        </div>
+        <div id="impulse-list" class="jars-grid"></div>
+      </section>
+
+      <section class="card section-block">
+        <div class="section-head">
+          <h3 class="h-title">
+            <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6" />
+              <path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18" />
+              <path d="M4 22h16" />
+              <path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22" />
+              <path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22" />
+              <path d="M18 2H6v7a6 6 0 0 0 12 0V2z" />
+            </svg>
+            Recent ADHD Dopamine Wins
+          </h3>
+          <span class="muted small">Every pause, skip &amp; reset counts</span>
+        </div>
+        <div id="dopamine-wins-list" class="stack-xs"></div>
+      </section>
+    </main>
+
+    <!-- =================================================================== -->
+    <!-- TAB 5: 5-MINUTE WEEKLY MONEY RESET WIZARD                           -->
+    <!-- =================================================================== -->
+    <main id="tab-reset" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-reset">
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2 class="h-title">
+              <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+              </svg>
+              5-Minute Weekly Money Reset
+            </h2>
+            <p class="muted">Short, forgiving, and high-dopamine. Zero long spreadsheets.</p>
+          </div>
+          <span id="reset-status-pill" class="pill pill-soft">Ready</span>
+        </div>
+
+        <div class="reset-steps">
+          <div class="reset-step">
+            <h3>1. Quick 1-Tap Triage</h3>
+            <p class="muted small">Pick a jar once and ChronoX remembers that merchant forever.</p>
+            <div id="reset-triage-list" class="stack-sm"></div>
+          </div>
+
+          <div class="reset-step">
+            <h3>2. Subscription &amp; Bill Check</h3>
+            <p class="muted small">Spot silent price hikes or subscriptions you forgot existed.</p>
+            <div id="reset-subs-list" class="stack-sm"></div>
+          </div>
+
+          <div class="reset-step">
+            <h3>3. Matured Impulse Vault Wins</h3>
+            <p class="muted small">Claim money kept when cravings cooled off.</p>
+            <div id="reset-impulses-list" class="stack-sm"></div>
+          </div>
+
+          <div class="reset-step">
+            <h3>4. Zero-Guilt Auto-Rebalance &amp; Lock In Your Week</h3>
+            <div id="reset-rebalance-list" class="stack-sm"></div>
+            <div class="reset-cta">
+              <button id="btn-complete-reset" type="button" class="btn btn-primary btn-lg">
+                <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+                  <polyline points="22 4 12 14.01 9 11.01" />
+                </svg>
+                Complete Weekly Reset (+100 XP &amp; Protect Streak)
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- =================================================================== -->
+    <!-- TAB 6: ACTIVITY, ACCOUNTS, CSV IMPORT & BILLS                       -->
+    <!-- =================================================================== -->
+    <main id="tab-activity" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-activity">
+      <section class="two-col">
+        <!-- Accounts -->
+        <div class="card">
+          <div class="section-head">
+            <h2>Accounts</h2>
+            <span class="muted small">Exact integer-cent tracking</span>
+          </div>
+          <div id="accounts-list" class="stack-sm"></div>
+          <hr class="divider" />
+          <form id="account-form" class="form-grid-compact">
+            <input id="acct-name" type="text" placeholder="Account name" required />
+            <select id="acct-type">
+              <option value="checking">Checking</option>
+              <option value="savings">Savings</option>
+              <option value="credit">Credit Card</option>
+              <option value="cash">Cash</option>
+              <option value="trading">ChronoX Trading</option>
+            </select>
+            <input id="acct-balance" type="number" step="0.01" placeholder="Balance ($)" required />
+            <button type="submit" class="btn btn-soft">Add Account</button>
+          </form>
+        </div>
+
+        <!-- Multi-Format Bank Statement Ingestion -->
+        <div class="card">
+          <div class="section-head">
+            <h2>Universal Statement Import</h2>
+            <a id="btn-export-csv-link" href="/api/export/csv" class="btn btn-ghost btn-sm">
+              <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+              Export CSV
+            </a>
+          </div>
+          <p class="muted small">
+            Auto-detects Chase, BofA, Capital One, Amex, Wells Fargo, Mint, YNAB, OFX/QFX, QIF &amp; JSON. Deduplicates via FITID/SHA-256 and separates internal transfers.
+          </p>
+          <form id="csv-upload-form" class="stack-sm">
+            <div class="row-gap wrap">
+              <input id="csv-file-input" class="grow" type="file" accept=".csv,.tsv,.ofx,.qfx,.qif,.json,text/csv,application/json" />
+              <button id="btn-desktop-import-dialog" type="button" class="btn btn-ghost btn-sm hidden">
+                <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                </svg>
+                Native Picker
+              </button>
+            </div>
+            <div id="desktop-selected-statement" class="notice-bar hidden" aria-live="polite"></div>
+            <label class="checkbox-row">
+              <input id="csv-flip-sign" type="checkbox" />
+              <span>Flip sign (if bank exports expenses as positive numbers)</span>
+            </label>
+            <label class="checkbox-row">
+              <input id="csv-detect-transfers" type="checkbox" checked />
+              <span>Auto-detect internal credit card payments/transfers</span>
+            </label>
+            <label class="checkbox-row">
+              <input id="csv-sync-balance" type="checkbox" />
+              <span>Sync account balance from OFX/QFX ledger balance if present</span>
+            </label>
+            <div class="row-gap wrap">
+              <button id="btn-preview-statement" type="button" class="btn btn-soft">
+                <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z" />
+                  <circle cx="12" cy="12" r="3" />
+                </svg>
+                Preview First
+              </button>
+              <button type="submit" class="btn btn-primary">Import &amp; Auto-Update</button>
+            </div>
+          </form>
+          <div id="csv-import-result" class="notice-bar hidden" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <!-- Transactions Table with Search, Filter & Inline Edit/Delete -->
+      <section class="card section-block">
+        <div class="section-head">
+          <div class="row-gap wrap">
+            <h2>Recent Activity</h2>
+            <span id="tx-count-pill" class="pill pill-soft">0 items</span>
+          </div>
+          <div class="row-gap wrap tx-filter-bar">
+            <input id="tx-search" type="search" placeholder="Search merchant or memo…" aria-label="Search transactions" />
+            <select id="tx-jar-filter" aria-label="Filter by jar">
+              <option value="">All Jars</option>
+            </select>
+          </div>
+        </div>
+        <details class="math-drawer details-spacer">
+          <summary>+ Detailed transaction entry (choose account, jar &amp; date)</summary>
+          <form id="manual-tx-form" class="form-grid-compact details-body">
+            <select id="manual-tx-type">
+              <option value="expense">Expense</option>
+              <option value="income">Income</option>
+            </select>
+            <input id="manual-tx-merchant" type="text" placeholder="Merchant / source" required />
+            <input id="manual-tx-amount" type="number" step="0.01" min="0.01" placeholder="Amount ($)" required />
+            <input id="manual-tx-date" type="date" required />
+            <select id="manual-tx-account"></select>
+            <select id="manual-tx-jar"></select>
+            <input id="manual-tx-memo" type="text" placeholder="Memo (optional)" />
+            <button type="submit" class="btn btn-primary">Save Entry</button>
+          </form>
+        </details>
+        <div class="table-wrap">
+          <table class="tx-table">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Merchant &amp; Memo</th>
+                <th>Jar (auto-learns)</th>
+                <th class="num">Amount</th>
+                <th class="num">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="tx-table-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Recurring Bills + Auto-Budget Audit Log -->
+      <section class="two-col section-block">
+        <div class="card">
+          <div class="section-head">
+            <h2>Recurring Bills &amp; Subscriptions</h2>
+            <span id="all-bills-count" class="pill pill-soft">0 active</span>
+          </div>
+          <div id="bill-anomalies-list" class="stack-xs details-spacer"></div>
+          <div id="all-bills-list" class="stack-xs"></div>
+          <hr class="divider" />
+          <h3>Add Recurring Bill / Subscription</h3>
+          <form id="bill-form" class="form-grid-compact">
+            <input id="bill-name" type="text" placeholder="Bill name (e.g. Rent)" required />
+            <input id="bill-amount" type="number" step="0.01" min="0.50" placeholder="Amount ($)" required />
+            <select id="bill-cadence">
+              <option value="monthly" selected>Monthly</option>
+              <option value="biweekly">Bi-weekly</option>
+              <option value="weekly">Weekly</option>
+              <option value="quarterly">Quarterly</option>
+              <option value="annual">Annual</option>
+            </select>
+            <input id="bill-due" type="date" required />
+            <label class="checkbox-row">
+              <input id="bill-is-sub" type="checkbox" />
+              <span>Subscription</span>
+            </label>
+            <button type="submit" class="btn btn-soft">Save Bill</button>
+          </form>
+        </div>
+
+        <div class="card">
+          <h2>Self-Updating Budget Audit Log</h2>
+          <p class="muted small">Every automatic adjustment explained transparently.</p>
+          <div id="audit-log-list" class="stack-xs"></div>
+        </div>
+      </section>
+    </main>
+
+    <!-- =================================================================== -->
+    <!-- TAB 7: AI PROVIDERS, INTELLIGENCE MODE & ADHD SETTINGS / SECURITY   -->
+    <!-- =================================================================== -->
+    <main id="tab-settings" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-settings">
+      <!-- Intelligence Mode & Active Provider Control Bar -->
+      <section class="card intelligence-hub-card">
+        <div class="section-head">
+          <div>
+            <h2 class="h-title">
+              <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="4" y="4" width="16" height="16" rx="2.5" />
+                <rect x="9" y="9" width="6" height="6" rx="1" />
+                <path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 15h3M1 9h3M1 15h3" />
+              </svg>
+              Intelligence Engine &amp; Provider Routing
+            </h2>
+            <p class="muted small">
+              Switch effortlessly between pure optimal deterministic math, verified hybrid AI, or standalone AI.
+            </p>
+          </div>
+          <span id="active-provider-badge" class="pill pill-calm">Active: Quant Math</span>
+        </div>
+
+        <div class="hub-controls-grid">
+          <div class="field">
+            <span>Intelligence Mode</span>
+            <div id="settings-mode-switcher" class="segmented" role="group" aria-label="Settings intelligence mode">
+              <button type="button" class="seg-btn" data-set-mode="deterministic_only" aria-pressed="false">
+                <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="4" y="2" width="16" height="20" rx="2.5" />
+                  <line x1="8" y1="6" x2="16" y2="6" />
+                  <path d="M8 11h.01M12 11h.01M16 11h.01M8 15h.01M12 15h.01M16 15h.01M8 19h4" />
+                </svg>
+                Quant Math
+              </button>
+              <button type="button" class="seg-btn active" data-set-mode="hybrid" aria-pressed="true">
+                <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+                </svg>
+                Hybrid
+              </button>
+              <button type="button" class="seg-btn" data-set-mode="ai_standalone" aria-pressed="false">
+                <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z" />
+                </svg>
+                AI Only
+              </button>
+            </div>
+            <p id="settings-mode-desc" class="muted small">
+              Combines exact optimal quant math with AI synthesis and strict mathematical validation.
+            </p>
+          </div>
+
+          <div class="field">
+            <span>Preferred Cloud AI Provider</span>
+            <div id="settings-provider-switcher" class="segmented" role="group" aria-label="Active AI provider">
+              <button type="button" class="seg-btn active" data-set-provider="auto" aria-pressed="true">Auto</button>
+              <button type="button" class="seg-btn" data-set-provider="opencode_go" aria-pressed="false">OpenCode Go</button>
+              <button type="button" class="seg-btn" data-set-provider="gemini" aria-pressed="false">Google Gemini</button>
+            </div>
+            <p class="muted small">
+              <code>Auto</code> prefers OpenCode Go when configured, seamlessly falling back to Gemini or local Quant Math.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Dual AI Provider Cards: OpenCode Go + Google Gemini -->
+      <section class="two-col">
+        <!-- OpenCode Go Subscription Panel -->
+        <div class="card">
+          <div class="section-head">
+            <div>
+              <h2 class="h-title">
+                <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <polyline points="4 17 10 11 4 5" />
+                  <line x1="12" y1="19" x2="20" y2="19" />
+                </svg>
+                OpenCode Go
+              </h2>
+              <span class="muted small">Subscription API · local <code>0600</code> key storage</span>
+            </div>
+            <span id="key-status-badge" class="pill pill-soft">Not set</span>
+          </div>
+          <form id="opencode-settings-form" class="stack-sm">
+            <label class="field">
+              <span>OpenCode Go API Key (write-only, never echoed back)</span>
+              <input id="set-opencode-key" type="password" autocomplete="off" placeholder="Paste OPENCODE_GO_API_KEY (leave blank to keep current)" />
+            </label>
+            <label class="field">
+              <span>API Base URL</span>
+              <input id="set-opencode-url" type="url" value="https://opencode.ai/zen/go/v1" required />
+            </label>
+            <div class="row-gap">
+              <label class="field grow">
+                <span>Model</span>
+                <select id="set-opencode-model"></select>
+              </label>
+              <button id="btn-fetch-models" type="button" class="btn btn-ghost align-end">
+                <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                  <polyline points="21 3 21 9 15 9" />
+                </svg>
+                Live Models
+              </button>
+            </div>
+            <div class="row-gap">
+              <label class="field grow">
+                <span>Protocol</span>
+                <select id="set-opencode-proto">
+                  <option value="auto">Auto (OpenAI + Anthropic fallback)</option>
+                  <option value="openai">OpenAI /chat/completions</option>
+                  <option value="anthropic">Anthropic /messages</option>
+                </select>
+              </label>
+              <label class="field grow">
+                <span>Daily Quota Guard</span>
+                <input id="set-opencode-quota" type="number" min="1" max="500" value="60" />
+              </label>
+            </div>
+            <div class="row-gap wrap">
+              <button type="submit" class="btn btn-primary">Save OpenCode Go</button>
+              <button id="btn-test-opencode" type="button" class="btn btn-soft">Test Connection</button>
+              <button id="btn-clear-opencode-key" type="button" class="btn btn-ghost btn-sm">Clear Key</button>
+            </div>
+          </form>
+          <div id="opencode-test-result" class="notice-bar hidden" aria-live="polite"></div>
+        </div>
+
+        <!-- Google Gemini Optional Provider Panel -->
+        <div class="card">
+          <div class="section-head">
+            <div>
+              <h2 class="h-title">
+                <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z" />
+                  <path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15z" />
+                </svg>
+                Google Gemini (Optional)
+              </h2>
+              <span class="muted small">Direct <code>x-goog-api-key</code> header · local <code>0600</code> key storage</span>
+            </div>
+            <span id="gemini-key-status-badge" class="pill pill-soft">Not set</span>
+          </div>
+          <form id="gemini-settings-form" class="stack-sm">
+            <label class="field">
+              <span>Google Gemini API Key (write-only, never echoed back)</span>
+              <input id="set-gemini-key" type="password" autocomplete="off" placeholder="Paste GEMINI_API_KEY (leave blank to keep current)" />
+            </label>
+            <label class="field">
+              <span>Gemini API Base URL</span>
+              <input id="set-gemini-url" type="url" value="https://generativelanguage.googleapis.com/v1beta" required />
+            </label>
+            <div class="row-gap">
+              <label class="field grow">
+                <span>Gemini Model</span>
+                <select id="set-gemini-model"></select>
+              </label>
+              <button id="btn-fetch-gemini-models" type="button" class="btn btn-ghost align-end">
+                <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                  <polyline points="21 3 21 9 15 9" />
+                </svg>
+                Live Models
+              </button>
+            </div>
+            <p class="muted small">
+              Optional: use Google AI Studio keys or set <code>GEMINI_API_KEY</code> in your environment. Keys are never written to backups or URLs.
+            </p>
+            <div class="row-gap wrap">
+              <button type="submit" class="btn btn-primary">Save Gemini Settings</button>
+              <button id="btn-test-gemini" type="button" class="btn btn-soft">Test Gemini</button>
+              <button id="btn-clear-gemini-key" type="button" class="btn btn-ghost btn-sm">Clear Key</button>
+            </div>
+          </form>
+          <div id="gemini-test-result" class="notice-bar hidden" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <!-- ADHD Profile & Local Privacy Lock -->
+      <section class="two-col">
+        <div class="card">
+          <h2 class="h-title">
+            <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+              <path d="M9 12l2 2 4-4" />
+            </svg>
+            ADHD Profile &amp; Guardrails
+          </h2>
+          <form id="profile-settings-form" class="stack-sm">
+            <div class="row-gap">
+              <label class="field grow">
+                <span>Hourly Wage ($/hr for Impulse Translator)</span>
+                <input id="set-hourly-wage" type="number" step="1" min="5" value="30" />
+              </label>
+              <label class="field grow">
+                <span>Emergency Overdraft Shield ($)</span>
+                <input id="set-emergency-buffer" type="number" step="25" min="0" value="500" />
+              </label>
+            </div>
+            <div class="row-gap">
+              <label class="field grow">
+                <span>Default Impulse Cooldown (hours)</span>
+                <input id="set-cooling-hours" type="number" min="1" max="720" value="48" />
+              </label>
+              <label class="field grow">
+                <span>Payday Cadence (days)</span>
+                <input id="set-payday-cadence" type="number" min="7" max="31" value="14" />
+              </label>
+            </div>
+            <div class="row-gap">
+              <label class="field grow">
+                <span>Next Payday Date</span>
+                <input id="set-next-payday" type="date" />
+              </label>
+              <label class="field grow">
+                <span>Expected Paycheck ($)</span>
+                <input id="set-expected-paycheck" type="number" step="10" min="0" value="2200" />
+              </label>
+            </div>
+            <button type="submit" class="btn btn-primary">Save ADHD Profile</button>
+          </form>
+        </div>
+
+        <div class="card">
+          <h2 class="h-title">
+            <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="4" y="11" width="16" height="10" rx="2.5" />
+              <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+            </svg>
+            Local Privacy Lock &amp; Data Ownership
+          </h2>
+          <p class="muted small">
+            100% local SQLite storage with restricted <code>0600</code> permissions. Backups never include secret API keys.
+          </p>
+          <div id="security-panel" class="stack-sm">
+            <form id="passcode-setup-form" class="row-gap">
+              <input id="new-passcode" type="password" minlength="6" placeholder="Set local passcode (6+ chars)" required />
+              <button type="submit" class="btn btn-soft">Enable Lock</button>
+            </form>
+            <form id="passcode-disable-form" class="row-gap hidden">
+              <input id="disable-passcode" type="password" placeholder="Current passcode to disable lock" required />
+              <button type="submit" class="btn btn-ghost">Disable Lock</button>
+            </form>
+            <hr class="divider" />
+            <div class="row-gap wrap">
+              <a id="btn-backup-export-link" href="/api/backup/export" class="btn btn-ghost">
+                <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                  <polyline points="7 10 12 15 17 10" />
+                  <line x1="12" y1="15" x2="12" y2="3" />
+                </svg>
+                Download JSON Backup
+              </a>
+              <label class="btn btn-ghost file-btn">
+                <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                  <polyline points="17 8 12 3 7 8" />
+                  <line x1="12" y1="3" x2="12" y2="15" />
+                </svg>
+                Restore JSON Backup
+                <input id="backup-import-input" type="file" accept=".json,application/json" class="sr-only" />
+              </label>
+              <button id="btn-load-demo" type="button" class="btn btn-soft">
+                <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z" />
+                </svg>
+                Load 90-Day Demo
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Desktop App Preferences & Diagnostics Card (shown only inside Electron desktop app) -->
+      <section id="desktop-settings-card" class="card section-block desktop-settings-card hidden">
+        <div class="section-head">
+          <div>
+            <h2 class="h-title">
+              <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="2" y="3" width="20" height="14" rx="2.5" />
+                <line x1="8" y1="21" x2="16" y2="21" />
+                <line x1="12" y1="17" x2="12" y2="21" />
+              </svg>
+              Desktop App Preferences &amp; Diagnostics
+            </h2>
+            <p class="muted small">
+              Native OS integration, system tray behavior, global Quick Capture HUD, and local sidecar diagnostics.
+            </p>
+          </div>
+          <span id="desktop-version-pill" class="pill pill-calm">Desktop App</span>
+        </div>
+
+        <div class="desktop-prefs-grid">
+          <label class="switch-card" for="desktop-pref-close-to-tray">
+            <div class="switch-copy">
+              <strong>Keep Running in System Tray on Close</strong>
+              <span class="muted small">Closing the window keeps ChronoX ready in your tray for instant Quick Capture.</span>
+            </div>
+            <span class="switch-control">
+              <input id="desktop-pref-close-to-tray" type="checkbox" class="toggle-input" />
+              <span class="toggle-track" aria-hidden="true"></span>
+            </span>
+          </label>
+
+          <label class="switch-card" for="desktop-pref-launch-login">
+            <div class="switch-copy">
+              <strong>Launch ChronoX at Login</strong>
+              <span class="muted small">Automatically start ChronoX in the background when you sign in to your computer.</span>
+            </div>
+            <span class="switch-control">
+              <input id="desktop-pref-launch-login" type="checkbox" class="toggle-input" />
+              <span class="toggle-track" aria-hidden="true"></span>
+            </span>
+          </label>
+        </div>
+
+        <hr class="divider" />
+
+        <div class="row-gap wrap">
+          <button id="btn-settings-open-hud" type="button" class="btn btn-primary btn-sm">
+            <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+            </svg>
+            Open Quick Capture HUD
+          </button>
+          <button id="btn-desktop-open-data" type="button" class="btn btn-soft btn-sm">
+            <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+            </svg>
+            Open Data Folder
+          </button>
+          <button id="btn-desktop-view-logs" type="button" class="btn btn-ghost btn-sm">
+            <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="4 17 10 11 4 5" />
+              <line x1="12" y1="19" x2="20" y2="19" />
+            </svg>
+            View Backend Logs
+          </button>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

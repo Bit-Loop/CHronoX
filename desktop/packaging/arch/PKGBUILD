@@ -1,0 +1,158 @@
+# Maintainer: ChronoX Contributors <maintainers@chronox.local>
+# Arch Linux / CachyOS / EndeavourOS / Manjaro PKGBUILD for ChronoX Finance Desktop
+#
+# Build from GitHub:
+#   makepkg -si
+#
+# Build offline from a local ChronoX git checkout (from desktop/packaging/arch/):
+#   CHRONOX_LOCAL_REPO=1 makepkg -si
+
+pkgname=chronox-finance
+pkgver=1.1.0
+pkgrel=1
+pkgdesc="Calm ADHD-friendly self-updating auto-budgeting, quant math & FICO/AZEO credit optimizer"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Bit-Loop/CHronoX"
+license=('MIT')
+depends=(
+  'gtk3'
+  'nss'
+  'libnotify'
+  'libxss'
+  'libxtst'
+  'xdg-utils'
+  'at-spi2-core'
+  'util-linux-libs'
+  'libsecret'
+)
+makedepends=(
+  'git'
+  'nodejs>=20'
+  'npm'
+  'python>=3.11'
+  'python-pip'
+)
+optdepends=(
+  'libappindicator-gtk3: enhanced system tray integration on GNOME/AppIndicator panels'
+  'gnome-keyring: secure desktop keyring support'
+)
+options=('!strip' '!debug')
+
+if [[ -n "${CHRONOX_LOCAL_REPO:-}" && -f "${startdir}/../../package.json" ]]; then
+  _src_url="git+file://$(cd "${startdir}/../../.." && pwd)"
+else
+  _src_url="git+${url}.git"
+fi
+
+source=(
+  "${pkgname}::${_src_url}"
+  'chronox-finance.desktop'
+)
+sha256sums=(
+  'SKIP'
+  'SKIP'
+)
+
+_electron_arch() {
+  case "${CARCH}" in
+    x86_64)  echo "x64" ;;
+    aarch64) echo "arm64" ;;
+    *)
+      echo "Unsupported architecture: ${CARCH}" >&2
+      return 1
+      ;;
+  esac
+}
+
+build() {
+  local eb_arch
+  eb_arch="$(_electron_arch)"
+
+  cd "${srcdir}/${pkgname}"
+
+  # 1. Build isolated Python venv and bundle zero-dependency backend sidecar
+  python -m venv "${srcdir}/py-venv"
+  "${srcdir}/py-venv/bin/pip" install --upgrade pip
+  "${srcdir}/py-venv/bin/pip" install --no-cache-dir . pyinstaller
+
+  # 2. Install desktop dependencies, generate icons, and bundle backend + Electron dir
+  cd "${srcdir}/${pkgname}/desktop"
+  if [[ -f package-lock.json ]]; then
+    npm ci --no-audit --no-fund
+  else
+    npm install --no-audit --no-fund
+  fi
+
+  CHRONOX_PYTHON="${srcdir}/py-venv/bin/python" "${srcdir}/py-venv/bin/python" scripts/generate-icons.py
+  CHRONOX_PYTHON="${srcdir}/py-venv/bin/python" node scripts/build-backend.mjs --clean
+
+  npx electron-builder \
+    --config electron-builder.yml \
+    --linux dir \
+    "--${eb_arch}" \
+    --publish never
+}
+
+package() {
+  local eb_arch unpacked_dir
+  eb_arch="$(_electron_arch)"
+
+  if [[ "${eb_arch}" == "arm64" && -d "${srcdir}/${pkgname}/desktop/dist/linux-arm64-unpacked" ]]; then
+    unpacked_dir="${srcdir}/${pkgname}/desktop/dist/linux-arm64-unpacked"
+  else
+    unpacked_dir="${srcdir}/${pkgname}/desktop/dist/linux-unpacked"
+  fi
+
+  # Install Electron application bundle + sidecar into /opt/chronox-finance
+  install -dm755 "${pkgdir}/opt/${pkgname}"
+  cp -a "${unpacked_dir}/." "${pkgdir}/opt/${pkgname}/"
+
+  # Ensure main executable and sidecar are executable
+  chmod 0755 "${pkgdir}/opt/${pkgname}/${pkgname}"
+  if [[ -f "${pkgdir}/opt/${pkgname}/resources/backend/chronox-backend" ]]; then
+    chmod 0755 "${pkgdir}/opt/${pkgname}/resources/backend/chronox-backend"
+  fi
+
+  # Install clean /usr/bin launcher honoring user flags in ~/.config/chronox-finance-flags.conf
+  install -dm755 "${pkgdir}/usr/bin"
+  cat > "${pkgdir}/usr/bin/${pkgname}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+FLAGS_FILE="${XDG_CONFIG_HOME}/chronox-finance-flags.conf"
+EXTRA_FLAGS=()
+
+if [[ -f "${FLAGS_FILE}" ]]; then
+  while IFS= read -r line; do
+    [[ -z "${line}" || "${line}" =~ ^[[:space:]]*# ]] && continue
+    EXTRA_FLAGS+=("${line}")
+  done < "${FLAGS_FILE}"
+fi
+
+exec /opt/chronox-finance/chronox-finance "${EXTRA_FLAGS[@]}" "$@"
+EOF
+  chmod 0755 "${pkgdir}/usr/bin/${pkgname}"
+
+  # Desktop entry
+  install -Dm644 "${srcdir}/chronox-finance.desktop" \
+    "${pkgdir}/usr/share/applications/${pkgname}.desktop"
+
+  # Multi-size hicolor icons + scalable SVG
+  local icon_dir="${srcdir}/${pkgname}/desktop/build/icons"
+  local size
+  for size in 16 32 48 64 128 256 512; do
+    if [[ -f "${icon_dir}/${size}x${size}.png" ]]; then
+      install -Dm644 "${icon_dir}/${size}x${size}.png" \
+        "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/${pkgname}.png"
+    fi
+  done
+  if [[ -f "${icon_dir}/icon.svg" ]]; then
+    install -Dm644 "${icon_dir}/icon.svg" \
+      "${pkgdir}/usr/share/icons/hicolor/scalable/apps/${pkgname}.svg"
+  fi
+
+  # License
+  install -Dm644 "${srcdir}/${pkgname}/LICENSE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

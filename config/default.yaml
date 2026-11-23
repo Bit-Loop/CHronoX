@@ -1,38 +1,46 @@
-# ChronoX Trading Bot - Default Configuration
-# 
-# This file contains default settings for all subsystems.
-# Override these by:
-# 1. Setting environment variables (highest priority)
-# 2. Creating custom config files (config/production.yaml, config/development.yaml)
-# 3. Command-line arguments
-#
-# For production, copy this to production.yaml and customize.
+# ChronoX - Default Configuration
+# Supports ${ENV_VAR} and ${ENV_VAR:-default} substitution via ConfigManager.
 
-# Polygon.io API Configuration
+opencode_go:
+  api_key: "${OPENCODE_GO_API_KEY}"
+  base_url: "${OPENCODE_GO_BASE_URL:-https://opencode.ai/zen/go/v1}"
+  model: "${OPENCODE_GO_MODEL:-glm-5.3-flash}"
+  protocol: "auto"
+  timeout_seconds: 30
+  max_daily_requests: 60
+  cache_ttl_seconds: 900
+
+finance:
+  host: "${CHRONOX_FINANCE_HOST:-127.0.0.1}"
+  port: 8742
+  db_path: "${CHRONOX_FINANCE_DB_PATH:-.chronox/finance.sqlite3}"
+  currency: "${CHRONOX_FINANCE_CURRENCY:-USD}"
+  default_cooling_hours: 48
+  emergency_buffer_cents: 50000
+  hourly_wage_cents: 3000
+  require_auth: false
+
 polygon:
-  api_key: "${POLYGON_API_KEY}"  # Set via environment variable
+  api_key: "${POLYGON_API_KEY}"
   base_url: "https://api.polygon.io"
   rate_limit_calls: 5
-  rate_limit_period: 1  # seconds
+  rate_limit_period: 1
   retry_attempts: 3
   retry_backoff_multiplier: 1.0
   retry_backoff_min: 4.0
   retry_backoff_max: 10.0
   timeout: 30
 
-# TimescaleDB Configuration
 timescale:
   host: "${TIMESCALE_HOST:-localhost}"
-  port: 5433  # Changed from 5432 to avoid conflict with other PostgreSQL instances
+  port: 5433
   database: "${TIMESCALE_DB:-chronox}"
   user: "${TIMESCALE_USER:-postgres}"
-  password: "${TIMESCALE_PASSWORD:-chronox_db_password}"  # Set via environment variable or use default
+  password: "${TIMESCALE_PASSWORD}"
   min_connections: 1
   max_connections: 20
 
-# ML Training Configuration
 training:
-  # Model architecture
   batch_size: 256
   learning_rate: 0.0001
   epochs: 100
@@ -41,73 +49,54 @@ training:
   num_heads: 8
   dropout: 0.1
   gradient_clip: 1.0
-  
-  # Hardware optimization
-  use_amp: true  # Automatic Mixed Precision (35-40% VRAM savings)
-  use_gradient_checkpointing: false  # Enable for long sequences (>2K timesteps)
+  use_amp: true
+  use_gradient_checkpointing: false
   device: "cuda"
   num_workers: 4
   pin_memory: true
-  
-  # Multi-timescale settings
   timescales:
     - "1min"
     - "15min"
     - "1hour"
     - "12hour"
     - "daily"
-  
-  short_term_sequence_length: 1000  # ~1 week of 15min bars
-  long_term_sequence_length: 5000   # ~months of 12hr bars
-  
-  # Asset scaling (based on hardware analysis)
-  # Hardware: Ryzen 9 9950X + RTX 5070 (10 GB VRAM) + 96 GB RAM
-  max_symbols_short_term: 15  # For 15min/1hour training (FP16)
-  max_symbols_long_term: 10   # For 12hour/daily training (FP16 + gradient checkpointing)
-  max_symbols_inference: 30   # Real-time inference (no gradients)
+  short_term_sequence_length: 1000
+  long_term_sequence_length: 5000
+  max_symbols_short_term: 15
+  max_symbols_long_term: 10
+  max_symbols_inference: 30
 
-# Backtesting Configuration
 backtest:
   initial_capital: 100000.0
-  commission_rate: 0.001  # 0.1% per trade
-  slippage_bps: 5.0  # 5 basis points
-  max_position_size: 0.1  # 10% of portfolio per position
-  risk_free_rate: 0.04  # 4% annual
-  
-  # Performance metrics
+  commission_rate: 0.001
+  slippage_bps: 5.0
+  max_position_size: 0.1
+  risk_free_rate: 0.04
   calculate_sharpe: true
   calculate_sortino: true
   calculate_max_drawdown: true
   calculate_calmar: true
 
-# Trading Configuration
 trading:
-  mode: "paper"  # "paper" or "live" (⚠️ live trades real money!)
+  mode: "paper"
   max_symbols: 10
-  position_sizing: "kelly"  # "equal", "kelly", "risk_parity"
-  rebalance_frequency: "daily"  # "daily", "weekly", "monthly"
-  
-  # Risk management
-  max_portfolio_risk: 0.02  # 2% max loss per trade
-  max_daily_loss: 0.05  # 5% max daily loss (circuit breaker)
+  position_sizing: "kelly"
+  rebalance_frequency: "daily"
+  max_portfolio_risk: 0.02
+  max_daily_loss: 0.05
   max_positions: 20
-  
-  # Alpaca API (set via environment variables)
+  enforce_budget_guardrail: true
   alpaca_api_key: "${ALPACA_API_KEY}"
   alpaca_secret_key: "${ALPACA_SECRET_KEY}"
-  alpaca_base_url: "https://paper-api.alpaca.markets"  # or live: https://api.alpaca.markets
+  alpaca_base_url: "${ALPACA_BASE_URL:-https://paper-api.alpaca.markets}"
 
-# Monitoring & Alerting Configuration
 monitoring:
   prometheus_port: 9090
   grafana_port: 3000
   mlflow_port: 5000
-  
-  # Alerting channels
   enable_email_alerts: false
   enable_slack_alerts: false
   enable_telegram_alerts: false
-  
   alert_email: "${ALERT_EMAIL}"
   slack_webhook: "${SLACK_WEBHOOK}"
   telegram_token: "${TELEGRAM_TOKEN}"

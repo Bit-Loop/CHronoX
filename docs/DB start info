@@ -20,7 +20,7 @@
    Port: 5433
    Database: chronox
    User: postgres
-   Password: chronox_db_password
+   Password: <set via TIMESCALE_PASSWORD in .env>
 
 🎯 Next steps:
    1. Test connection: .venv/bin/python scripts/verify_implementation.py

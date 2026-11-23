@@ -1,0 +1,38 @@
+{
+  "name": "chronox-finance",
+  "productName": "ChronoX Finance",
+  "desktopName": "chronox-finance.desktop",
+  "version": "1.1.0",
+  "description": "Calm ADHD Personal Finance, Self-Updating Auto-Budgeting, Quant Math Engine & Multi-Provider AI Coach",
+  "author": {
+    "name": "ChronoX Team",
+    "email": "maintainers@chronox.local"
+  },
+  "homepage": "https://github.com/Bit-Loop/CHronoX",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Bit-Loop/CHronoX.git"
+  },
+  "license": "MIT",
+  "private": true,
+  "main": "src/main/index.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "demo": "electron . --demo",
+    "icons": "node -e \"const{spawnSync}=require('child_process'),fs=require('fs'),p=require('path');const c=[p.resolve('..','.venv','bin','python'),p.resolve('..','.venv','Scripts','python.exe'),'python3','python'].find(x=>!x.includes(p.sep)||fs.existsSync(x));const r=spawnSync(c,['scripts/generate-icons.py'],{stdio:'inherit'});process.exit(r.status??1)\"",
+    "build:backend": "node scripts/build-backend.mjs",
+    "pack": "electron-builder --config electron-builder.yml --dir",
+    "dist:deb": "electron-builder --config electron-builder.yml --linux deb",
+    "dist:pacman": "electron-builder --config electron-builder.yml --linux pacman",
+    "dist:appimage": "electron-builder --config electron-builder.yml --linux AppImage",
+    "dist:linux": "electron-builder --config electron-builder.yml --linux deb pacman AppImage",
+    "dist:win": "electron-builder --config electron-builder.yml --win nsis portable",
+    "dist:mac": "electron-builder --config electron-builder.yml --mac dmg",
+    "check": "node --check src/main/index.js && node --check src/main/backend-manager.js && node --check src/main/tray.js && node --check src/main/menu.js && node --check src/main/window-state.js && node --check src/preload/preload.js && node --check src/preload/hud-preload.js"
+  },
+  "devDependencies": {
+    "electron": "^45.4.1",
+    "electron-builder": "^26.18.0"
+  }
+}

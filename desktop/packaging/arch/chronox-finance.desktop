@@ -1,0 +1,19 @@
+[Desktop Entry]
+Version=1.5
+Type=Application
+Name=ChronoX Finance
+GenericName=Personal Finance & Auto-Budget
+Comment=Calm ADHD-friendly self-updating auto-budgeting, quant math & FICO/AZEO credit optimizer
+Exec=/usr/bin/chronox-finance %U
+Icon=chronox-finance
+Terminal=false
+Categories=Office;Finance;
+Keywords=budget;finance;adhd;credit;fico;azeo;cashflow;money;quant;
+StartupNotify=true
+StartupWMClass=chronox-finance
+MimeType=text/csv;text/tab-separated-values;application/x-ofx;application/vnd.intu.qfx;application/x-qw;
+Actions=Demo;
+
+[Desktop Action Demo]
+Name=Open 90-Day ADHD Demo Workspace
+Exec=/usr/bin/chronox-finance --demo

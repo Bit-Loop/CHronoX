@@ -1,161 +1,101 @@
-.PHONY: help install test lint format clean docker-up docker-down backfill verify
+.PHONY: help install dev finance demo test lint clean docker-finance docker-trading docker-down \
+	desktop-install desktop desktop-demo desktop-icons desktop-backend \
+	desktop-deb desktop-pacman desktop-appimage desktop-linux desktop-win desktop-mac
 
-# Default target
+PYTHON ?= .venv/bin/python
+PYTEST ?= .venv/bin/pytest
+RUFF ?= .venv/bin/ruff
+NPM ?= npm
+
 help:
-	@echo "ChronoX Trading Bot - Available Commands"
-	@echo "========================================"
-	@echo "install          Install dependencies"
-	@echo "test             Run all tests"
-	@echo "test-phase0      Run Phase 0 component tests"
-	@echo "lint             Run code linters"
-	@echo "format           Format code with black"
-	@echo "clean            Clean temporary files"
-	@echo "docker-up        Start InfluxDB container"
-	@echo "docker-down      Stop InfluxDB container"
-	@echo "docker-logs      View InfluxDB logs"
-	@echo "backfill-test    Backfill test tickers (AAPL,TSLA,NVDA)"
-	@echo "backfill-top50   Backfill top 50 tickers"
-	@echo "verify           Verify data quality"
-	@echo "influx-ui        Open InfluxDB UI in browser"
+	@echo "ChronoX — Available Commands"
+	@echo "========================================================"
+	@echo "Web & Core:"
+	@echo "  make dev              Create .venv and install app + dev deps"
+	@echo "  make finance          Run ADHD Auto-Budgeting Web App (port 8742)"
+	@echo "  make demo             Run Web App preloaded with 90-day ADHD demo"
+	@echo "  make test             Run full automated pytest suite"
+	@echo "  make lint             Run ruff security & code quality checks"
+	@echo "  make docker-finance   Start ChronoX Finance container (127.0.0.1:8742)"
+	@echo "  make docker-trading   Start TimescaleDB + Redis trading stack"
+	@echo "  make docker-down      Stop all Docker Compose containers"
+	@echo ""
+	@echo "Desktop App (Electron — Windows, Linux & macOS):"
+	@echo "  make desktop-install  Install desktop/ Electron dependencies & icons"
+	@echo "  make desktop          Launch ChronoX Finance Desktop App"
+	@echo "  make desktop-demo     Launch Desktop App with 90-day ADHD demo data"
+	@echo "  make desktop-icons    Regenerate cross-platform PNG, ICO & ICNS icons"
+	@echo "  make desktop-backend  Bundle standalone zero-Python PyInstaller sidecar"
+	@echo "  make desktop-deb      Build Debian/Ubuntu .deb package in desktop/dist/"
+	@echo "  make desktop-pacman   Build Arch/CachyOS .pacman package in desktop/dist/"
+	@echo "  make desktop-appimage Build universal Linux .AppImage in desktop/dist/"
+	@echo "  make desktop-linux    Build .deb, .pacman & .AppImage packages"
+	@echo "  make desktop-win      Build Windows NSIS + Portable .exe installers"
+	@echo "  make desktop-mac      Build macOS .dmg installer"
+	@echo ""
+	@echo "Maintenance:"
+	@echo "  make clean            Remove caches and build artifacts"
 
-# Installation
-install:
-	pip install -r requirements.txt
-	@echo "✓ Dependencies installed"
+dev:
+	uv venv .venv --python 3.12
+	uv pip install --python $(PYTHON) -e ".[dev]"
+	@echo "Ready! Copy .env.example to .env and add OPENCODE_GO_API_KEY or GEMINI_API_KEY (optional)."
 
-install-dev:
-	pip install -r requirements.txt
-	pip install pytest pytest-cov black pylint flake8 mypy
-	@echo "✓ Dev dependencies installed"
+finance:
+	$(PYTHON) main.py --action finance
 
-# Testing
+demo:
+	$(PYTHON) main.py --action finance --demo
+
 test:
-	pytest tests/ -v
+	$(PYTEST) tests/ -v
 
-test-phase0:
-	python scripts/test_phase0.py
-
-test-coverage:
-	pytest tests/ --cov=. --cov-report=html
-	@echo "✓ Coverage report generated in htmlcov/"
-
-# Code Quality
 lint:
-	pylint data/ scripts/ --ignore=tests
-	flake8 data/ scripts/ --max-line-length=120
+	$(RUFF) check chronox_finance config main.py data/ingestion/polygon/client.py data/ingestion/polygon/__init__.py tests
 
-format:
-	black data/ scripts/ tests/ --line-length=100
-	isort data/ scripts/ tests/
+docker-finance:
+	docker compose up -d --build chronox-finance
 
-type-check:
-	mypy data/ scripts/ --ignore-missing-imports
-
-# Cleaning
-clean:
-	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-	find . -type f -name "*.pyc" -delete
-	find . -type f -name "*.pyo" -delete
-	find . -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
-	rm -rf .pytest_cache
-	rm -rf htmlcov
-	rm -rf .coverage
-	@echo "✓ Cleaned temporary files"
-
-# Docker Management
-docker-up:
-	docker run -d \
-		--name chronox-influxdb \
-		-p 8086:8086 \
-		-v chronox-influxdb-data:/var/lib/influxdb2 \
-		-v chronox-influxdb-config:/etc/influxdb2 \
-		-e DOCKER_INFLUXDB_INIT_MODE=setup \
-		-e DOCKER_INFLUXDB_INIT_USERNAME=admin \
-		-e DOCKER_INFLUXDB_INIT_PASSWORD=$$(openssl rand -base64 32) \
-		-e DOCKER_INFLUXDB_INIT_ORG=chronox \
-		-e DOCKER_INFLUXDB_INIT_BUCKET=market_data_5y \
-		-e DOCKER_INFLUXDB_INIT_RETENTION=1825d \
-		-e DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=$$(openssl rand -base64 32) \
-		influxdb:2.7
-	@echo "✓ InfluxDB started on http://localhost:8086"
-	@echo "⚠ Save the admin token from container logs!"
-	@docker logs chronox-influxdb 2>&1 | grep -A 5 "token"
+docker-trading:
+	docker compose --profile trading up -d
 
 docker-down:
-	docker stop chronox-influxdb
-	docker rm chronox-influxdb
-	@echo "✓ InfluxDB stopped"
+	docker compose down
 
-docker-restart:
-	$(MAKE) docker-down
-	$(MAKE) docker-up
+desktop-install:
+	cd desktop && $(NPM) install && $(NPM) run icons
 
-docker-logs:
-	docker logs -f chronox-influxdb
+desktop:
+	cd desktop && $(NPM) start
 
-docker-clean:
-	docker stop chronox-influxdb 2>/dev/null || true
-	docker rm chronox-influxdb 2>/dev/null || true
-	docker volume rm chronox-influxdb-data 2>/dev/null || true
-	docker volume rm chronox-influxdb-config 2>/dev/null || true
-	@echo "✓ InfluxDB and volumes removed"
+desktop-demo:
+	cd desktop && $(NPM) run demo
 
-# Data Operations
-backfill-test:
-	python scripts/backfill_historical_data.py --tickers AAPL,TSLA,NVDA
-	@echo "✓ Test backfill complete"
+desktop-icons:
+	cd desktop && $(NPM) run icons
 
-backfill-top50:
-	python scripts/backfill_historical_data.py --all --limit 50
-	@echo "✓ Top 50 tickers backfilled"
+desktop-backend:
+	cd desktop && $(NPM) run build:backend
 
-backfill-full:
-	@echo "⚠ WARNING: This will take several hours and use significant bandwidth"
-	@read -p "Continue? [y/N] " -n 1 -r; \
-	echo; \
-	if [[ $$REPLY =~ ^[Yy]$$ ]]; then \
-		python scripts/backfill_historical_data.py --all --limit 500; \
-	fi
+desktop-deb:
+	cd desktop && $(NPM) run dist:deb
 
-verify:
-	python scripts/verify_data.py
+desktop-pacman:
+	cd desktop && $(NPM) run dist:pacman
 
-# Utilities
-influx-ui:
-	@echo "Opening InfluxDB UI in browser..."
-	@python -m webbrowser http://localhost:8086
+desktop-appimage:
+	cd desktop && $(NPM) run dist:appimage
 
-env-check:
-	@echo "Checking environment variables..."
-	@python -c "import os; from dotenv import load_dotenv; load_dotenv(); \
-		print('POLYGON_API_KEY:', '✓' if os.getenv('POLYGON_API_KEY') else '✗ Missing'); \
-		print('INFLUX_URL:', os.getenv('INFLUX_URL', 'http://localhost:8086')); \
-		print('INFLUX_TOKEN:', '✓' if os.getenv('INFLUX_TOKEN') else '✗ Missing'); \
-		print('INFLUX_ORG:', os.getenv('INFLUX_ORG', 'chronox'));"
+desktop-linux:
+	cd desktop && $(NPM) run dist:linux
 
-logs:
-	tail -f logs/*.log
+desktop-win:
+	cd desktop && $(NPM) run dist:win
 
-# Development
-dev-setup:
-	$(MAKE) install-dev
-	cp .env.example .env
-	@echo "✓ Dev environment set up"
-	@echo "⚠ Edit .env and add your API keys"
+desktop-mac:
+	cd desktop && $(NPM) run dist:mac
 
-quick-start:
-	@echo "ChronoX Quick Start"
-	@echo "==================="
-	@echo "1. Installing dependencies..."
-	$(MAKE) install
-	@echo "2. Starting InfluxDB..."
-	$(MAKE) docker-up
-	@echo "3. Testing components..."
-	sleep 5
-	$(MAKE) test-phase0
-	@echo ""
-	@echo "✓ Quick start complete!"
-	@echo "Next steps:"
-	@echo "  1. Edit .env and add your POLYGON_API_KEY"
-	@echo "  2. Run: make backfill-test"
-	@echo "  3. Run: make verify"
+clean:
+	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+	rm -rf .pytest_cache .ruff_cache htmlcov .coverage dist build *.egg-info \
+		desktop/dist desktop/build/backend desktop/build/pyinstaller-work

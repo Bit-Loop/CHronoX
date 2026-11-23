@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:*;"
+  />
+  <title>ChronoX Finance — Starting</title>
+  <link rel="stylesheet" href="./splash.css" />
+</head>
+<body>
+  <main id="splash-card" class="splash-card" data-stage="starting" role="status" aria-live="polite">
+    <div class="ambient-glow ambient-glow-emerald" aria-hidden="true"></div>
+    <div class="ambient-glow ambient-glow-sky" aria-hidden="true"></div>
+
+    <!-- Subtle top metadata strip -->
+    <header class="splash-meta">
+      <span class="vault-badge">
+        <svg class="meta-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 3l7 3v5c0 4.8-3 8.8-7 10-4-1.2-7-5.2-7-10V6l7-3z" />
+          <path d="M9.5 12.2l1.8 1.8 3.4-3.6" />
+        </svg>
+        <span>Local Vault</span>
+      </span>
+      <span id="splash-version" class="version-pill">Desktop</span>
+    </header>
+
+    <!-- Hero animated ChronoX orbital emblem -->
+    <section class="splash-hero">
+      <div class="emblem-wrap" aria-hidden="true">
+        <div class="emblem-halo"></div>
+        <svg class="emblem-svg" viewBox="0 0 88 88" fill="none">
+          <defs>
+            <linearGradient id="splashArcGrad" x1="16" y1="72" x2="72" y2="16" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#10b981" />
+              <stop offset="48%" stop-color="#34d399" />
+              <stop offset="78%" stop-color="#2dd4bf" />
+              <stop offset="100%" stop-color="#38bdf8" />
+            </linearGradient>
+            <linearGradient id="splashErrGrad" x1="16" y1="72" x2="72" y2="16" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#f43f5e" />
+              <stop offset="100%" stop-color="#fbbf24" />
+            </linearGradient>
+            <linearGradient id="splashHandsGrad" x1="44" y1="26" x2="58" y2="54" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#f0fdfa" />
+              <stop offset="100%" stop-color="#6ee7b7" />
+            </linearGradient>
+          </defs>
+
+          <!-- Faint chronograph bezel track -->
+          <circle class="emblem-track" cx="44" cy="44" r="34" stroke-width="1.2" />
+
+          <!-- Subtle cardinal dial ticks -->
+          <g class="emblem-ticks" stroke-width="1.6" stroke-linecap="round">
+            <line x1="44" y1="7.5" x2="44" y2="11.5" />
+            <line x1="80.5" y1="44" x2="76.5" y2="44" />
+            <line x1="44" y1="80.5" x2="44" y2="76.5" />
+            <line x1="7.5" y1="44" x2="11.5" y2="44" />
+          </g>
+
+          <!-- Luminous open orbital clock-arc (294 deg sweep) -->
+          <path
+            class="emblem-arc"
+            d="M 68.45 38.80 A 25 25 0 1 1 49.20 19.55"
+            stroke="url(#splashArcGrad)"
+            stroke-width="6.2"
+            stroke-linecap="round"
+          />
+
+          <!-- Upper-right cyan pulse beacon -->
+          <circle class="emblem-beacon" cx="61.68" cy="26.32" r="3.9" />
+
+          <!-- Inner precision clock hands -->
+          <path
+            class="emblem-hands"
+            d="M 44 30.8 L 44 44 L 54.6 50.8"
+            stroke="url(#splashHandsGrad)"
+            stroke-width="4.6"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+          <circle class="emblem-pivot-outer" cx="44" cy="44" r="3.4" />
+          <circle class="emblem-pivot-inner" cx="44" cy="44" r="1.6" />
+        </svg>
+      </div>
+
+      <div class="brand-copy">
+        <h1 class="brand-title">ChronoX Finance</h1>
+        <p class="brand-sub">Calm ADHD Auto-Budget &amp; Quant Intelligence</p>
+      </div>
+    </section>
+
+    <!-- Boot status & progress (normal boot flow) -->
+    <section id="boot-panel" class="boot-panel">
+      <div class="status-row">
+        <div id="status-pill" class="status-pill">
+          <span class="status-indicator" aria-hidden="true">
+            <span class="status-dot"></span>
+            <svg class="status-icon-ready hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="20 6 9 17 4 12" />
+            </svg>
+          </span>
+          <span id="status-label" class="status-label">Starting local vault</span>
+        </div>
+      </div>
+
+      <p id="status-detail" class="status-detail">Preparing encrypted local database</p>
+
+      <div
+        id="progress-track"
+        class="progress-track"
+        role="progressbar"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow="14"
+        aria-label="Startup progress"
+      >
+        <div id="progress-fill" class="progress-fill"></div>
+      </div>
+    </section>
+
+    <!-- Friendly recovery panel (shown only when backend startup fails) -->
+    <section id="error-panel" class="error-panel hidden" role="alert">
+      <div class="error-banner">
+        <svg class="error-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+          <line x1="12" y1="9" x2="12" y2="13" />
+          <line x1="12" y1="17" x2="12.01" y2="17" />
+        </svg>
+        <div class="error-copy">
+          <p id="error-title" class="error-title">Local vault failed to start</p>
+          <p id="error-detail" class="error-detail">Check diagnostics logs or retry startup.</p>
+        </div>
+      </div>
+      <div class="error-actions">
+        <button id="btn-retry" type="button" class="btn btn-primary">
+          <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+            <polyline points="21 3 21 9 15 9" />
+          </svg>
+          Retry
+        </button>
+        <button id="btn-view-logs" type="button" class="btn btn-ghost">
+          <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="4 17 10 11 4 5" />
+            <line x1="12" y1="19" x2="20" y2="19" />
+          </svg>
+          View Logs
+        </button>
+        <button id="btn-quit" type="button" class="btn btn-subtle">Quit</button>
+      </div>
+    </section>
+
+    <!-- Collapsible diagnostics log viewer overlay -->
+    <section id="logs-sheet" class="logs-sheet hidden" aria-label="Backend startup logs">
+      <div class="logs-head">
+        <div class="logs-head-left">
+          <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="4 17 10 11 4 5" />
+            <line x1="12" y1="19" x2="20" y2="19" />
+          </svg>
+          <span class="logs-title">Startup Diagnostics</span>
+        </div>
+        <div class="logs-head-actions">
+          <button id="btn-copy-logs" type="button" class="mini-btn">Copy</button>
+          <button id="btn-close-logs" type="button" class="mini-btn">Back</button>
+        </div>
+      </div>
+      <div id="logs-list" class="logs-list" tabindex="0"></div>
+      <div id="logs-meta" class="logs-meta">Local backend diagnostics</div>
+    </section>
+  </main>
+
+  <script src="./splash.js"></script>
+</body>
+</html>
