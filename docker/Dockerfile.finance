@@ -12,7 +12,7 @@ RUN groupadd --system chronox && useradd --system --gid chronox --home-dir /app 
 
 COPY pyproject.toml requirements.txt ./
 RUN pip install --upgrade pip \
-    && pip install fastapi "uvicorn[standard]" pydantic httpx python-dotenv pyyaml python-multipart
+    && pip install fastapi "uvicorn[standard]" pydantic httpx python-dotenv pyyaml python-multipart "cryptography>=43.0.0"
 
 COPY chronox_finance ./chronox_finance
 COPY config ./config

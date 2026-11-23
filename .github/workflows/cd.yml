@@ -49,17 +49,21 @@ jobs:
 
       - name: Smoke-test container /api/health endpoint
         run: |
-          CID=$(docker run -d -p 127.0.0.1:18742:8742 \
+          CID=$(docker run -d -p 127.0.0.1:8742:8742 \
             -e CHRONOX_FINANCE_DB_PATH=/data/smoke.sqlite3 \
             chronox-finance:cd-smoke)
           trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
           for i in $(seq 1 25); do
-            if curl -fsS http://127.0.0.1:18742/api/health >/dev/null 2>&1; then
+            if curl -fsS http://127.0.0.1:8742/api/health >/dev/null 2>&1; then
               break
             fi
             sleep 1
           done
-          HEALTH=$(curl -fsS http://127.0.0.1:18742/api/health)
+          if ! HEALTH=$(curl -fsS http://127.0.0.1:8742/api/health); then
+            echo "=== Container Logs ==="
+            docker logs "$CID" || true
+            exit 1
+          fi
           echo "Health response: $HEALTH"
           echo "$HEALTH" | grep -q '"status":"ok"'
 
