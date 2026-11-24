@@ -1111,6 +1111,118 @@
         </details>
       </section>
 
+      <!-- Optional BYOK Credit Score APIs (Spinwheel / Array / CRS / Custom) -->
+      <section id="credit-apis-card" class="card section-block">
+        <div class="section-head">
+          <div>
+            <span class="eyebrow">OPTIONAL DIRECT BUREAU &amp; SCORE INTEGRATIONS</span>
+            <h2>CREDIT SCORE APIS (BYOK)</h2>
+            <span class="muted small">
+              Optionally connect Spinwheel, Array, CRS Credit API, or a Custom HTTPS/local credit bridge to sync live bureau scores, hard inquiries, derogatories &amp; tradelines. Keys are sealed in AES-256-GCM <code>secrets.enc</code>.
+            </span>
+          </div>
+          <span id="credit-apis-count" class="pill pill-soft">0 connected</span>
+        </div>
+
+        <div id="credit-apis-list" class="stack-sm"></div>
+        <div id="credit-api-status-box" class="notice-bar hidden" aria-live="polite"></div>
+
+        <details class="math-drawer details-spacer">
+          <summary>+ CONNECT CREDIT SCORE API (SPINWHEEL / ARRAY / CRS / CUSTOM)</summary>
+          <form id="credit-api-connect-form" class="stack-sm details-body">
+            <div class="form-grid-compact">
+              <label class="field">
+                <span>Provider</span>
+                <select id="capi-vendor">
+                  <option value="spinwheel">Spinwheel (Equifax Score + Liabilities)</option>
+                  <option value="array">Array (Experian / Equifax / TransUnion 1B/3B)</option>
+                  <option value="crs">CRS Credit API (Experian / Equifax / TransUnion)</option>
+                  <option value="custom">Custom Credit Score API (HTTPS / Local Bridge)</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Environment</span>
+                <select id="capi-env">
+                  <option value="sandbox">Sandbox</option>
+                  <option value="production">Production</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Display Label (optional)</span>
+                <input id="capi-label" type="text" placeholder="e.g. Equifax Live Pull" maxlength="100" />
+              </label>
+            </div>
+
+            <div id="capi-vendor-hint" class="small muted">
+              Equifax credit score &amp; full liabilities profile via Bearer API Key + Spinwheel User ID.
+            </div>
+
+            <div id="capi-field-apikey" class="form-grid-compact">
+              <label class="field">
+                <span>API Key / Server Token / Bearer JWT</span>
+                <input id="capi-api-key" type="password" autocomplete="off" placeholder="Write-only; sealed in secrets.enc" />
+              </label>
+            </div>
+
+            <div id="capi-field-userid" class="form-grid-compact">
+              <label class="field">
+                <span>User ID (Spinwheel / Array)</span>
+                <input id="capi-user-id" type="text" autocomplete="off" placeholder="e.g. usr_01J..." />
+              </label>
+            </div>
+
+            <div id="capi-field-array" class="form-grid-compact hidden">
+              <label class="field">
+                <span>Array Report Key</span>
+                <input id="capi-report-key" type="text" autocomplete="off" placeholder="reportKey from Array" />
+              </label>
+              <label class="field">
+                <span>Array Display Token</span>
+                <input id="capi-display-token" type="password" autocomplete="off" placeholder="displayToken (sealed in vault)" />
+              </label>
+            </div>
+
+            <div id="capi-field-crs" class="form-grid-compact hidden">
+              <label class="field">
+                <span>CRS Username (if not using Bearer JWT)</span>
+                <input id="capi-username" type="text" autocomplete="off" placeholder="CRS API username" />
+              </label>
+              <label class="field">
+                <span>CRS Password</span>
+                <input id="capi-password" type="password" autocomplete="off" placeholder="CRS API password (sealed in vault)" />
+              </label>
+              <label class="field">
+                <span>Default Bureau</span>
+                <select id="capi-bureau">
+                  <option value="equifax">Equifax</option>
+                  <option value="experian">Experian</option>
+                  <option value="transunion">TransUnion</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Report Option Slug (optional)</span>
+                <input id="capi-option" type="text" autocomplete="off" placeholder="e.g. credit-report-equifax-vantage3" />
+              </label>
+            </div>
+
+            <div id="capi-field-baseurl" class="form-grid-compact hidden">
+              <label class="field">
+                <span>Custom Credit Score API Endpoint URL</span>
+                <input id="capi-base-url" type="url" autocomplete="off" placeholder="https://credit-bridge.example.com/v1/snapshot or http://127.0.0.1:9001/credit" />
+              </label>
+            </div>
+
+            <div class="item-row wrap">
+              <label class="checkbox-row small">
+                <input id="capi-test-on-connect" type="checkbox" />
+                <span>Verify live credentials immediately on save</span>
+              </label>
+              <button type="submit" class="btn btn-primary btn-sm">Seal Credentials &amp; Connect</button>
+            </div>
+          </form>
+        </details>
+      </section>
+
       <!-- Niche Advisor Alerts + AZEO Statement-Close Calendar -->
       <section id="credit-advisory-grid" class="two-col section-block">
         <div class="card">

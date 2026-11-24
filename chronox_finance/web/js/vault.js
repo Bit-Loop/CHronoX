@@ -2722,6 +2722,8 @@ export function initVaultAndShell() {
               ? "/api/v1/plaid/sync"
               : prov === "simplefin"
               ? "/api/v1/simplefin/sync"
+              : prov && prov.startsWith("credit_api_")
+              ? `/api/v1/credit/apis/${btn.dataset.connSync}/sync`
               : `/api/v1/brokers/${btn.dataset.connSync}/sync`;
           await api(url, { method: "POST" });
           toast(`Synced ${prov.toUpperCase()} connection.`);

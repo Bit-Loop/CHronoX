@@ -50,9 +50,17 @@ const portState = {
   portfolio: null,
   connections: [],
   creditReport: null,
+  creditApis: null,
   factorModel: "fico8", // "fico8" | "vantage3"
   simPaydownDollars: 0,
   pendingPdfBundle: null,
+};
+
+const CREDIT_API_HINTS = {
+  spinwheel: "Equifax credit score & full liabilities profile via Bearer API Key + Spinwheel User ID.",
+  array: "1B/3B Experian, Equifax & TransUnion JSON reports via Server Token + Report Key & Display Token.",
+  crs: "Direct Experian, Equifax & TransUnion pulls via CRS Username/Password JWT login or Bearer Token.",
+  custom: "Any ChronoX-compatible HTTPS or local loopback credit bridge returning structured score/report JSON.",
 };
 
 function normalizeDerogatoryKind(raw) {
@@ -632,6 +640,7 @@ export async function loadCreditReport() {
     portState.creditReport = rep;
     state.creditReport = rep;
     renderCreditReport(rep);
+    await loadCreditApis();
     return rep;
   } catch (err) {
     toast(err.message || "Could not load credit report.", true);
@@ -690,8 +699,19 @@ function renderCreditReport(rep) {
       scoreEl.textContent = String(latestScore.score);
       scoreEl.style.color =
         latestScore.score >= 740 ? "var(--primary)" : latestScore.score >= 670 ? "var(--cyan)" : "var(--amber)";
-      const modelLbl = latestScore.model === "vantage3" ? "VantageScore 3.0" : "FICO 8";
-      scoreMeta.textContent = `${String(latestScore.bureau || "").toUpperCase()} · ${modelLbl} · ${latestScore.pulled_date}`;
+      const modelLbl =
+        latestScore.model === "vantage3"
+          ? "VantageScore 3.0"
+          : latestScore.model === "fico9"
+          ? "FICO 9"
+          : latestScore.model === "other"
+          ? "Bureau Score"
+          : "FICO 8";
+      const srcTag =
+        latestScore.source && String(latestScore.source).endsWith("_api")
+          ? ` · ${String(latestScore.source).replace(/_/g, " ").toUpperCase()}`
+          : "";
+      scoreMeta.textContent = `${String(latestScore.bureau || "").toUpperCase()} · ${modelLbl} · ${latestScore.pulled_date}${srcTag}`;
     } else {
       scoreEl.textContent = "--";
       scoreEl.style.color = "var(--muted)";
@@ -1408,6 +1428,184 @@ function renderCreditLines(lines) {
 }
 
 /* ============================================================================
+   PART C: OPTIONAL BYOK CREDIT SCORE APIS (Spinwheel / Array / CRS / Custom)
+   ============================================================================ */
+
+function setCreditApiStatus(message, isError = false) {
+  const box = $("credit-api-status-box");
+  if (!box) return;
+  if (!message) {
+    box.classList.add("hidden");
+    box.replaceChildren();
+    return;
+  }
+  box.className = `notice-bar${isError ? " notice-warn" : ""}`;
+  box.replaceChildren(
+    makeIcon(isError ? "alert" : "check", "ui-icon-sm"),
+    el("span", { text: message })
+  );
+}
+
+function updateCreditApiFormFields() {
+  const vendorSel = $("capi-vendor");
+  if (!vendorSel) return;
+  const v = vendorSel.value || "spinwheel";
+  const hint = $("capi-vendor-hint");
+  if (hint) {
+    hint.textContent = CREDIT_API_HINTS[v] || "";
+  }
+  const fUser = $("capi-field-userid");
+  const fArray = $("capi-field-array");
+  const fCrs = $("capi-field-crs");
+  const fUrl = $("capi-field-baseurl");
+  const fKey = $("capi-field-apikey");
+  if (fKey) fKey.classList.remove("hidden");
+  if (fUser) fUser.classList.toggle("hidden", !(v === "spinwheel" || v === "array"));
+  if (fArray) fArray.classList.toggle("hidden", v !== "array");
+  if (fCrs) fCrs.classList.toggle("hidden", v !== "crs");
+  if (fUrl) fUrl.classList.toggle("hidden", v !== "custom");
+}
+
+export async function loadCreditApis() {
+  if (state.vaultStatus !== "unlocked") return null;
+  try {
+    const data = await api("/api/v1/credit/apis");
+    portState.creditApis = data;
+    renderCreditApis(data);
+    return data;
+  } catch (err) {
+    const list = $("credit-apis-list");
+    if (list && err.status !== 401) {
+      list.replaceChildren(el("p", { class: "small muted", text: err.message || "Could not load Credit Score APIs." }));
+    }
+    return null;
+  }
+}
+
+function renderCreditApis(data) {
+  const list = $("credit-apis-list");
+  const countPill = $("credit-apis-count");
+  if (!list) return;
+  const conns = Array.isArray(data && data.connections) ? data.connections : [];
+  if (countPill) {
+    countPill.textContent = `${conns.length} connected`;
+    countPill.className = `pill ${conns.length > 0 ? "pill-calm" : "pill-soft"}`;
+  }
+
+  if (!conns.length) {
+    const plaidNote =
+      data && data.plaid_liabilities_connected
+        ? "Plaid Liabilities is active for cards/loans. Add an optional Credit Score API below to pull live bureau scores automatically."
+        : "No Credit Score API connected yet (optional). Connect Spinwheel, Array, CRS Credit API, or a Custom credit bridge below, or keep using manual / PDF bureau imports above.";
+    list.replaceChildren(el("p", { class: "small muted", text: plaidNote }));
+    return;
+  }
+
+  list.replaceChildren(
+    ...conns.map((c) => {
+      const statusCls =
+        c.status === "active"
+          ? "pill-calm"
+          : c.status === "paused_locked"
+          ? "pill-watch"
+          : "pill-danger";
+      const statusLabel =
+        c.status === "paused_locked"
+          ? "VAULT LOCKED"
+          : String(c.status || "active").replace(/_/g, " ").toUpperCase();
+
+      const testBtn = el("button", { type: "button", class: "btn btn-ghost btn-xs", text: "Test" });
+      testBtn.addEventListener("click", () =>
+        withBusy(testBtn, async () => {
+          try {
+            const res = await api(`/api/v1/credit/apis/${c.id}/test`, { method: "POST" });
+            setCreditApiStatus(res.message || `${c.institution} connection verified.`);
+            toast(res.message || "Credit Score API verified.");
+            await loadCreditApis();
+          } catch (err) {
+            setCreditApiStatus(err.message || "Connection test failed.", true);
+            toast(err.message || "Credit Score API test failed.", true);
+            await loadCreditApis();
+          }
+        })
+      );
+
+      const syncBtn = el("button", {
+        type: "button",
+        class: "btn btn-primary btn-xs",
+        text: "Sync Score & Tradelines",
+      });
+      syncBtn.addEventListener("click", () =>
+        withBusy(syncBtn, async () => {
+          try {
+            const res = await api(`/api/v1/credit/apis/${c.id}/sync`, {
+              method: "POST",
+              body: JSON.stringify({ sync_tradelines: true }),
+            });
+            const sc = (res && res.synced_counts) || {};
+            const summary =
+              `Synced ${c.institution}: ${sc.reports_added || 0} score(s), ` +
+              `${(sc.tradelines_added || 0) + (sc.tradelines_updated || 0)} tradeline(s), ` +
+              `${sc.inquiries_added || 0} inquiry(s), ${sc.derogatories_added || 0} derogatory(s).`;
+            setCreditApiStatus(summary);
+            toast(summary);
+            await loadCreditReport();
+            await refreshAll();
+          } catch (err) {
+            setCreditApiStatus(err.message || "Credit Score API sync failed.", true);
+            toast(err.message || "Credit Score API sync failed.", true);
+          }
+        })
+      );
+
+      const delBtn = el(
+        "button",
+        { type: "button", class: "btn btn-ghost btn-xs", "aria-label": `Disconnect ${c.institution}` },
+        [makeIcon("x", "ui-icon-sm")]
+      );
+      delBtn.addEventListener("click", () =>
+        withBusy(delBtn, async () => {
+          try {
+            await api(`/api/v1/credit/apis/${c.id}`, { method: "DELETE" });
+            setCreditApiStatus(`Disconnected ${c.institution} and purged sealed credentials.`);
+            toast(`Disconnected ${c.institution}.`);
+            await loadCreditApis();
+          } catch (err) {
+            toast(err.message || "Could not disconnect Credit Score API.", true);
+          }
+        })
+      );
+
+      const metaParts = [
+        `Vendor: ${String(c.vendor || "").toUpperCase()}`,
+        `Env: ${String(c.env || "sandbox").toUpperCase()}`,
+      ];
+      if (c.api_key_masked) metaParts.push(`Key: ${c.api_key_masked}`);
+      if (c.user_id) metaParts.push(`User: ${c.user_id}`);
+      if (c.vendor === "crs" && c.bureau) metaParts.push(`Bureau: ${String(c.bureau).toUpperCase()}`);
+      if (c.api_base_url) metaParts.push(c.api_base_url);
+      metaParts.push(
+        `Last sync: ${c.last_synced_at ? String(c.last_synced_at).replace("T", " ").slice(0, 16) : "Never"}`
+      );
+
+      return el("div", { class: "item-box" }, [
+        el("div", { class: "item-row wrap" }, [
+          el("div", {}, [
+            el("div", { class: "row-gap wrap", style: { gap: "6px" } }, [
+              el("strong", { text: c.institution }),
+              el("span", { class: "pill pill-blue", text: String(c.vendor || "").toUpperCase() }),
+              el("span", { class: `pill ${statusCls}`, text: statusLabel }),
+            ]),
+            el("div", { class: "muted small tabular-nums", text: metaParts.join(" · ") }),
+          ]),
+          el("div", { class: "row-gap wrap" }, [testBtn, syncBtn, delBtn]),
+        ]),
+      ]);
+    })
+  );
+}
+
+/* ============================================================================
    Module Bootstrap
    ============================================================================ */
 
@@ -1627,6 +1825,55 @@ export function initPortfolioAndCredit() {
           await loadCreditReport();
         } catch (err) {
           toast(err.message || "Could not log derogatory mark.", true);
+        }
+      });
+    });
+  }
+
+  // --- Optional BYOK Credit Score APIs ---
+  const capiVendor = $("capi-vendor");
+  if (capiVendor) {
+    capiVendor.addEventListener("change", updateCreditApiFormFields);
+    updateCreditApiFormFields();
+  }
+
+  const capiForm = $("credit-api-connect-form");
+  if (capiForm) {
+    capiForm.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const btn = capiForm.querySelector("button[type=submit]");
+      await withBusy(btn, async () => {
+        try {
+          const vendor = $("capi-vendor").value;
+          const payload = {
+            vendor,
+            env: $("capi-env").value || "sandbox",
+            label: ($("capi-label") && $("capi-label").value.trim()) || "",
+            api_key: ($("capi-api-key") && $("capi-api-key").value.trim()) || null,
+            user_id: ($("capi-user-id") && $("capi-user-id").value.trim()) || null,
+            report_key: ($("capi-report-key") && $("capi-report-key").value.trim()) || null,
+            display_token: ($("capi-display-token") && $("capi-display-token").value.trim()) || null,
+            username: ($("capi-username") && $("capi-username").value.trim()) || null,
+            password: ($("capi-password") && $("capi-password").value.trim()) || null,
+            bureau: ($("capi-bureau") && $("capi-bureau").value) || "equifax",
+            option: ($("capi-option") && $("capi-option").value.trim()) || null,
+            api_base_url: ($("capi-base-url") && $("capi-base-url").value.trim()) || null,
+            test_on_connect: Boolean($("capi-test-on-connect") && $("capi-test-on-connect").checked),
+          };
+          const res = await api("/api/v1/credit/apis/connect", {
+            method: "POST",
+            body: JSON.stringify(payload),
+          });
+          capiForm.reset();
+          if ($("capi-vendor")) $("capi-vendor").value = vendor;
+          updateCreditApiFormFields();
+          const label = (res && res.connection && res.connection.institution) || vendor.toUpperCase();
+          setCreditApiStatus(`Sealed ${label} credentials in secrets.enc. Click Sync Score & Tradelines to pull live bureau data.`);
+          toast(`Connected Credit Score API: ${label}.`);
+          await loadCreditApis();
+        } catch (err) {
+          setCreditApiStatus(err.message || "Could not connect Credit Score API.", true);
+          toast(err.message || "Could not connect Credit Score API.", true);
         }
       });
     });

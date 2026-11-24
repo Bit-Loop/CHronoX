@@ -52,6 +52,8 @@ from chronox_finance.models import (
     BrokerRobinhoodConnectRequest,
     BrokerSchwabConnectRequest,
     CoachQuestionRequest,
+    CreditAPIConnectRequest,
+    CreditAPISyncRequest,
     CreditDerogatoryCreate,
     CreditInquiryCreate,
     CreditLineCreate,
@@ -1019,6 +1021,39 @@ def create_app(
     @v1.post("/credit/balance-transfer", tags=["Credit"], dependencies=[Depends(require_auth)])
     def eval_balance_transfer(req: BalanceTransferRequest):
         return svc.evaluate_balance_transfer(req)
+
+    # --- Optional BYOK Credit Score APIs (Spinwheel / Array / CRS / Custom) ---
+
+    @v1.get("/credit/apis", tags=["Credit"], dependencies=[Depends(require_auth)])
+    def list_credit_apis():
+        return svc.list_credit_apis()
+
+    @v1.post("/credit/apis/connect", tags=["Credit"], dependencies=[Depends(require_auth)])
+    def connect_credit_api(req: CreditAPIConnectRequest):
+        return svc.connect_credit_api(req)
+
+    @v1.post("/credit/apis/{connection_id}/test", tags=["Credit"], dependencies=[Depends(require_auth)])
+    def test_credit_api(connection_id: int):
+        try:
+            return svc.test_credit_api(connection_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @v1.post("/credit/apis/{connection_id}/sync", tags=["Credit"], dependencies=[Depends(require_auth)])
+    def sync_credit_api(
+        connection_id: int,
+        req: Annotated[Optional[CreditAPISyncRequest], Body()] = None,
+    ):
+        try:
+            return svc.sync_credit_api(connection_id, req=req)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @v1.delete("/credit/apis/{connection_id}", tags=["Credit"], dependencies=[Depends(require_auth)])
+    def disconnect_credit_api(connection_id: int):
+        if not svc.disconnect_credit_api(connection_id):
+            raise HTTPException(status_code=404, detail="Credit Score API connection not found")
+        return {"deleted": True}
 
     # --- Stocks & Crypto Portfolio + Direct Brokers ---
 

@@ -63,6 +63,8 @@ from chronox_finance.connectors.brokers import (
     parse_holdings_csv,
 )
 from chronox_finance.connectors.credit_providers import (
+    CREDIT_API_VENDOR_SPECS,
+    BureauAPIAdapter,
     OfficialCreditReportImporter,
     PlaidLiabilitiesAdapter,
 )
@@ -122,6 +124,11 @@ from chronox_finance.models import (
     BudgetAuditEvent,
     CoachAnswerResponse,
     ConnectionOut,
+    CreditAPIConnectionOut,
+    CreditAPIConnectRequest,
+    CreditAPIListResponse,
+    CreditAPISyncRequest,
+    CreditAPIVendorInfo,
     CreditDerogatoryCreate,
     CreditDerogatoryOut,
     CreditInquiryCreate,
@@ -278,6 +285,7 @@ class FinanceService:
         simplefin_transport: Any = None,
         broker_transport: Any = None,
         quote_transport: Any = None,
+        credit_api_transport: Any = None,
         imap_factory: Any = None,
     ):
         self.db_path = db_path
@@ -315,6 +323,7 @@ class FinanceService:
         self._simplefin_transport = simplefin_transport
         self._broker_transport = broker_transport
         self._quote_transport = quote_transport
+        self._credit_api_transport = credit_api_transport
         self._imap_factory = imap_factory
 
         self._pending_schwab_states: Dict[str, Dict[str, Any]] = {}
@@ -2592,6 +2601,345 @@ class FinanceService:
         out["committed"] = should_commit
         out["committed_counts"] = committed_counts
         return out
+
+    # --- Optional BYOK Credit Score APIs (Spinwheel / Array / CRS / Custom) ---
+
+    @staticmethod
+    def _credit_api_vendor_from_provider(provider: str) -> Optional[str]:
+        if not provider.startswith("credit_api_"):
+            return None
+        vendor = provider[len("credit_api_") :]
+        return vendor if vendor in CREDIT_API_VENDOR_SPECS else None
+
+    def _build_credit_api_adapter(
+        self, vendor: str, env: str, creds: Dict[str, Any]
+    ) -> BureauAPIAdapter:
+        return BureauAPIAdapter(
+            vendor=vendor,
+            env=env or "sandbox",
+            api_base_url=creds.get("api_base_url"),
+            api_key=creds.get("api_key"),
+            api_secret=creds.get("api_secret"),
+            username=creds.get("username"),
+            password=creds.get("password"),
+            user_id=creds.get("user_id"),
+            report_key=creds.get("report_key"),
+            display_token=creds.get("display_token"),
+            bureau=str(creds.get("bureau") or "equifax"),
+            option=creds.get("option"),
+            transport=self._credit_api_transport,
+        )
+
+    def _to_credit_api_connection_out(self, row: Dict[str, Any]) -> CreditAPIConnectionOut:
+        provider = str(row["provider"])
+        vendor = self._credit_api_vendor_from_provider(provider) or "custom"
+        status = str(row.get("status", "active"))
+        unlocked = self.secrets.is_unlocked()
+        if not unlocked and status == "active":
+            status = "paused_locked"
+        creds = self._safe_get_secret_json(f"conn:{row['id']}") or {}
+        key_for_mask = str(creds.get("api_key") or creds.get("username") or "")
+        return CreditAPIConnectionOut(
+            id=int(row["id"]),
+            vendor=vendor,  # type: ignore[arg-type]
+            provider=provider,
+            institution=str(row.get("institution") or CREDIT_API_VENDOR_SPECS[vendor]["display_name"]),
+            env=str(row.get("env", "sandbox")),
+            status=status,  # type: ignore[arg-type]
+            api_key_masked=mask_secret(key_for_mask) if key_for_mask else "",
+            has_credentials=bool(creds) if unlocked else True,
+            user_id=str(creds.get("user_id") or "") if unlocked else "",
+            has_report_key=bool(creds.get("report_key")) if unlocked else False,
+            bureau=str(creds.get("bureau") or "equifax") if unlocked else "equifax",
+            api_base_url=str(creds.get("api_base_url") or "") if unlocked else "",
+            last_synced_at=row.get("last_synced_at"),
+            created_at=str(row.get("created_at", "")),
+            updated_at=str(row.get("updated_at", "")),
+        )
+
+    def list_credit_apis(self) -> CreditAPIListResponse:
+        vendors = [
+            CreditAPIVendorInfo(
+                vendor=spec["vendor"],
+                display_name=spec["display_name"],
+                auth_type=spec["auth_type"],
+                bureaus=list(spec["bureaus"]),
+                models=list(spec["models"]),
+                sandbox_base_url=spec["sandbox_base_url"],
+                production_base_url=spec["production_base_url"],
+                notes=spec["notes"],
+            )
+            for spec in CREDIT_API_VENDOR_SPECS.values()
+        ]
+        all_conns = self.storage.list_connections()
+        credit_conns = [
+            self._to_credit_api_connection_out(c)
+            for c in all_conns
+            if self._credit_api_vendor_from_provider(str(c["provider"])) is not None
+        ]
+        plaid_connected = any(c["provider"] == "plaid" and c.get("status") == "active" for c in all_conns)
+        return CreditAPIListResponse(
+            vendors=vendors,
+            connections=credit_conns,
+            plaid_liabilities_connected=plaid_connected,
+        )
+
+    def connect_credit_api(self, req: CreditAPIConnectRequest) -> Dict[str, Any]:
+        self._require_vault_unlocked()
+        spec = CREDIT_API_VENDOR_SPECS[req.vendor]
+        creds: Dict[str, Any] = {
+            "vendor": req.vendor,
+            "env": req.env,
+            "api_key": (req.api_key or "").strip(),
+            "api_secret": (req.api_secret or "").strip(),
+            "username": (req.username or "").strip(),
+            "password": (req.password or "").strip(),
+            "user_id": (req.user_id or "").strip(),
+            "report_key": (req.report_key or "").strip(),
+            "display_token": (req.display_token or "").strip(),
+            "bureau": req.bureau,
+            "option": (req.option or "").strip(),
+            "api_base_url": (req.api_base_url or "").strip(),
+        }
+        # Validate host allowlist / SSRF guard and required credentials up front
+        adapter = self._build_credit_api_adapter(req.vendor, req.env, creds)
+        if not adapter.is_configured():
+            raise ConnectorError(adapter.missing_config_message(), provider=adapter.provider_name)
+
+        test_result: Optional[Dict[str, Any]] = None
+        if req.test_on_connect:
+            test_result = adapter.test_connection()
+
+        identity_seed = "|".join(
+            [
+                req.vendor,
+                req.env,
+                creds["user_id"],
+                creds["username"],
+                creds["report_key"],
+                creds["api_base_url"],
+                creds["api_key"][:12],
+                req.label.strip(),
+            ]
+        )
+        item_key = hashlib.sha256(identity_seed.encode("utf-8")).hexdigest()[:16]
+        institution = req.label.strip() or f"{spec['display_name']} ({req.env.title()})"
+        row = self.storage.upsert_connection(
+            {
+                "provider": f"credit_api_{req.vendor}",
+                "item_id": item_key,
+                "institution": institution,
+                "env": req.env,
+                "status": "active",
+            }
+        )
+        # Seal sensitive credentials strictly in secrets.enc (NEVER in SQLite)
+        self.secrets.set_json(f"conn:{row['id']}", creds)
+        self.storage.log_budget_event(
+            "connector_added", f"Connected Credit Score API: {institution} ({req.vendor})"
+        )
+        return {
+            "connection": self._to_credit_api_connection_out(row).model_dump(),
+            "capabilities": adapter.capabilities(),
+            "test_result": test_result,
+        }
+
+    def _load_credit_api_connection(self, connection_id: int) -> Tuple[Dict[str, Any], str, BureauAPIAdapter]:
+        self._require_vault_unlocked()
+        conn = self.storage.get_connection(connection_id)
+        if not conn:
+            raise ValueError(f"Credit Score API connection #{connection_id} not found.")
+        vendor = self._credit_api_vendor_from_provider(str(conn["provider"]))
+        if not vendor:
+            raise ValueError(f"Connection #{connection_id} is not a Credit Score API connection.")
+        creds = self.secrets.get_json(f"conn:{connection_id}")
+        if not creds:
+            self.storage.upsert_connection(
+                {"id": connection_id, "provider": conn["provider"], "status": "needs_reauth"}
+            )
+            raise ConnectorAuthError(
+                "Encrypted credentials missing for this Credit Score API connection. Re-connect to seal new keys.",
+                provider=f"bureau_api_{vendor}",
+            )
+        adapter = self._build_credit_api_adapter(vendor, str(conn.get("env") or "sandbox"), creds)
+        return conn, vendor, adapter
+
+    def test_credit_api(self, connection_id: int) -> Dict[str, Any]:
+        conn, _vendor, adapter = self._load_credit_api_connection(connection_id)
+        try:
+            res = adapter.test_connection()
+            self.storage.upsert_connection(
+                {"id": connection_id, "provider": conn["provider"], "status": "active"}
+            )
+            return res
+        except ConnectorAuthError:
+            self.storage.upsert_connection(
+                {"id": connection_id, "provider": conn["provider"], "status": "needs_reauth"}
+            )
+            raise
+
+    def sync_credit_api(
+        self,
+        connection_id: int,
+        req: Optional[CreditAPISyncRequest] = None,
+    ) -> Dict[str, Any]:
+        conn, vendor, adapter = self._load_credit_api_connection(connection_id)
+        effective = req or CreditAPISyncRequest()
+        try:
+            bundle = adapter.fetch_credit_snapshot(
+                order_refresh=effective.order_refresh,
+                report_key=effective.report_key,
+                display_token=effective.display_token,
+                bureau=effective.bureau,
+                option=effective.option,
+                consumer_profile=effective.consumer_profile,
+            )
+        except ConnectorAuthError:
+            self.storage.upsert_connection(
+                {"id": connection_id, "provider": conn["provider"], "status": "needs_reauth"}
+            )
+            raise
+
+        counts = {
+            "reports_added": 0,
+            "reports_skipped_duplicate": 0,
+            "inquiries_added": 0,
+            "inquiries_skipped_duplicate": 0,
+            "derogatories_added": 0,
+            "derogatories_skipped_duplicate": 0,
+            "tradelines_added": 0,
+            "tradelines_updated": 0,
+        }
+
+        existing_reports = {
+            (str(r["bureau"]), str(r["model"]), int(r["score"]), str(r["pulled_date"]))
+            for r in self.storage.list_credit_reports()
+        }
+        for rep in bundle.reports:
+            if rep.score is None or not (300 <= int(rep.score) <= 850):
+                continue
+            model_val = rep.model if rep.model in ("fico8", "vantage3", "fico9", "other") else "other"
+            rkey = (rep.bureau, model_val, int(rep.score), rep.pulled_date)
+            if rkey in existing_reports:
+                counts["reports_skipped_duplicate"] += 1
+                continue
+            self.storage.create_credit_report(
+                {
+                    "bureau": rep.bureau,
+                    "model": model_val,
+                    "score": int(rep.score),
+                    "pulled_date": rep.pulled_date,
+                    "source": rep.source or f"{vendor}_api",
+                }
+            )
+            existing_reports.add(rkey)
+            counts["reports_added"] += 1
+
+        existing_inqs = {
+            (str(i["lender"]).strip().lower(), str(i["bureau"]), str(i["inquiry_date"]))
+            for i in self.storage.list_credit_inquiries()
+        }
+        for inq in bundle.inquiries:
+            ikey = (inq.lender.strip().lower(), inq.bureau, inq.inquiry_date)
+            if ikey in existing_inqs:
+                counts["inquiries_skipped_duplicate"] += 1
+                continue
+            self.storage.create_credit_inquiry(
+                {
+                    "lender": inq.lender,
+                    "bureau": inq.bureau,
+                    "inquiry_date": inq.inquiry_date,
+                    "counts_until": inq.counts_until,
+                    "drops_off": inq.drops_off,
+                }
+            )
+            existing_inqs.add(ikey)
+            counts["inquiries_added"] += 1
+
+        valid_derog = {
+            "late_30",
+            "late_60",
+            "late_90",
+            "charge_off",
+            "collection",
+            "bankruptcy_ch7",
+            "bankruptcy_ch13",
+            "other",
+        }
+        existing_derogs = {
+            (str(d["kind"]), str(d.get("lender", "")).strip().lower(), str(d["opened_date"]))
+            for d in self.storage.list_credit_derogatories(active_only=False)
+        }
+        for der in bundle.derogatories:
+            dkind = der.kind if der.kind in valid_derog else "other"
+            lender_str = der.lender or der.creditor
+            dkey = (dkind, lender_str.strip().lower(), der.opened_date)
+            if dkey in existing_derogs:
+                counts["derogatories_skipped_duplicate"] += 1
+                continue
+            self.storage.create_credit_derogatory(
+                {
+                    "kind": dkind,
+                    "lender": lender_str,
+                    "opened_date": der.opened_date,
+                    "drops_off": der.drops_off,
+                    "active": der.active,
+                }
+            )
+            existing_derogs.add(dkey)
+            counts["derogatories_added"] += 1
+
+        if effective.sync_tradelines and bundle.tradelines:
+            existing_lines = {
+                str(cl["name"]).strip().lower(): cl
+                for cl in self.storage.list_credit_lines(active_only=False)
+            }
+            for tl in bundle.tradelines:
+                payload = tl.to_credit_line_payload()
+                name_key = str(payload.get("name", "")).strip().lower()
+                if not name_key:
+                    continue
+                if name_key in existing_lines:
+                    self.storage.update_credit_line(int(existing_lines[name_key]["id"]), payload)
+                    counts["tradelines_updated"] += 1
+                else:
+                    created = self.storage.create_credit_line(payload)
+                    existing_lines[name_key] = created
+                    counts["tradelines_added"] += 1
+
+        updated_conn = self.storage.upsert_connection(
+            {
+                "id": connection_id,
+                "provider": conn["provider"],
+                "status": "active",
+                "last_synced_at": utc_now_iso(),
+            }
+        )
+        total_changes = (
+            counts["reports_added"]
+            + counts["inquiries_added"]
+            + counts["derogatories_added"]
+            + counts["tradelines_added"]
+            + counts["tradelines_updated"]
+        )
+        if total_changes > 0:
+            self.run_self_updating_sync(
+                reason=f"Synced Credit Score API ({conn.get('institution') or vendor})"
+            )
+
+        return {
+            "connection": self._to_credit_api_connection_out(updated_conn).model_dump(),
+            "synced_counts": counts,
+            "warnings": list(bundle.warnings),
+            "credit_report": self.get_credit_report().model_dump(),
+        }
+
+    def disconnect_credit_api(self, connection_id: int) -> bool:
+        self._require_vault_unlocked()
+        conn = self.storage.get_connection(connection_id)
+        if not conn or self._credit_api_vendor_from_provider(str(conn["provider"])) is None:
+            return False
+        return self.delete_connection(connection_id)
 
     # --- Stocks & Crypto Portfolio + Direct Official Brokers ---
 

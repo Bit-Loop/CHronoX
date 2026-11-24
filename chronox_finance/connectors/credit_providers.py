@@ -12,30 +12,43 @@ Provides:
 4. `OfficialCreditReportImporter`: primary structured JSON/manual parser + best-effort
    AnnualCreditReport.com Experian/Equifax/TransUnion pure-Python PDF extractor with
    mandatory `needs_review=True` preview payload.
-5. `BureauAPIAdapter`: clean future SaaS interface for CRS / Array / Spinwheel returning
-   honest `NotConfiguredForLocalDesktop` guidance on local desktop installs.
+5. `BureauAPIAdapter`: optional BYOK Credit Score API client supporting:
+   - **Spinwheel** (Equifax credit score + full liabilities profile, Sandbox & Production)
+   - **Array** (1B/3B Experian/Equifax/TransUnion JSON reports, Sandbox & Production)
+   - **CRS Credit API** (Experian/Equifax/TransUnion JWT login or Bearer token, Sandbox & Production)
+   - **Custom Credit Score API** (ChronoX-compatible HTTPS or local loopback JSON bridge)
+   When unconfigured, cleanly raises `NotConfiguredForLocalDesktop` with actionable local guidance.
 """
 
 from __future__ import annotations
 
 import calendar
 import io
+import ipaddress
 import json
 import logging
 import re
 import zlib
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple, Union
+from urllib.parse import quote, urlencode, urlparse
+
+import httpx
 
 from chronox_finance.connectors.base import (
+    ConnectorAuthError,
     ConnectorError,
+    HostNotAllowedError,
     NormalizedLiability,
     NotConfiguredForLocalDesktop,
     apr_pct_to_bps,
+    build_http_client,
     decimal_to_cents,
+    request_with_retry,
+    validate_strict_external_url,
 )
-from chronox_finance.security import sanitize_untrusted_text
+from chronox_finance.security import sanitize_untrusted_text, validate_external_api_url
 
 logger = logging.getLogger(__name__)
 
@@ -1007,62 +1020,1166 @@ class OfficialCreditReportImporter:
 
 
 # ---------------------------------------------------------------------------
-# 3. Bureau API Adapter (Clean Future SaaS Seam: CRS / Array / Spinwheel)
+# 3. Optional BYOK Credit Score API Adapter (Spinwheel / Array / CRS / Custom)
 # ---------------------------------------------------------------------------
+
+CREDIT_API_VENDOR_SPECS: Dict[str, Dict[str, Any]] = {
+    "spinwheel": {
+        "vendor": "spinwheel",
+        "display_name": "Spinwheel",
+        "auth_type": "bearer_api_key",
+        "bureaus": ["equifax"],
+        "models": ["vantage3", "fico8"],
+        "sandbox_base_url": "https://sandbox-api.spinwheel.io",
+        "production_base_url": "https://api.spinwheel.io",
+        "allowed_hosts": ("sandbox-api.spinwheel.io", "api.spinwheel.io"),
+        "notes": "Equifax credit score & full liabilities profile via Bearer API Key + Spinwheel User ID.",
+    },
+    "array": {
+        "vendor": "array",
+        "display_name": "Array",
+        "auth_type": "server_token",
+        "bureaus": ["experian", "equifax", "transunion"],
+        "models": ["vantage3", "fico8"],
+        "sandbox_base_url": "https://sandbox.array.io/api",
+        "production_base_url": "https://array.io/api",
+        "allowed_hosts": ("sandbox.array.io", "array.io"),
+        "notes": "1B/3B Experian, Equifax & TransUnion JSON reports via Server Token + Report Key & Display Token.",
+    },
+    "crs": {
+        "vendor": "crs",
+        "display_name": "CRS Credit API",
+        "auth_type": "jwt_login_or_bearer",
+        "bureaus": ["experian", "equifax", "transunion"],
+        "models": ["fico8", "vantage3", "fico9"],
+        "sandbox_base_url": "https://api-sandbox.stitchcredit.com/api",
+        "production_base_url": "https://api.stitchcredit.com/api",
+        "allowed_hosts": ("api-sandbox.stitchcredit.com", "api.stitchcredit.com"),
+        "notes": "Direct Experian, Equifax & TransUnion pulls via CRS Username/Password JWT login or Bearer Token.",
+    },
+    "custom": {
+        "vendor": "custom",
+        "display_name": "Custom Credit Score API",
+        "auth_type": "bearer_api_key",
+        "bureaus": ["experian", "equifax", "transunion", "other"],
+        "models": ["fico8", "vantage3", "fico9", "other"],
+        "sandbox_base_url": "",
+        "production_base_url": "",
+        "allowed_hosts": None,
+        "notes": "Any ChronoX-compatible HTTPS or local loopback credit bridge returning structured score/report JSON.",
+    },
+}
+
+_CRS_DEFAULT_OPTIONS: Dict[str, str] = {
+    "equifax": "credit-report-equifax-vantage3",
+    "experian": "credit-report-experian-fico8",
+    "transunion": "credit-report-transunion-vantage3",
+}
+
+
+def _validate_custom_credit_url(url: str, *, provider: str) -> str:
+    """
+    Validate a Custom Credit Score API URL.
+
+    Allows:
+    - Public `https://` endpoints
+    - Explicit loopback `http(s)://127.0.0.1`, `localhost`, or `[::1]` for self-hosted/local bridges
+
+    Blocks:
+    - Non-HTTP schemes, non-local plaintext `http://`, embedded URL credentials
+    - Cloud metadata / link-local IPs (`169.254.x.x`, `fe80::/10`), multicast, reserved
+    - Private RFC1918 / ULA networks (`10.x`, `172.16.x`, `192.168.x`, `fc00::/7`)
+    """
+    raw = (url or "").strip()
+    if not raw:
+        raise HostNotAllowedError("Custom Credit API URL must not be empty", provider=provider)
+    try:
+        validated = validate_external_api_url(raw)
+    except ValueError as exc:
+        raise HostNotAllowedError(str(exc), provider=provider) from exc
+
+    parsed = urlparse(validated)
+    host = (parsed.hostname or "").lower()
+    if parsed.username is not None or parsed.password is not None:
+        raise HostNotAllowedError("Embedded URL credentials are not permitted", provider=provider)
+    if host.endswith((".local", ".internal")):
+        raise HostNotAllowedError(f"Internal host '{host}' is blocked", provider=provider)
+
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+
+    if ip is not None and not ip.is_loopback:
+        if (
+            ip.is_private
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise HostNotAllowedError(f"Blocked non-public IP address '{host}'", provider=provider)
+
+    return validated
+
+
+def _money_field_to_cents(obj: Dict[str, Any], cents_keys: Sequence[str], dollar_keys: Sequence[str]) -> int:
+    for k in cents_keys:
+        if obj.get(k) is not None and str(obj.get(k)).strip() != "":
+            return max(0, int(obj[k]))
+    for k in dollar_keys:
+        val = obj.get(k)
+        if val is not None and str(val).strip() != "":
+            try:
+                return max(0, decimal_to_cents(val))
+            except ValueError:
+                continue
+    return 0
+
+
+def _opt_money_field_to_cents(
+    obj: Dict[str, Any], cents_keys: Sequence[str], dollar_keys: Sequence[str]
+) -> Optional[int]:
+    for k in cents_keys:
+        if obj.get(k) is not None and str(obj.get(k)).strip() != "":
+            return max(0, int(obj[k]))
+    for k in dollar_keys:
+        val = obj.get(k)
+        if val is not None and str(val).strip() != "":
+            try:
+                return max(0, decimal_to_cents(val))
+            except ValueError:
+                continue
+    return None
+
+
+def _parse_score_int(raw: Any) -> Optional[int]:
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        val = int(round(float(str(raw).strip().lstrip("+"))))
+    except (ValueError, TypeError):
+        return None
+    return val if 300 <= val <= 850 else None
+
+
+def _safe_error_snippet(response: httpx.Response, *, max_len: int = 180) -> str:
+    try:
+        body = response.json()
+        if isinstance(body, dict):
+            msg = (
+                body.get("message")
+                or body.get("error_description")
+                or body.get("error")
+                or body.get("detail")
+                or body.get("statusMessage")
+            )
+            if isinstance(msg, dict):
+                msg = msg.get("message") or msg.get("desc") or json.dumps(msg)
+            if msg:
+                return sanitize_untrusted_text(str(msg), max_len=max_len)
+    except (ValueError, TypeError):
+        logger.debug("Non-JSON credit API error body (HTTP %s)", response.status_code)
+    return sanitize_untrusted_text(response.text or f"HTTP {response.status_code}", max_len=max_len)
 
 
 class BureauAPIAdapter:
     """
-    Future SaaS credit-bureau adapter interface for CRS Credit API, Array, or Spinwheel.
+    Optional BYOK Credit Score API client for Spinwheel, Array, CRS Credit API, and
+    Custom Credit Score REST endpoints.
 
-    Direct tri-merge bureau APIs require B2B commercial credentialing, permissible-purpose
-    audits, and FCRA compliance infrastructure — they cannot be embedded in a local-first
-    desktop binary. On local desktop builds this adapter raises `NotConfiguredForLocalDesktop`
-    with honest, actionable guidance.
+    - When instantiated WITHOUT credentials (default local desktop state), `is_configured()`
+      is `False` and `fetch_credit_snapshot()` raises `NotConfiguredForLocalDesktop` with
+      clear guidance pointing to Plaid Liabilities & Official Credit Report imports.
+    - When instantiated WITH user-supplied BYOK credentials (sealed in `secrets.enc`),
+      performs strictly allowlisted, redirect-blocking HTTPS requests and normalizes
+      bureau scores, hard inquiries, derogatories, and tradelines into `CreditImportBundle`.
     """
 
-    SUPPORTED_VENDORS = ("crs", "array", "spinwheel")
+    SUPPORTED_VENDORS = ("spinwheel", "array", "crs", "custom")
 
     def __init__(
         self,
         vendor: str = "crs",
         *,
+        env: str = "sandbox",
         api_base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        api_secret: Optional[str] = None,
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        user_id: Optional[str] = None,
+        report_key: Optional[str] = None,
+        display_token: Optional[str] = None,
+        bureau: str = "equifax",
+        option: Optional[str] = None,
+        transport: Optional[httpx.BaseTransport] = None,
+        timeout: float = 20.0,
+        max_retries: int = 2,
+        backoff_base: float = 0.25,
+        sleep_fn: Optional[Callable[[float], None]] = None,
     ) -> None:
         normalized = (vendor or "crs").strip().lower()
         if normalized not in self.SUPPORTED_VENDORS:
             raise ValueError(f"Unsupported bureau adapter '{vendor}'; choose from {self.SUPPORTED_VENDORS}")
+        norm_env = (env or "sandbox").strip().lower()
+        if norm_env not in ("sandbox", "production"):
+            raise ValueError("Environment must be 'sandbox' or 'production'")
+
         self.vendor = normalized
+        self.env = norm_env
         self.provider_name = f"bureau_api_{normalized}"
-        self._api_base_url = (api_base_url or "").strip()
+        self._spec = CREDIT_API_VENDOR_SPECS[normalized]
+
+        raw_base = (api_base_url or "").strip()
+        if normalized == "custom":
+            self._api_base_url = (
+                _validate_custom_credit_url(raw_base, provider=self.provider_name) if raw_base else ""
+            )
+        else:
+            default_url = self._spec[f"{norm_env}_base_url"]
+            target_url = raw_base or default_url
+            self._api_base_url = validate_strict_external_url(
+                target_url,
+                provider=self.provider_name,
+                allowed_hosts=self._spec["allowed_hosts"],
+                require_https=True,
+            ).rstrip("/")
+
+        self._api_key = (api_key or "").strip()
+        self._api_secret = (api_secret or "").strip()
         self._client_id = (client_id or "").strip()
         self._client_secret = (client_secret or "").strip()
+        self._username = (username or "").strip()
+        self._password = (password or "").strip()
+        self._user_id = (user_id or "").strip()
+        self._report_key = (report_key or "").strip()
+        self._display_token = (display_token or "").strip()
+        self._bureau = _normalize_bureau(bureau or "equifax")
+        if self._bureau == "other":
+            self._bureau = "equifax"
+        self._option = (option or "").strip()
+        self._transport = transport
+        self._timeout = float(timeout)
+        self._max_retries = int(max_retries)
+        self._backoff_base = float(backoff_base)
+        self._sleep_fn = sleep_fn
 
     def is_configured(self) -> bool:
-        return bool(self._api_base_url and self._client_id and self._client_secret)
+        if self.vendor == "spinwheel":
+            return bool(self._api_key and self._user_id)
+        if self.vendor == "array":
+            return bool(self._api_key or self._client_secret)
+        if self.vendor == "crs":
+            return bool(
+                self._api_key
+                or (self._username and self._password)
+                or (self._client_id and self._client_secret)
+            )
+        if self.vendor == "custom":
+            return bool(self._api_base_url)
+        return False
+
+    def missing_config_message(self) -> str:
+        if self.vendor == "spinwheel":
+            return "Spinwheel requires both an API key and a Spinwheel User ID."
+        if self.vendor == "array":
+            return "Array requires an Array Server Token (api_key)."
+        if self.vendor == "crs":
+            return "CRS Credit API requires either a Bearer token (api_key) or a username and password."
+        return "Custom Credit Score API requires a valid HTTPS or localhost API URL."
 
     def capabilities(self) -> Dict[str, Any]:
+        configured = self.is_configured()
         return {
             "vendor": self.vendor,
-            "configured": self.is_configured(),
-            "local_desktop_supported": False,
-            "requires_fcra_saas_backend": True,
+            "display_name": self._spec["display_name"],
+            "env": self.env,
+            "base_url": self._api_base_url,
+            "configured": configured,
+            "byok_supported": True,
+            "local_desktop_supported": configured,
+            "requires_fcra_saas_backend": self.vendor in ("crs", "array", "spinwheel"),
+            "bureaus": list(self._spec["bureaus"]),
+            "models": list(self._spec["models"]),
             "recommended_local_alternatives": [
                 "Plaid Liabilities (/liabilities/get) for live credit cards, APRs, and loans",
                 "Official AnnualCreditReport.com PDF or Structured Manual Form for bureau scores, inquiries, and derogatories",
             ],
         }
 
-    def fetch_credit_snapshot(self, *args: Any, **kwargs: Any) -> CreditImportBundle:
-        raise NotConfiguredForLocalDesktop(
-            f"Direct bureau API '{self.vendor.upper()}' is a B2B/FCRA-gated SaaS integration and is "
-            "not configured for local desktop installations. Use Plaid Liabilities for live card/loan "
-            "balances & APRs and the Official Credit Report Structured Form / AnnualCreditReport.com "
-            "importer for bureau scores, hard inquiries, and derogatory drop-off tracking.",
-            provider=self.provider_name,
-        )
+    def _request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[int, Any]:
+        req_headers = {"Accept": "application/json", "User-Agent": "ChronoX-Finance/2.0"}
+        if headers:
+            req_headers.update(headers)
+        kwargs: Dict[str, Any] = {}
+        if json_body is not None:
+            kwargs["json"] = json_body
+            req_headers.setdefault("Content-Type", "application/json")
+
+        retry_kwargs: Dict[str, Any] = {
+            "provider": self.provider_name,
+            "max_retries": self._max_retries,
+            "backoff_base": self._backoff_base,
+        }
+        if self._sleep_fn is not None:
+            retry_kwargs["sleep_fn"] = self._sleep_fn
+
+        with build_http_client(timeout=self._timeout, transport=self._transport, headers=req_headers) as client:
+            resp = request_with_retry(client, method, url, **retry_kwargs, **kwargs)
+
+        if resp.status_code in (401, 403):
+            raise ConnectorAuthError(
+                f"{self._spec['display_name']} authentication failed (HTTP {resp.status_code}): "
+                f"{_safe_error_snippet(resp)}",
+                provider=self.provider_name,
+                status_code=resp.status_code,
+            )
+        if resp.status_code >= 400:
+            raise ConnectorError(
+                f"{self._spec['display_name']} request failed (HTTP {resp.status_code}): "
+                f"{_safe_error_snippet(resp)}",
+                provider=self.provider_name,
+                status_code=resp.status_code,
+            )
+        try:
+            data = resp.json() if resp.content else {}
+        except ValueError as exc:
+            raise ConnectorError(
+                f"{self._spec['display_name']} returned non-JSON response (HTTP {resp.status_code}).",
+                provider=self.provider_name,
+                status_code=resp.status_code,
+            ) from exc
+        return resp.status_code, data
+
+    def test_connection(
+        self,
+        *,
+        report_key: Optional[str] = None,
+        display_token: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Verify live API credentials without mutating local ledger state."""
+        if not self.is_configured():
+            raise NotConfiguredForLocalDesktop(
+                f"{self._spec['display_name']} is not configured. {self.missing_config_message()}",
+                provider=self.provider_name,
+            )
+
+        if self.vendor == "spinwheel":
+            safe_uid = quote(self._user_id, safe="")
+            url = f"{self._api_base_url}/v1/users/{safe_uid}"
+            status, payload = self._request_json(
+                "GET", url, headers={"Authorization": f"Bearer {self._api_key}"}
+            )
+            data = payload.get("data", payload) if isinstance(payload, dict) else {}
+            has_profile = bool(isinstance(data, dict) and (data.get("creditProfile") or data.get("credit_profile")))
+            return {
+                "ok": True,
+                "vendor": "spinwheel",
+                "env": self.env,
+                "status_code": status,
+                "user_id": self._user_id,
+                "has_credit_profile": has_profile,
+                "message": f"Spinwheel {self.env} connection verified for user {self._user_id}.",
+            }
+
+        if self.vendor == "array":
+            token = self._api_key or self._client_secret
+            rk = (report_key or self._report_key).strip()
+            dt = (display_token or self._display_token).strip()
+            headers = {
+                "x-array-server-token": token,
+                "Authorization": f"Bearer {token}",
+            }
+            if rk and dt:
+                qs = urlencode({"reportKey": rk, "displayToken": dt})
+                url = f"{self._api_base_url}/report/v2?{qs}"
+            elif self._user_id:
+                qs = urlencode({"userId": self._user_id})
+                url = f"{self._api_base_url}/user/v2?{qs}"
+            else:
+                url = f"{self._api_base_url}/report/v2"
+            status, _payload = self._request_json("GET", url, headers=headers)
+            return {
+                "ok": True,
+                "vendor": "array",
+                "env": self.env,
+                "status_code": status,
+                "message": (
+                    "Array report still generating (HTTP 202); credentials valid."
+                    if status == 202
+                    else f"Array {self.env} connection verified."
+                ),
+            }
+
+        if self.vendor == "crs":
+            bearer = self._crs_get_bearer_token()
+            status, payload = self._request_json(
+                "GET",
+                f"{self._api_base_url}/system/health",
+                headers={"Authorization": f"Bearer {bearer}"},
+            )
+            return {
+                "ok": True,
+                "vendor": "crs",
+                "env": self.env,
+                "status_code": status,
+                "authenticated": True,
+                "health": payload if isinstance(payload, dict) else {"status": "ok"},
+                "message": f"CRS Credit API {self.env} authenticated & healthy.",
+            }
+
+        # custom
+        headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
+        status, payload = self._request_json("GET", self._api_base_url, headers=headers)
+        if not isinstance(payload, dict):
+            raise ConnectorError(
+                "Custom Credit Score API must return a JSON object.",
+                provider=self.provider_name,
+                status_code=status,
+            )
+        return {
+            "ok": True,
+            "vendor": "custom",
+            "env": self.env,
+            "status_code": status,
+            "message": f"Custom Credit Score API reachable ({self._api_base_url}).",
+        }
+
+    def fetch_credit_snapshot(
+        self,
+        *,
+        order_refresh: bool = False,
+        report_key: Optional[str] = None,
+        display_token: Optional[str] = None,
+        bureau: Optional[str] = None,
+        option: Optional[str] = None,
+        consumer_profile: Optional[Dict[str, Any]] = None,
+    ) -> CreditImportBundle:
+        """
+        Pull live bureau credit scores, inquiries, derogatories, and tradelines from the
+        configured Credit Score API vendor.
+
+        When unconfigured, raises `NotConfiguredForLocalDesktop` with guidance for local
+        Plaid Liabilities & Official Credit Report imports.
+        """
+        if not self.is_configured():
+            raise NotConfiguredForLocalDesktop(
+                f"Direct bureau API '{self.vendor.upper()}' is not configured yet. Configure BYOK "
+                "credentials in Credit & Debt -> Optional Credit Score APIs, or use Plaid Liabilities "
+                "for live card/loan balances & APRs and the Official Credit Report Structured Form / "
+                "AnnualCreditReport.com importer for bureau scores, hard inquiries, and derogatory drop-offs.",
+                provider=self.provider_name,
+            )
+
+        if self.vendor == "spinwheel":
+            return self._fetch_spinwheel(order_refresh=order_refresh)
+        if self.vendor == "array":
+            return self._fetch_array(report_key=report_key, display_token=display_token)
+        if self.vendor == "crs":
+            return self._fetch_crs(bureau=bureau, option=option, consumer_profile=consumer_profile)
+        return self._fetch_custom()
 
     def pull_tri_merge(self, *args: Any, **kwargs: Any) -> CreditImportBundle:
         return self.fetch_credit_snapshot(*args, **kwargs)
+
+    # --- Vendor 1: Spinwheel (Equifax Credit Profile + Liabilities) ---
+
+    def _fetch_spinwheel(self, *, order_refresh: bool = False) -> CreditImportBundle:
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+        safe_uid = quote(self._user_id, safe="")
+        if order_refresh:
+            self._request_json(
+                "POST",
+                f"{self._api_base_url}/v1/users/{safe_uid}/debtProfile",
+                headers=headers,
+                json_body={"creditReport": {"source": "equifax"}},
+            )
+        _status, payload = self._request_json(
+            "GET",
+            f"{self._api_base_url}/v1/users/{safe_uid}",
+            headers=headers,
+        )
+        return self._parse_spinwheel_payload(payload if isinstance(payload, dict) else {})
+
+    def _parse_spinwheel_payload(self, payload: Dict[str, Any]) -> CreditImportBundle:
+        data = payload.get("data", payload) if isinstance(payload.get("data"), dict) else payload
+        today_iso = date.today().isoformat()
+        reports: List[CreditReportRecord] = []
+        tradelines: List[CreditTradelineRecord] = []
+        inquiries: List[CreditInquiryRecord] = []
+        derogatories: List[CreditDerogatoryRecord] = []
+        warnings: List[str] = []
+
+        profile = data.get("creditProfile") or data.get("credit_profile") or {}
+        if isinstance(profile, dict):
+            raw_scores: List[Dict[str, Any]] = []
+            if isinstance(profile.get("creditScores"), list):
+                raw_scores.extend(s for s in profile["creditScores"] if isinstance(s, dict))
+            elif isinstance(profile.get("creditScore"), dict):
+                raw_scores.append(profile["creditScore"])
+            elif profile.get("creditScore") is not None:
+                raw_scores.append(
+                    {
+                        "score": profile.get("creditScore"),
+                        "model": profile.get("scoreModel") or profile.get("creditScoreModel") or "vantage3",
+                        "bureau": profile.get("bureau") or "equifax",
+                        "pulled_date": profile.get("updatedAt") or profile.get("pulledDate") or today_iso,
+                    }
+                )
+            elif profile.get("score") is not None:
+                raw_scores.append(profile)
+
+            for s_item in raw_scores:
+                score_val = _parse_score_int(
+                    s_item.get("score") or s_item.get("creditScore") or s_item.get("value")
+                )
+                if score_val is None:
+                    continue
+                pulled = (
+                    _parse_flexible_date(
+                        s_item.get("pulled_date")
+                        or s_item.get("pulledDate")
+                        or s_item.get("updatedAt")
+                        or s_item.get("reportedDate")
+                    )
+                    or today_iso
+                )
+                reports.append(
+                    CreditReportRecord(
+                        bureau=_normalize_bureau(str(s_item.get("bureau") or "equifax")),
+                        pulled_date=pulled,
+                        model=_normalize_model(
+                            str(s_item.get("model") or s_item.get("scoreModel") or "vantage3")
+                        ),
+                        score=score_val,
+                        source="spinwheel_api",
+                        needs_review=False,
+                    )
+                )
+
+            for raw_inq in profile.get("inquiries") or profile.get("hardInquiries") or []:
+                if not isinstance(raw_inq, dict):
+                    continue
+                inq_date = _parse_flexible_date(
+                    raw_inq.get("inquiryDate") or raw_inq.get("inquiry_date") or raw_inq.get("date")
+                )
+                if not inq_date:
+                    continue
+                inquiries.append(
+                    CreditInquiryRecord(
+                        lender=str(raw_inq.get("lender") or raw_inq.get("subscriberName") or "Unknown Lender"),
+                        bureau=str(raw_inq.get("bureau") or "equifax"),
+                        inquiry_date=inq_date,
+                    )
+                )
+
+            for raw_der in profile.get("derogatories") or profile.get("publicRecords") or []:
+                if not isinstance(raw_der, dict):
+                    continue
+                ev_date = _parse_flexible_date(
+                    raw_der.get("openedDate") or raw_der.get("opened_date") or raw_der.get("date")
+                )
+                if not ev_date:
+                    continue
+                derogatories.append(
+                    CreditDerogatoryRecord(
+                        kind=str(raw_der.get("kind") or raw_der.get("type") or "late_payment"),
+                        opened_date=ev_date,
+                        creditor=str(raw_der.get("creditor") or raw_der.get("lender") or ""),
+                        bureau=str(raw_der.get("bureau") or "equifax"),
+                        amount_cents=_opt_money_field_to_cents(raw_der, ("amount_cents",), ("amount", "balance")),
+                    )
+                )
+
+        # Parse Spinwheel liabilities buckets
+        liab_root = data.get("liabilities") if isinstance(data.get("liabilities"), dict) else data
+        bucket_kind_map = (
+            ("creditCards", "credit_card"),
+            ("credit_cards", "credit_card"),
+            ("studentLoans", "student_loan"),
+            ("student_loans", "student_loan"),
+            ("autoLoans", "auto_loan"),
+            ("auto_loans", "auto_loan"),
+            ("personalLoans", "personal_loan"),
+            ("personal_loans", "personal_loan"),
+            ("homeLoans", "mortgage"),
+            ("home_loans", "mortgage"),
+            ("mortgages", "mortgage"),
+            ("miscellaneousLiabilities", "personal_loan"),
+        )
+        for bucket_key, default_kind in bucket_kind_map:
+            items = liab_root.get(bucket_key)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                stmt = item.get("statementSummary") if isinstance(item.get("statementSummary"), dict) else {}
+                card_prof = item.get("creditCardProfile") if isinstance(item.get("creditCardProfile"), dict) else {}
+                bal_det = item.get("balanceDetails") if isinstance(item.get("balanceDetails"), dict) else {}
+                liab_prof = item.get("liabilityProfile") if isinstance(item.get("liabilityProfile"), dict) else {}
+
+                name = (
+                    item.get("name")
+                    or item.get("accountName")
+                    or card_prof.get("accountName")
+                    or liab_prof.get("creditorName")
+                    or item.get("creditorName")
+                    or f"{default_kind.replace('_', ' ').title()}"
+                )
+                issuer = (
+                    item.get("issuer")
+                    or card_prof.get("issuerName")
+                    or liab_prof.get("servicerName")
+                    or item.get("servicerName")
+                    or ""
+                )
+                bal_cents = _money_field_to_cents(
+                    item,
+                    ("balance_cents",),
+                    ("currentBalance", "balance", "outstandingBalance"),
+                ) or _money_field_to_cents(bal_det, ("balance_cents",), ("outstandingBalance", "currentBalance"))
+
+                limit_cents = (
+                    _money_field_to_cents(
+                        item, ("credit_limit_cents",), ("creditLimit", "limit", "highCredit")
+                    )
+                    or _money_field_to_cents(stmt, ("credit_limit_cents",), ("creditLimit",))
+                    or _money_field_to_cents(card_prof, ("credit_limit_cents",), ("creditLimit",))
+                )
+                stmt_bal = _opt_money_field_to_cents(
+                    stmt, ("statement_balance_cents",), ("statementBalance", "lastStatementBalance")
+                ) or _opt_money_field_to_cents(
+                    item, ("statement_balance_cents",), ("statementBalance", "lastStatementBalance")
+                )
+                min_pay = _money_field_to_cents(
+                    stmt, ("min_payment_cents",), ("minimumPaymentAmount", "minimumPayment")
+                ) or _money_field_to_cents(
+                    item, ("min_payment_cents",), ("minimumPaymentAmount", "minimumPayment")
+                )
+
+                raw_apr = (
+                    item.get("apr")
+                    if item.get("apr") is not None
+                    else (
+                        item.get("interestRate")
+                        if item.get("interestRate") is not None
+                        else (stmt.get("apr") if stmt.get("apr") is not None else liab_prof.get("interestRatePercentage"))
+                    )
+                )
+                apr_bps = int(item["apr_bps"]) if item.get("apr_bps") is not None else apr_pct_to_bps(raw_apr)
+
+                due_date = _parse_flexible_date(
+                    stmt.get("dueDate") or item.get("dueDate") or item.get("nextPaymentDueDate")
+                )
+                stmt_date = _parse_flexible_date(
+                    stmt.get("statementDate") or item.get("lastStatementDate")
+                )
+                opened_date = _parse_flexible_date(
+                    item.get("openedDate") or item.get("originationDate") or liab_prof.get("originationDate")
+                )
+                status_raw = str(item.get("status") or liab_prof.get("status") or "open").strip().lower()
+                is_overdue = bool(
+                    item.get("isOverdue")
+                    or stmt.get("pastDueAmount")
+                    or "delinquent" in status_raw
+                    or "past_due" in status_raw
+                )
+                ecoa = str(item.get("accountOwnershipType") or card_prof.get("ecoaCode") or "").lower()
+                is_au = bool(item.get("isAuthorizedUser") or "authorized" in ecoa)
+
+                tradelines.append(
+                    CreditTradelineRecord(
+                        name=sanitize_untrusted_text(str(name), max_len=80) or "Credit Account",
+                        issuer=sanitize_untrusted_text(str(issuer), max_len=60),
+                        kind=default_kind,
+                        balance_cents=bal_cents,
+                        credit_limit_cents=limit_cents,
+                        apr_bps=apr_bps,
+                        min_payment_cents=min_pay,
+                        statement_balance_cents=stmt_bal,
+                        statement_closing_day=_day_from_iso(stmt_date, 15),
+                        payment_due_day=_day_from_iso(due_date, 10),
+                        next_due_date=due_date,
+                        opened_date=opened_date,
+                        is_overdue=is_overdue,
+                        is_authorized_user=is_au,
+                        status="closed" if "closed" in status_raw else "open",
+                        external_account_id=str(
+                            item.get("creditCardId") or item.get("liabilityId") or item.get("id") or ""
+                        ),
+                        source="spinwheel_api",
+                    )
+                )
+
+        if not reports and not tradelines:
+            warnings.append("Spinwheel response contained no credit score or liability records yet.")
+
+        return CreditImportBundle(
+            provider=self.provider_name,
+            needs_review=False,
+            reports=reports,
+            tradelines=tradelines,
+            inquiries=inquiries,
+            derogatories=derogatories,
+            warnings=warnings,
+            raw_source_format="spinwheel_json",
+        )
+
+    # --- Vendor 2: Array (1B/3B Experian / Equifax / TransUnion JSON) ---
+
+    def _fetch_array(
+        self,
+        *,
+        report_key: Optional[str] = None,
+        display_token: Optional[str] = None,
+    ) -> CreditImportBundle:
+        token = self._api_key or self._client_secret
+        rk = (report_key or self._report_key).strip()
+        dt = (display_token or self._display_token).strip()
+        if not rk or not dt:
+            raise ConnectorError(
+                "Array requires both 'report_key' and 'display_token' to retrieve a credit report JSON.",
+                provider=self.provider_name,
+            )
+        qs = urlencode({"reportKey": rk, "displayToken": dt})
+        url = f"{self._api_base_url}/report/v2?{qs}"
+        status, payload = self._request_json(
+            "GET",
+            url,
+            headers={
+                "x-array-server-token": token,
+                "Authorization": f"Bearer {token}",
+            },
+        )
+        if status == 202:
+            raise ConnectorError(
+                "Array credit report is still being generated (HTTP 202). Wait a few seconds and sync again.",
+                provider=self.provider_name,
+                status_code=202,
+            )
+        return self._parse_array_payload(payload if isinstance(payload, dict) else {})
+
+    def _parse_array_payload(self, payload: Dict[str, Any]) -> CreditImportBundle:
+        today_iso = date.today().isoformat()
+        reports: List[CreditReportRecord] = []
+        tradelines: List[CreditTradelineRecord] = []
+        inquiries: List[CreditInquiryRecord] = []
+        derogatories: List[CreditDerogatoryRecord] = []
+        warnings: List[str] = []
+
+        # Support Array MISMO JSON (`CREDIT_RESPONSE`) and flattened JSON formats
+        cr = payload.get("CREDIT_RESPONSE") or payload.get("creditResponse") or payload
+        if not isinstance(cr, dict):
+            cr = {}
+
+        # 1. Scores
+        raw_scores = (
+            cr.get("CREDIT_SCORE")
+            or cr.get("creditScores")
+            or cr.get("scores")
+            or cr.get("reports")
+            or []
+        )
+        if isinstance(raw_scores, dict):
+            raw_scores = [raw_scores]
+        for s_item in raw_scores:
+            if not isinstance(s_item, dict):
+                continue
+            score_val = _parse_score_int(
+                s_item.get("@_Value")
+                or s_item.get("value")
+                or s_item.get("score")
+                or s_item.get("creditScore")
+            )
+            if score_val is None:
+                continue
+            bureau_raw = (
+                s_item.get("@CreditRepositorySourceType")
+                or s_item.get("bureau")
+                or s_item.get("source")
+                or "other"
+            )
+            model_raw = (
+                s_item.get("@_ModelNameType")
+                or s_item.get("model")
+                or s_item.get("scoreModel")
+                or "vantage3"
+            )
+            pulled = (
+                _parse_flexible_date(
+                    s_item.get("@_Date")
+                    or s_item.get("pulled_date")
+                    or s_item.get("date")
+                    or cr.get("@CreditReportFirstIssuedDate")
+                )
+                or today_iso
+            )
+            reports.append(
+                CreditReportRecord(
+                    bureau=_normalize_bureau(str(bureau_raw)),
+                    pulled_date=pulled,
+                    model=_normalize_model(str(model_raw)),
+                    score=score_val,
+                    source="array_api",
+                    needs_review=False,
+                )
+            )
+
+        # 2. Tradelines / Liabilities
+        raw_liabs = (
+            cr.get("CREDIT_LIABILITY")
+            or cr.get("tradelines")
+            or cr.get("accounts")
+            or cr.get("liabilities")
+            or []
+        )
+        if isinstance(raw_liabs, dict):
+            raw_liabs = [raw_liabs]
+        for item in raw_liabs:
+            if not isinstance(item, dict):
+                continue
+            creditor_obj = item.get("_CREDITOR") if isinstance(item.get("_CREDITOR"), dict) else {}
+            name = (
+                creditor_obj.get("@_Name")
+                or item.get("name")
+                or item.get("creditorName")
+                or item.get("accountName")
+                or "Credit Account"
+            )
+            kind_raw = (
+                item.get("@_AccountType")
+                or item.get("@_AccountTypeDescription")
+                or item.get("kind")
+                or item.get("accountType")
+                or "credit_card"
+            )
+            ecoa = str(
+                item.get("@_AccountOwnershipType")
+                or item.get("ownershipType")
+                or item.get("ecoa")
+                or ""
+            ).lower()
+            is_au = bool(item.get("is_authorized_user") or "authorized" in ecoa or ecoa == "a")
+            bal_cents = _money_field_to_cents(
+                item,
+                ("balance_cents",),
+                ("@_UnpaidBalanceAmount", "balance", "currentBalance"),
+            )
+            limit_cents = _money_field_to_cents(
+                item,
+                ("credit_limit_cents",),
+                ("@_CreditLimitAmount", "@_HighCreditAmount", "creditLimit", "limit"),
+            )
+            min_pay = _money_field_to_cents(
+                item,
+                ("min_payment_cents",),
+                ("@_MonthlyPaymentAmount", "monthlyPayment", "minimumPayment"),
+            )
+            opened = _parse_flexible_date(
+                item.get("@_AccountOpenedDate") or item.get("opened_date") or item.get("openedDate")
+            )
+            status_raw = str(
+                item.get("@_AccountStatusType") or item.get("status") or "open"
+            ).strip().lower()
+            past_due = _money_field_to_cents(item, (), ("@_PastDueAmount", "pastDueAmount"))
+            tradelines.append(
+                CreditTradelineRecord(
+                    name=sanitize_untrusted_text(str(name), max_len=80) or "Credit Account",
+                    issuer=sanitize_untrusted_text(str(creditor_obj.get("@_Name") or item.get("issuer") or ""), max_len=60),
+                    kind=_normalize_debt_kind(str(kind_raw)),
+                    balance_cents=bal_cents,
+                    credit_limit_cents=limit_cents,
+                    apr_bps=int(item["apr_bps"]) if item.get("apr_bps") is not None else apr_pct_to_bps(item.get("apr")),
+                    min_payment_cents=min_pay,
+                    opened_date=opened,
+                    is_overdue=bool(item.get("is_overdue") or past_due > 0),
+                    is_authorized_user=is_au,
+                    status="closed" if "closed" in status_raw else "open",
+                    external_account_id=str(item.get("@CreditLiabilityID") or item.get("id") or ""),
+                    source="array_api",
+                )
+            )
+
+        # 3. Hard Inquiries
+        raw_inqs = cr.get("CREDIT_INQUIRY") or cr.get("inquiries") or []
+        if isinstance(raw_inqs, dict):
+            raw_inqs = [raw_inqs]
+        for inq in raw_inqs:
+            if not isinstance(inq, dict):
+                continue
+            inq_date = _parse_flexible_date(
+                inq.get("@_Date") or inq.get("inquiry_date") or inq.get("inquiryDate") or inq.get("date")
+            )
+            if not inq_date:
+                continue
+            repo = inq.get("CREDIT_REPOSITORY") if isinstance(inq.get("CREDIT_REPOSITORY"), dict) else {}
+            bureau_raw = (
+                repo.get("@_SourceType")
+                or inq.get("@CreditRepositorySourceType")
+                or inq.get("bureau")
+                or "other"
+            )
+            inquiries.append(
+                CreditInquiryRecord(
+                    lender=str(inq.get("@_Name") or inq.get("lender") or inq.get("subscriberName") or "Unknown Lender"),
+                    bureau=str(bureau_raw),
+                    inquiry_date=inq_date,
+                )
+            )
+
+        # 4. Public Records / Derogatories
+        raw_derogs = (
+            cr.get("CREDIT_PUBLIC_RECORD")
+            or cr.get("publicRecords")
+            or cr.get("derogatories")
+            or []
+        )
+        if isinstance(raw_derogs, dict):
+            raw_derogs = [raw_derogs]
+        for der in raw_derogs:
+            if not isinstance(der, dict):
+                continue
+            ev_date = _parse_flexible_date(
+                der.get("@_FiledDate")
+                or der.get("opened_date")
+                or der.get("filedDate")
+                or der.get("date")
+            )
+            if not ev_date:
+                continue
+            derogatories.append(
+                CreditDerogatoryRecord(
+                    kind=str(der.get("@_Type") or der.get("kind") or der.get("type") or "collection"),
+                    opened_date=ev_date,
+                    creditor=str(der.get("@_CourtName") or der.get("creditor") or der.get("lender") or ""),
+                    bureau=str(der.get("@CreditRepositorySourceType") or der.get("bureau") or "other"),
+                    amount_cents=_opt_money_field_to_cents(
+                        der, ("amount_cents",), ("@_LegalObligationAmount", "amount")
+                    ),
+                )
+            )
+
+        if not reports and not tradelines and not inquiries and not derogatories:
+            warnings.append("Array report payload contained no recognized credit records.")
+
+        return CreditImportBundle(
+            provider=self.provider_name,
+            needs_review=False,
+            reports=reports,
+            tradelines=tradelines,
+            inquiries=inquiries,
+            derogatories=derogatories,
+            warnings=warnings,
+            raw_source_format="array_json",
+        )
+
+    # --- Vendor 3: CRS Credit API (Experian / Equifax / TransUnion) ---
+
+    def _crs_get_bearer_token(self) -> str:
+        if self._api_key:
+            return self._api_key
+        user = self._username or self._client_id
+        pwd = self._password or self._client_secret
+        if not user or not pwd:
+            raise ConnectorAuthError(
+                "CRS Credit API requires either a Bearer token or username + password.",
+                provider=self.provider_name,
+            )
+        _status, data = self._request_json(
+            "POST",
+            f"{self._api_base_url}/user/login",
+            json_body={"username": user, "password": pwd},
+        )
+        token = ""
+        if isinstance(data, dict):
+            token = str(data.get("token") or data.get("access_token") or data.get("jwt") or "").strip()
+        if not token:
+            raise ConnectorAuthError(
+                "CRS Credit API login succeeded without returning a JWT token.",
+                provider=self.provider_name,
+            )
+        return token
+
+    def _fetch_crs(
+        self,
+        *,
+        bureau: Optional[str] = None,
+        option: Optional[str] = None,
+        consumer_profile: Optional[Dict[str, Any]] = None,
+    ) -> CreditImportBundle:
+        bearer = self._crs_get_bearer_token()
+        target_bureau = _normalize_bureau(bureau or self._bureau or "equifax")
+        if target_bureau not in ("equifax", "experian", "transunion"):
+            target_bureau = "equifax"
+        target_option = (option or self._option or _CRS_DEFAULT_OPTIONS[target_bureau]).strip()
+        # Prevent path traversal in option segment
+        if not re.match(r"^[a-zA-Z0-9._-]+$", target_option):
+            raise ConnectorError(f"Invalid CRS credit-report option '{target_option}'.", provider=self.provider_name)
+
+        url = f"{self._api_base_url}/{target_bureau}/credit-report/{target_option}"
+        _status, payload = self._request_json(
+            "POST",
+            url,
+            headers={"Authorization": f"Bearer {bearer}"},
+            json_body=consumer_profile or {},
+        )
+        return self._parse_crs_payload(
+            payload if isinstance(payload, dict) else {},
+            default_bureau=target_bureau,
+        )
+
+    def _parse_crs_payload(
+        self, payload: Dict[str, Any], *, default_bureau: str = "equifax"
+    ) -> CreditImportBundle:
+        today_iso = date.today().isoformat()
+        reports: List[CreditReportRecord] = []
+        tradelines: List[CreditTradelineRecord] = []
+        inquiries: List[CreditInquiryRecord] = []
+        derogatories: List[CreditDerogatoryRecord] = []
+        warnings: List[str] = []
+
+        root = payload.get("data", payload) if isinstance(payload.get("data"), dict) else payload
+
+        raw_scores: List[Dict[str, Any]] = []
+        for key in ("scores", "creditScores", "models", "reports"):
+            if isinstance(root.get(key), list):
+                raw_scores.extend(s for s in root[key] if isinstance(s, dict))
+        if not raw_scores and root.get("score") is not None:
+            raw_scores.append(root)
+        elif not raw_scores and isinstance(root.get("creditScore"), dict):
+            raw_scores.append(root["creditScore"])
+
+        for s_item in raw_scores:
+            score_val = _parse_score_int(
+                s_item.get("score") or s_item.get("scoreValue") or s_item.get("value")
+            )
+            if score_val is None:
+                continue
+            pulled = (
+                _parse_flexible_date(
+                    s_item.get("pulled_date")
+                    or s_item.get("date")
+                    or root.get("reportDate")
+                    or root.get("createdAt")
+                )
+                or today_iso
+            )
+            reports.append(
+                CreditReportRecord(
+                    bureau=_normalize_bureau(str(s_item.get("bureau") or default_bureau)),
+                    pulled_date=pulled,
+                    model=_normalize_model(
+                        str(s_item.get("model") or s_item.get("modelName") or s_item.get("scoreModel") or "fico8")
+                    ),
+                    score=score_val,
+                    source="crs_api",
+                    needs_review=False,
+                )
+            )
+
+        for tl in root.get("tradelines") or root.get("trades") or root.get("accounts") or []:
+            if not isinstance(tl, dict):
+                continue
+            name = tl.get("accountName") or tl.get("creditorName") or tl.get("name") or "Credit Account"
+            ecoa = str(tl.get("ecoa") or tl.get("ownership") or "").lower()
+            tradelines.append(
+                CreditTradelineRecord(
+                    name=sanitize_untrusted_text(str(name), max_len=80) or "Credit Account",
+                    issuer=sanitize_untrusted_text(str(tl.get("creditorName") or tl.get("issuer") or ""), max_len=60),
+                    kind=_normalize_debt_kind(str(tl.get("accountType") or tl.get("kind") or "credit_card")),
+                    balance_cents=_money_field_to_cents(tl, ("balance_cents",), ("currentBalance", "balance")),
+                    credit_limit_cents=_money_field_to_cents(
+                        tl, ("credit_limit_cents",), ("creditLimit", "highCredit", "limit")
+                    ),
+                    apr_bps=int(tl["apr_bps"]) if tl.get("apr_bps") is not None else apr_pct_to_bps(tl.get("apr")),
+                    min_payment_cents=_money_field_to_cents(
+                        tl, ("min_payment_cents",), ("monthlyPayment", "minimumPayment")
+                    ),
+                    opened_date=_parse_flexible_date(tl.get("dateOpened") or tl.get("opened_date") or tl.get("openedDate")),
+                    is_overdue=bool(tl.get("isOverdue") or tl.get("pastDueAmount")),
+                    is_authorized_user=bool(tl.get("is_authorized_user") or "authorized" in ecoa or ecoa == "a"),
+                    status="closed" if "closed" in str(tl.get("status") or "open").lower() else "open",
+                    external_account_id=str(tl.get("accountNumber") or tl.get("id") or ""),
+                    source="crs_api",
+                )
+            )
+
+        for inq in root.get("inquiries") or []:
+            if not isinstance(inq, dict):
+                continue
+            inq_date = _parse_flexible_date(inq.get("inquiryDate") or inq.get("inquiry_date") or inq.get("date"))
+            if not inq_date:
+                continue
+            inquiries.append(
+                CreditInquiryRecord(
+                    lender=str(inq.get("subscriberName") or inq.get("lender") or inq.get("name") or "Unknown Lender"),
+                    bureau=str(inq.get("bureau") or default_bureau),
+                    inquiry_date=inq_date,
+                )
+            )
+
+        raw_derogs = list(root.get("derogatories") or []) + list(root.get("publicRecords") or []) + list(root.get("collections") or [])
+        for der in raw_derogs:
+            if not isinstance(der, dict):
+                continue
+            ev_date = _parse_flexible_date(
+                der.get("openedDate") or der.get("opened_date") or der.get("filedDate") or der.get("date")
+            )
+            if not ev_date:
+                continue
+            derogatories.append(
+                CreditDerogatoryRecord(
+                    kind=str(der.get("kind") or der.get("type") or "collection"),
+                    opened_date=ev_date,
+                    creditor=str(der.get("creditor") or der.get("lender") or der.get("agency") or ""),
+                    bureau=str(der.get("bureau") or default_bureau),
+                    amount_cents=_opt_money_field_to_cents(der, ("amount_cents",), ("amount", "balance")),
+                )
+            )
+
+        if not reports and not tradelines and not inquiries and not derogatories:
+            warnings.append("CRS Credit API response contained no recognized credit records.")
+
+        return CreditImportBundle(
+            provider=self.provider_name,
+            needs_review=False,
+            reports=reports,
+            tradelines=tradelines,
+            inquiries=inquiries,
+            derogatories=derogatories,
+            warnings=warnings,
+            raw_source_format="crs_json",
+        )
+
+    # --- Vendor 4: Custom Credit Score API (ChronoX Structured JSON Bridge) ---
+
+    def _fetch_custom(self) -> CreditImportBundle:
+        headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
+        _status, payload = self._request_json("GET", self._api_base_url, headers=headers)
+        if not isinstance(payload, dict):
+            raise ConnectorError(
+                "Custom Credit Score API must return a JSON object.",
+                provider=self.provider_name,
+            )
+        importer = OfficialCreditReportImporter()
+        bundle = importer.import_structured(payload)
+        bundle.provider = self.provider_name
+        bundle.needs_review = False
+        bundle.raw_source_format = "custom_credit_json"
+        for rep in bundle.reports:
+            rep.source = "custom_credit_api"
+            rep.needs_review = False
+        for tl in bundle.tradelines:
+            tl.source = "custom_credit_api"
+        return bundle

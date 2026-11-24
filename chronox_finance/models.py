@@ -163,7 +163,18 @@ SuggestionSource = Literal[
 ]
 
 VaultState = Literal["needs_setup", "locked", "unlocked"]
-ConnectorProvider = Literal["plaid", "simplefin", "coinbase", "schwab", "robinhood"]
+CreditAPIVendor = Literal["spinwheel", "array", "crs", "custom"]
+ConnectorProvider = Literal[
+    "plaid",
+    "simplefin",
+    "coinbase",
+    "schwab",
+    "robinhood",
+    "credit_api_spinwheel",
+    "credit_api_array",
+    "credit_api_crs",
+    "credit_api_custom",
+]
 AssetClass = Literal["equity", "etf", "crypto", "cash"]
 CreditBureau = Literal["experian", "equifax", "transunion", "other"]
 CreditScoreModel = Literal["fico8", "vantage3", "fico9", "other"]
@@ -1132,6 +1143,68 @@ class CreditDerogatoryOut(BaseModel):
     active: bool = True
     notes: str = ""
     created_at: str = ""
+
+
+class CreditAPIConnectRequest(BaseModel):
+    vendor: CreditAPIVendor
+    env: Literal["sandbox", "production"] = "sandbox"
+    label: str = Field("", max_length=100)
+    api_key: Optional[str] = Field(None, max_length=2048)       # Write-only; sealed in secrets.enc
+    api_secret: Optional[str] = Field(None, max_length=2048)    # Write-only; sealed in secrets.enc
+    username: Optional[str] = Field(None, max_length=200)
+    password: Optional[str] = Field(None, max_length=512)       # Write-only; sealed in secrets.enc
+    user_id: Optional[str] = Field(None, max_length=200)
+    report_key: Optional[str] = Field(None, max_length=256)
+    display_token: Optional[str] = Field(None, max_length=512)  # Write-only; sealed in secrets.enc
+    bureau: CreditBureau = "equifax"
+    option: Optional[str] = Field(None, max_length=120)
+    api_base_url: Optional[str] = Field(None, max_length=512)
+    test_on_connect: bool = False
+
+
+class CreditAPISyncRequest(BaseModel):
+    order_refresh: bool = False
+    sync_tradelines: bool = True
+    report_key: Optional[str] = Field(None, max_length=256)
+    display_token: Optional[str] = Field(None, max_length=512)
+    bureau: Optional[CreditBureau] = None
+    option: Optional[str] = Field(None, max_length=120)
+    consumer_profile: Optional[Dict[str, Any]] = None
+
+
+class CreditAPIVendorInfo(BaseModel):
+    vendor: CreditAPIVendor
+    display_name: str
+    auth_type: str
+    bureaus: List[str] = Field(default_factory=list)
+    models: List[str] = Field(default_factory=list)
+    sandbox_base_url: str = ""
+    production_base_url: str = ""
+    notes: str = ""
+
+
+class CreditAPIConnectionOut(BaseModel):
+    id: int
+    vendor: CreditAPIVendor
+    provider: str
+    institution: str
+    env: str = "sandbox"
+    status: Literal["active", "needs_reauth", "relink_required", "error", "paused_locked"] = "active"
+    api_key_masked: str = ""
+    has_credentials: bool = False
+    user_id: str = ""
+    has_report_key: bool = False
+    bureau: str = "equifax"
+    api_base_url: str = ""
+    last_synced_at: Optional[str] = None
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class CreditAPIListResponse(BaseModel):
+    vendors: List[CreditAPIVendorInfo] = Field(default_factory=list)
+    connections: List[CreditAPIConnectionOut] = Field(default_factory=list)
+    plaid_liabilities_connected: bool = False
 
 
 class CreditFactorItem(BaseModel):

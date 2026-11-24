@@ -43,6 +43,7 @@ from chronox_finance.connectors.brokers import (
     parse_holdings_csv,
 )
 from chronox_finance.connectors.credit_providers import (
+    CREDIT_API_VENDOR_SPECS,
     BureauAPIAdapter,
     CreditDerogatoryRecord,
     CreditImportBundle,
@@ -82,6 +83,7 @@ from chronox_finance.connectors.quotes import (
 from chronox_finance.connectors.simplefin_client import SimpleFINClient
 
 __all__ = [
+    "CREDIT_API_VENDOR_SPECS",
     "BrokerConnectorProtocol",
     "BureauAPIAdapter",
     "CoinbaseConnector",
