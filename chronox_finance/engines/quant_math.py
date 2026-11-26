@@ -17,10 +17,11 @@ from __future__ import annotations
 import calendar
 import math
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, timedelta
-from statistics import mean, stdev
+from decimal import ROUND_HALF_EVEN, Decimal
+from statistics import mean, median, stdev
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from pydantic import BaseModel
@@ -60,11 +61,23 @@ from chronox_finance.security import sanitize_untrusted_text
 __all__ = [
     "CashflowRunwayResult",
     "DailyCashflowPoint",
+    "HYSA_BENCHMARK_BPS",
+    "MannKendallTrendResult",
     "OptimalAllocationStep",
     "QuantForecastReport",
     "QuantMathEngine",
     "SeasonalBaseline",
     "SpendingVolatilityMetrics",
+    "WEEKDAY_KEYS",
+    "allocate_kkt_concave_cents",
+    "compute_dow_multipliers",
+    "compute_ewma_shrunk_rate",
+    "compute_hhi_index",
+    "compute_mad_stats",
+    "compute_mann_kendall_slope",
+    "compute_modified_z_score",
+    "huber_mad_clip_series",
+    "percentile_cents",
     "to_dict",
 ]
 
@@ -74,6 +87,8 @@ MIN_EMERGENCY_BUFFER_CENTS = 50_000  # $500.00 baseline floor
 LATE_FEE_SHIELD_CENTS = 3_500  # $35.00 conservative late-fee floor
 INVEST_EXPECTED_ANNUAL_PCT = 7.5  # Long-run diversified expected return benchmark
 SAFETY_HYSA_ANNUAL_PCT = 4.25  # High-yield cash reserve benchmark
+HYSA_BENCHMARK_BPS = 425  # 4.25% exact basis points for integer/Decimal interest math
+WEEKDAY_KEYS: Tuple[str, ...] = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 _QUESTION_DOLLAR_RE = re.compile(
     r"(?<!\d)\$?\s*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)"
@@ -294,6 +309,407 @@ def _allocate_proportional_exact_cents(
         break
 
     return allocs
+
+
+def percentile_cents(values: Sequence[int], q: float) -> int:
+    """Compute exact linear-interpolated (Type-7) percentile in integer cents."""
+    return _percentile_cents(values, q)
+
+
+def compute_mad_stats(values: Sequence[float]) -> Tuple[float, float]:
+    """Return `(median, MAD)` where `MAD = median(|x_i - median|)` using pure Python stdlib."""
+    if not values:
+        return 0.0, 0.0
+    nums = [float(v) for v in values]
+    med = float(median(nums))
+    abs_devs = [abs(v - med) for v in nums]
+    mad = float(median(abs_devs))
+    return med, mad
+
+
+def compute_modified_z_score(
+    value: float,
+    median_val: float,
+    mad_val: float,
+    mean_ad: float = 0.0,
+) -> float:
+    """
+    Compute the Iglewicz & Hoaglin (1993) Modified Z-Score.
+
+    Uses `0.6745 * (x - median) / MAD` when `MAD > 0`, falling back to
+    `(x - median) / (1.253314 * MeanAD)` when `MAD == 0` and `MeanAD > 0`.
+    """
+    diff = float(value) - float(median_val)
+    if mad_val > 0.0:
+        return 0.6745 * diff / float(mad_val)
+    if mean_ad > 0.0:
+        return diff / (1.253314 * float(mean_ad))
+    return 0.0
+
+
+def huber_mad_clip_series(values: Sequence[float], k: float = 2.5) -> List[float]:
+    """
+    Apply robust Huber/MAD winsorization to a non-negative spending series so one-off
+    outliers cannot distort daily burn estimates.
+
+    Handles zero-inflated daily spending cleanly: when the overall MAD is 0 (more than
+    half of days have $0 spend), computes robust dispersion across positive spend days
+    so normal spending days are preserved while extreme spikes are clipped.
+    """
+    if not values:
+        return []
+    nums = [max(0.0, float(v)) for v in values]
+    k_val = max(0.5, float(k))
+    med_all, mad_all = compute_mad_stats(nums)
+    if mad_all > 0.0:
+        sigma = 1.4826 * mad_all
+        lo = max(0.0, med_all - k_val * sigma)
+        hi = med_all + k_val * sigma
+        return [min(hi, max(lo, v)) for v in nums]
+
+    positives = [v for v in nums if v > 0.0]
+    if not positives:
+        return [0.0] * len(nums)
+
+    med_pos, mad_pos = compute_mad_stats(positives)
+    if mad_pos > 0.0:
+        sigma_pos = 1.4826 * mad_pos
+    else:
+        ordered_pos = sorted(positives)
+        # Trim top 10% extreme right tail before computing fallback scale so one massive spike
+        # cannot inflate its own clip ceiling.
+        trim_n = max(1, int(math.ceil(0.10 * len(ordered_pos)))) if len(ordered_pos) >= 5 else 0
+        core = ordered_pos[:-trim_n] if trim_n > 0 else ordered_pos
+        core_med = float(median(core))
+        core_mean_ad = sum(abs(v - core_med) for v in core) / len(core) if core else 0.0
+        sigma_pos = max(1.253314 * core_mean_ad, 0.25 * med_pos)
+
+    hi = med_pos + k_val * sigma_pos
+    return [min(hi, v) if v > 0.0 else 0.0 for v in nums]
+
+
+def compute_ewma_shrunk_rate(
+    daily_values: Sequence[float],
+    *,
+    alpha: float = 0.18,
+    prior_days: float = 14.0,
+    max_ewma_weight: float = 0.65,
+    huber_k: float = 2.5,
+) -> Tuple[float, float, float]:
+    """
+    Estimate daily discretionary burn rate via Huber/MAD-clipped EWMA (`alpha=0.18`)
+    shrunk toward the trailing 90-day robust median anchor.
+
+    Returns `(shrunk_daily_rate, ewma_daily_rate, robust_median_daily_rate)`.
+    """
+    if not daily_values:
+        return 0.0, 0.0, 0.0
+
+    clipped = huber_mad_clip_series(daily_values, k=huber_k)
+    n = len(clipped)
+    if n == 0 or sum(clipped) <= 0.0:
+        return 0.0, 0.0, 0.0
+
+    alpha_clamped = min(0.95, max(0.01, float(alpha)))
+    daily_med = float(median(clipped))
+
+    # Build complete trailing 7-day blocks anchored at the most recent day so sparse/weekend
+    # spending patterns yield a realistic median daily rate rather than collapsing to $0.
+    n_full_weeks = n // 7
+    weekly_totals: List[float] = []
+    for w in range(n_full_weeks):
+        end_idx = n - w * 7
+        start_idx = end_idx - 7
+        weekly_totals.append(sum(clipped[start_idx:end_idx]))
+
+    if daily_med > 0.0 and len(weekly_totals) >= 2:
+        weekly_med_daily = float(median(weekly_totals)) / 7.0
+        robust_anchor = 0.5 * daily_med + 0.5 * weekly_med_daily
+    elif daily_med > 0.0:
+        robust_anchor = daily_med
+    elif weekly_totals:
+        robust_anchor = float(median(weekly_totals)) / 7.0
+    else:
+        robust_anchor = sum(clipped) / float(n)
+
+    ewma_val = robust_anchor
+    for val in clipped:
+        ewma_val = alpha_clamped * val + (1.0 - alpha_clamped) * ewma_val
+
+    prior = max(1.0, float(prior_days))
+    weight = min(float(max_ewma_weight), float(n) / (float(n) + prior))
+    shrunk = weight * ewma_val + (1.0 - weight) * robust_anchor
+    return max(0.0, shrunk), max(0.0, ewma_val), max(0.0, robust_anchor)
+
+
+def compute_dow_multipliers(
+    dates: Sequence[date],
+    values: Sequence[float],
+    *,
+    min_days: int = 21,
+    prior_weeks: float = 3.0,
+) -> Tuple[Dict[str, float], bool]:
+    """
+    Compute Bayesian-shrunk day-of-week spending seasonality multipliers when at least
+    `min_days` (default 21) of daily observations are present.
+
+    Multipliers are clamped to `[0.40, 2.20]` and normalized so their 7-day average is 1.0.
+    """
+    flat = {k: 1.0 for k in WEEKDAY_KEYS}
+    if len(dates) != len(values) or len(dates) < int(min_days):
+        return flat, False
+
+    overall_mean = sum(max(0.0, float(v)) for v in values) / float(len(values))
+    if overall_mean <= 0.0:
+        return flat, False
+
+    buckets: Dict[int, List[float]] = {wd: [] for wd in range(7)}
+    for dt, val in zip(dates, values, strict=True):
+        buckets[dt.weekday()].append(max(0.0, float(val)))
+
+    k_prior = max(0.5, float(prior_weeks))
+    raw_mults: List[float] = []
+    for wd in range(7):
+        obs = buckets[wd]
+        n_wd = len(obs)
+        wd_mean = (sum(obs) / float(n_wd)) if n_wd > 0 else overall_mean
+        shrunk_wd = (n_wd * wd_mean + k_prior * overall_mean) / (n_wd + k_prior)
+        raw_mult = min(2.20, max(0.40, shrunk_wd / overall_mean))
+        raw_mults.append(raw_mult)
+
+    avg_mult = sum(raw_mults) / 7.0
+    if avg_mult <= 0.0:
+        return flat, False
+
+    norm_mults = [m / avg_mult for m in raw_mults]
+    result = {WEEKDAY_KEYS[wd]: round(norm_mults[wd], 4) for wd in range(7)}
+    return result, True
+
+
+@dataclass
+class MannKendallTrendResult:
+    """Non-parametric Mann-Kendall test + Theil-Sen / OLS weekly spend drift telemetry."""
+
+    weeks_analyzed: int = 0
+    drift_cents_per_week: int = 0
+    linear_slope_cents_per_week: int = 0
+    mann_kendall_s: int = 0
+    mann_kendall_z: float = 0.0
+    mann_kendall_tau: float = 0.0
+    p_value: float = 1.0
+    is_significant: bool = False
+    trend_direction: str = "stable"
+
+
+def compute_mann_kendall_slope(
+    weekly_values: Sequence[float],
+    *,
+    significance_alpha: float = 0.10,
+    min_material_cents: int = 500,
+) -> MannKendallTrendResult:
+    """
+    Detect statistically significant upward or downward weekly spending drift using the
+    exact tie-corrected Mann-Kendall S-test, Theil-Sen median pairwise slope, and OLS slope.
+    """
+    vals = [float(v) for v in weekly_values]
+    n = len(vals)
+    if n < 2:
+        return MannKendallTrendResult(weeks_analyzed=n)
+
+    # OLS linear slope (cents/week)
+    x_bar = (n - 1) / 2.0
+    y_bar = sum(vals) / float(n)
+    denom_x = sum((i - x_bar) ** 2 for i in range(n))
+    ols_slope = (
+        sum((i - x_bar) * (vals[i] - y_bar) for i in range(n)) / denom_x
+        if denom_x > 0.0
+        else 0.0
+    )
+
+    # Exact pairwise Mann-Kendall S statistic + Theil-Sen median slope
+    s_stat = 0
+    pairwise_slopes: List[float] = []
+    for i in range(n - 1):
+        vi = vals[i]
+        for j in range(i + 1, n):
+            diff = vals[j] - vi
+            if diff > 0.0:
+                s_stat += 1
+            elif diff < 0.0:
+                s_stat -= 1
+            pairwise_slopes.append(diff / float(j - i))
+
+    theil_sen = float(median(pairwise_slopes)) if pairwise_slopes else ols_slope
+    drift_cents = int(round(theil_sen))
+    ols_cents = int(round(ols_slope))
+
+    total_pairs = n * (n - 1) / 2.0
+    tau = round(s_stat / total_pairs, 4) if total_pairs > 0 else 0.0
+
+    if n < 4:
+        return MannKendallTrendResult(
+            weeks_analyzed=n,
+            drift_cents_per_week=drift_cents,
+            linear_slope_cents_per_week=ols_cents,
+            mann_kendall_s=s_stat,
+            mann_kendall_z=0.0,
+            mann_kendall_tau=tau,
+            p_value=1.0,
+            is_significant=False,
+            trend_direction="stable",
+        )
+
+    # Tie-corrected variance Var(S)
+    counts = Counter(vals)
+    tie_correction = sum(g * (g - 1) * (2 * g + 5) for g in counts.values() if g > 1)
+    var_s = (n * (n - 1) * (2 * n + 5) - tie_correction) / 18.0
+    if var_s <= 0.0 or s_stat == 0:
+        z_stat = 0.0
+        p_val = 1.0
+    else:
+        sigma_s = math.sqrt(var_s)
+        z_stat = (s_stat - 1.0) / sigma_s if s_stat > 0 else (s_stat + 1.0) / sigma_s
+        p_val = math.erfc(abs(z_stat) / math.sqrt(2.0))
+
+    p_val_clamped = round(min(1.0, max(0.0, p_val)), 4)
+    is_sig = p_val <= float(significance_alpha) and abs(drift_cents) >= int(min_material_cents)
+    if is_sig and drift_cents > 0:
+        direction = "accelerating"
+    elif is_sig and drift_cents < 0:
+        direction = "cooling"
+    else:
+        direction = "stable"
+
+    return MannKendallTrendResult(
+        weeks_analyzed=n,
+        drift_cents_per_week=drift_cents,
+        linear_slope_cents_per_week=ols_cents,
+        mann_kendall_s=s_stat,
+        mann_kendall_z=round(z_stat, 3),
+        mann_kendall_tau=tau,
+        p_value=p_val_clamped,
+        is_significant=is_sig,
+        trend_direction=direction,
+    )
+
+
+def compute_hhi_index(amounts: Sequence[int]) -> Tuple[int, str]:
+    """
+    Compute the Herfindahl-Hirschman Index (HHI) on the canonical `0..10000` scale.
+
+    Returns `(hhi_0_to_10000, concentration_band)` where band is:
+    - `"none"` when empty or zero total
+    - `"diversified"` when `HHI < 1500`
+    - `"moderate"` when `1500 <= HHI < 2500`
+    - `"concentrated"` when `HHI >= 2500`
+    """
+    positives = [int(a) for a in amounts if int(a) > 0]
+    total = sum(positives)
+    if total <= 0:
+        return 0, "none"
+
+    total_dec = Decimal(total)
+    hundred = Decimal(100)
+    hhi_dec = sum(((Decimal(a) * hundred) / total_dec) ** 2 for a in positives)
+    hhi_int = int(hhi_dec.quantize(Decimal("1"), rounding=ROUND_HALF_EVEN))
+    hhi_clamped = max(0, min(10_000, hhi_int))
+    if hhi_clamped < 1500:
+        band = "diversified"
+    elif hhi_clamped < 2500:
+        band = "moderate"
+    else:
+        band = "concentrated"
+    return hhi_clamped, band
+
+
+def allocate_kkt_concave_cents(
+    total_cents: int,
+    weights: Sequence[float],
+    scales: Sequence[float],
+    caps: Sequence[int],
+) -> Tuple[List[int], float]:
+    """
+    Solve the strictly concave separable KKT resource-allocation problem in exact integer cents:
+
+        maximize   sum_i  alpha_i * beta_i * ln(1 + x_i / beta_i)
+        subject to 0 <= x_i <= caps[i],   sum_i x_i <= total_cents
+
+    Marginal utility is `MU_i(x_i) = alpha_i / (1 + x_i / beta_i)`.
+    At optimality, active unconstrained buckets share an identical shadow price `lambda*`.
+    Returns `(exact_integer_cent_allocations, shadow_price_lambda)`.
+    """
+    n = len(weights)
+    if n == 0 or total_cents <= 0:
+        return [0] * n, 0.0
+
+    budget = int(total_cents)
+    active = [i for i in range(n) if int(caps[i]) > 0 and float(weights[i]) > 0.0]
+    if not active:
+        return [0] * n, 0.0
+
+    total_cap = sum(int(caps[i]) for i in active)
+    if total_cap <= budget:
+        out = [int(caps[i]) if i in active else 0 for i in range(n)]
+        return out, 0.0
+
+    alphas = [max(0.0, float(w)) for w in weights]
+    betas = [max(1.0, float(s)) for s in scales]
+    cap_ints = [max(0, int(c)) for c in caps]
+
+    hi = max(alphas[i] for i in active)
+    lo = min(alphas[i] / (1.0 + cap_ints[i] / betas[i]) for i in active) * 0.999
+    lo = max(1e-12, lo)
+
+    def _primal(lam: float) -> List[float]:
+        res = [0.0] * n
+        for i in active:
+            raw = betas[i] * ((alphas[i] / lam) - 1.0)
+            if raw <= 0.0:
+                res[i] = 0.0
+            elif raw >= cap_ints[i]:
+                res[i] = float(cap_ints[i])
+            else:
+                res[i] = raw
+        return res
+
+    # Exact 70-step bisection on strictly decreasing primal sum(x_i(lambda))
+    for _ in range(70):
+        mid = 0.5 * (lo + hi)
+        if sum(_primal(mid)) > float(budget):
+            lo = mid
+        else:
+            hi = mid
+
+    lam_star = 0.5 * (lo + hi)
+    raw_alloc = _primal(lam_star)
+
+    # Exact largest-remainder integer-cent discretization conserving sum(allocs) == budget
+    allocs = [min(cap_ints[i], int(math.floor(raw_alloc[i]))) for i in range(n)]
+    leftover = budget - sum(allocs)
+    remainders = [
+        (i, raw_alloc[i] - allocs[i], alphas[i])
+        for i in active
+        if allocs[i] < cap_ints[i]
+    ]
+    remainders.sort(key=lambda item: (-item[1], -item[2], item[0]))
+    for i, _rem, _a in remainders:
+        if leftover <= 0:
+            break
+        allocs[i] += 1
+        leftover -= 1
+
+    # Fallback pass if fractional remainders exhausted while headroom remains
+    if leftover > 0:
+        for i in sorted(active, key=lambda idx: (-alphas[idx], idx)):
+            if leftover <= 0:
+                break
+            room = cap_ints[i] - allocs[i]
+            if room > 0:
+                take = min(leftover, room)
+                allocs[i] += take
+                leftover -= take
+
+    return allocs, round(lam_star, 6)
 
 
 @dataclass
@@ -2373,3 +2789,25 @@ class QuantMathEngine:
             verified_numbers=verified_numbers,
             affordability_check=affordability_check,
         )
+
+    # =========================================================================
+    # 5. Statistical Tail-Risk Runway, Diagnostics & One-Tap Optimization Bridge
+    # =========================================================================
+
+    def compute_statistical_runway(self, **kwargs: Any) -> Any:
+        """Delegate to `OneTapQuantEngine.compute_statistical_runway`."""
+        from chronox_finance.engines.onetap_quant import OneTapQuantEngine
+
+        return OneTapQuantEngine().compute_statistical_runway(**kwargs)
+
+    def compute_statistical_diagnostics(self, **kwargs: Any) -> Any:
+        """Delegate to `OneTapQuantEngine.compute_statistical_diagnostics`."""
+        from chronox_finance.engines.onetap_quant import OneTapQuantEngine
+
+        return OneTapQuantEngine().compute_statistical_diagnostics(**kwargs)
+
+    def build_onetap_plan(self, **kwargs: Any) -> Any:
+        """Delegate to `OneTapQuantEngine.build_onetap_plan`."""
+        from chronox_finance.engines.onetap_quant import OneTapQuantEngine
+
+        return OneTapQuantEngine().build_onetap_plan(**kwargs)
