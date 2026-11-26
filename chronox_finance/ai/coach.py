@@ -25,6 +25,11 @@ from chronox_finance.ai.agent_tools import (
     AgentLedgerContext,
     AgentPlanResult,
 )
+from chronox_finance.ai.harness import (
+    FinancialAIHarness,
+    HarnessUtteranceResult,
+    OneTapNarrativeResult,
+)
 from chronox_finance.ai.opencode_client import (
     CompletionResult,
     LLMClient,
@@ -35,6 +40,7 @@ from chronox_finance.ai.validator import (
     extract_json_object,
     sanitize_prompt_injection,
     sanitize_rsd_tone,
+    strip_untrusted_delimiters,
     wrap_untrusted_data,
 )
 from chronox_finance.engines.autobudget import AutoBudgetResult
@@ -180,6 +186,9 @@ def _provider_label(provider_id: str) -> str:
         "openai_codex": "OpenAI / Codex",
         "chat_wrapper": "Durable Chat-Wrapper",
         "codex_cli": "Codex CLI",
+        "opencode_cli": "OpenCode CLI",
+        "claude_cli": "Claude CLI",
+        "agy_cli": "Antigravity CLI",
     }
     return labels.get(provider_id, provider_id)
 
@@ -334,6 +343,62 @@ class FinancialCoach:
         return planner.plan(
             prompt=prompt,
             context=context,
+            intelligence_mode=intelligence_mode,
+            quota_remaining=quota_remaining,
+            use_cache=use_cache,
+        )
+
+    def build_harness(
+        self,
+        *,
+        completion_fn: Optional[Callable[..., Any]] = None,
+    ) -> FinancialAIHarness:
+        """Build a `FinancialAIHarness` bound to this coach's ordered multi-provider failover chain."""
+        return FinancialAIHarness(
+            clients=self._all_clients(),
+            completion_fn=completion_fn,
+            on_completion=self._record_completion,
+        )
+
+    def process_utterance(
+        self,
+        text: str,
+        *,
+        context: AgentLedgerContext,
+        quant_snapshot: Optional[Any] = None,
+        dashboard_snapshot: Optional[Any] = None,
+        intelligence_mode: Union[str, IntelligenceMode] = IntelligenceMode.HYBRID,
+        auto_commit: bool = False,
+        quota_remaining: int = 60,
+        use_cache: bool = True,
+        completion_fn: Optional[Callable[..., Any]] = None,
+    ) -> HarnessUtteranceResult:
+        """Delegate unified `--say` / natural-language processing to `FinancialAIHarness`."""
+        harness = self.build_harness(completion_fn=completion_fn)
+        return harness.process_utterance(
+            text,
+            context=context,
+            quant_snapshot=quant_snapshot,
+            dashboard_snapshot=dashboard_snapshot,
+            intelligence_mode=intelligence_mode,
+            auto_commit=auto_commit,
+            quota_remaining=quota_remaining,
+            use_cache=use_cache,
+        )
+
+    def synthesize_onetap_narrative(
+        self,
+        plan: Any,
+        *,
+        intelligence_mode: Union[str, IntelligenceMode] = IntelligenceMode.HYBRID,
+        quota_remaining: int = 60,
+        use_cache: bool = True,
+        completion_fn: Optional[Callable[..., Any]] = None,
+    ) -> OneTapNarrativeResult:
+        """Delegate grounded One-Tap executive narrative synthesis to `FinancialAIHarness`."""
+        harness = self.build_harness(completion_fn=completion_fn)
+        return harness.synthesize_onetap_narrative(
+            plan,
             intelligence_mode=intelligence_mode,
             quota_remaining=quota_remaining,
             use_cache=use_cache,
@@ -1340,7 +1405,7 @@ class FinancialCoach:
                 json_mode=False,
                 use_cache=True,
             )
-            clean_answer, _ = sanitize_rsd_tone(res.content)
+            clean_answer, _ = sanitize_rsd_tone(strip_untrusted_delimiters(res.content))
             qa_source = _coerce_suggestion_source("ai_standalone" if is_standalone else active_provider)
             return CoachAnswerResponse(
                 answer=clean_answer,
@@ -1368,3 +1433,7 @@ class FinancialCoach:
                 verified_numbers=local_verified_numbers,
                 affordability_check=local_afford,
             )
+
+
+# Canonical alias for callers referencing `CoachEngine`
+CoachEngine = FinancialCoach

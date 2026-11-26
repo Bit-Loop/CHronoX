@@ -98,6 +98,46 @@ FORBIDDEN_AGENT_ACTION_TYPES: FrozenSet[str] = frozenset(
 )
 
 _VALID_TX_TYPES = frozenset({"expense", "income", "transfer"})
+_VALID_TRANSFER_DIRECTIONS = frozenset({"in", "out"})
+_JAR_SLUG_ALIASES: Dict[str, str] = {
+    "bills": "bills",
+    "fixed": "bills",
+    "utilities": "bills",
+    "rent": "bills",
+    "subscriptions": "bills",
+    "daily": "daily",
+    "daily_living": "daily",
+    "supplies": "daily",
+    "groceries": "daily",
+    "household": "daily",
+    "essentials": "daily",
+    "transport": "daily",
+    "transit": "daily",
+    "fuel": "daily",
+    "health": "daily",
+    "fun": "fun",
+    "guilt_free": "fun",
+    "guilt-free": "fun",
+    "dining": "fun",
+    "coffee": "fun",
+    "entertainment": "fun",
+    "shopping": "fun",
+    "hobbies": "fun",
+    "travel": "fun",
+    "safety": "safety",
+    "savings": "safety",
+    "saving": "safety",
+    "emergency": "safety",
+    "buffer": "safety",
+    "goals": "safety",
+    "sinking": "safety",
+    "debt": "safety",
+    "invest": "invest",
+    "investing": "invest",
+    "investment": "invest",
+    "trading": "invest",
+    "brokerage": "invest",
+}
 _VALID_GOAL_CATEGORIES = frozenset({"gadget", "emergency", "travel", "debt_freedom", "invest", "custom"})
 _VALID_GOAL_STATUSES = frozenset({"active", "funded", "completed"})
 _VALID_DEBT_KINDS = frozenset(
@@ -223,9 +263,13 @@ class AgentLedgerContext:
     credit_lines: List[Dict[str, Any]] = field(default_factory=list)
     holdings: List[Dict[str, Any]] = field(default_factory=list)
     email_queue: List[Dict[str, Any]] = field(default_factory=list)
+    bills: List[Dict[str, Any]] = field(default_factory=list)
     safe_to_spend_cents: int = 0
     safe_to_invest_cents: int = 0
     monthly_surplus_cents: int = 0
+    daily_safe_to_spend_cents: int = 0
+    days_until_payday: int = 0
+    hourly_wage_cents: int = 3_000
 
     @classmethod
     def from_objects(
@@ -239,9 +283,13 @@ class AgentLedgerContext:
         credit_lines: Sequence[Any] = (),
         holdings: Sequence[Any] = (),
         email_queue: Sequence[Any] = (),
+        bills: Sequence[Any] = (),
         safe_to_spend_cents: int = 0,
         safe_to_invest_cents: int = 0,
         monthly_surplus_cents: int = 0,
+        daily_safe_to_spend_cents: int = 0,
+        days_until_payday: int = 0,
+        hourly_wage_cents: int = 3_000,
     ) -> "AgentLedgerContext":
         return cls(
             accounts=[_as_dict(x) for x in accounts],
@@ -252,9 +300,13 @@ class AgentLedgerContext:
             credit_lines=[_as_dict(x) for x in credit_lines],
             holdings=[_as_dict(x) for x in holdings],
             email_queue=[_as_dict(x) for x in email_queue],
+            bills=[_as_dict(x) for x in bills],
             safe_to_spend_cents=int(safe_to_spend_cents or 0),
             safe_to_invest_cents=int(safe_to_invest_cents or 0),
             monthly_surplus_cents=int(monthly_surplus_cents or 0),
+            daily_safe_to_spend_cents=int(daily_safe_to_spend_cents or 0),
+            days_until_payday=int(days_until_payday or 0),
+            hourly_wage_cents=max(100, int(hourly_wage_cents or 3_000)),
         )
 
     def accounts_by_id(self) -> Dict[int, Dict[str, Any]]:
@@ -264,6 +316,84 @@ class AgentLedgerContext:
             if aid is not None:
                 out[aid] = a
         return out
+
+    def savings_accounts(self) -> List[Dict[str, Any]]:
+        return [
+            a
+            for a in self.accounts
+            if str(
+                a["account_type"].value
+                if hasattr(a.get("account_type"), "value")
+                else (a.get("account_type") or "")
+            )
+            .strip()
+            .lower()
+            == "savings"
+        ]
+
+    def checking_accounts(self) -> List[Dict[str, Any]]:
+        return [
+            a
+            for a in self.accounts
+            if str(
+                a["account_type"].value
+                if hasattr(a.get("account_type"), "value")
+                else (a.get("account_type") or "")
+            )
+            .strip()
+            .lower()
+            == "checking"
+        ]
+
+    def find_goal_by_name(self, query: str) -> Optional[Dict[str, Any]]:
+        """Case-insensitive exact, substring, or token-overlap match across active goals."""
+        q = re.sub(r"[^a-z0-9\s]+", " ", (query or "").lower()).strip()
+        if not q:
+            return None
+        active = list(self.goals_by_id().values())
+        if not active:
+            return None
+
+        # 1. Exact normalized name match
+        for g in active:
+            gname = re.sub(r"[^a-z0-9\s]+", " ", str(g.get("name") or "").lower()).strip()
+            if gname == q:
+                return g
+
+        # 2. Substring match
+        for g in active:
+            gname = re.sub(r"[^a-z0-9\s]+", " ", str(g.get("name") or "").lower()).strip()
+            if gname and (q in gname or gname in q):
+                return g
+
+        # 3. Token-overlap match (ignoring generic words like "fund", "goal", "my")
+        stop = {"my", "the", "a", "an", "goal", "fund", "account", "jar", "savings", "saving"}
+        q_tokens = {tok for tok in q.split() if tok not in stop}
+        best_goal: Optional[Dict[str, Any]] = None
+        best_score = 0
+        for g in active:
+            gname = re.sub(r"[^a-z0-9\s]+", " ", str(g.get("name") or "").lower()).strip()
+            g_tokens = {tok for tok in gname.split() if tok not in stop}
+            overlap = len(q_tokens & g_tokens)
+            if overlap > best_score:
+                best_score = overlap
+                best_goal = g
+        if best_goal is not None and best_score > 0:
+            return best_goal
+
+        # 4. Generic "savings" / "emergency" fallback to emergency/safety goals only
+        if any(w in q.split() for w in ("savings", "saving", "emergency", "rainy", "reserve", "buffer")):
+            for g in active:
+                gname = str(g.get("name") or "").lower()
+                gcat = str(g.get("category") or "").lower()
+                gslug = str(g.get("funding_jar_slug") or "").lower()
+                if (
+                    gcat == "emergency"
+                    or gslug == "safety"
+                    or any(w in gname for w in ("emergency", "saving", "buffer", "rainy", "reserve"))
+                ):
+                    return g
+        return None
 
     def jars_by_id(self) -> Dict[int, Dict[str, Any]]:
         out: Dict[int, Dict[str, Any]] = {}
@@ -332,13 +462,19 @@ class AgentLedgerContext:
         """
         return {
             "safe_to_spend_cents": self.safe_to_spend_cents,
+            "daily_safe_to_spend_cents": self.daily_safe_to_spend_cents,
+            "days_until_payday": self.days_until_payday,
             "safe_to_invest_cents": self.safe_to_invest_cents,
             "monthly_surplus_cents": self.monthly_surplus_cents,
             "accounts": [
                 {
                     "id": a.get("id"),
                     "name": wrap_untrusted_data(a.get("name"), 60),
-                    "type": str(a.get("account_type") or "checking"),
+                    "type": str(
+                        a["account_type"].value
+                        if hasattr(a.get("account_type"), "value")
+                        else (a.get("account_type") or "checking")
+                    ),
                     "balance_cents": int(a.get("balance_cents") or 0),
                 }
                 for a in self.accounts[:12]
@@ -353,6 +489,21 @@ class AgentLedgerContext:
                     "protected_bills": _strict_int(j.get("id")) in self.bills_jar_ids(),
                 }
                 for j in self.jars[:10]
+            ],
+            "bills": [
+                {
+                    "id": b.get("id"),
+                    "name": wrap_untrusted_data(b.get("name"), 60),
+                    "amount_cents": int(b.get("amount_cents") or 0),
+                    "next_due_date": str(b.get("next_due_date") or ""),
+                    "cadence": str(
+                        b["cadence"].value if hasattr(b.get("cadence"), "value") else (b.get("cadence") or "monthly")
+                    ),
+                    "is_subscription": bool(b.get("is_subscription", False)),
+                    "is_essential": bool(b.get("is_essential", True)),
+                    "auto_pay": bool(b.get("auto_pay", False)),
+                }
+                for b in self.bills[:15]
             ],
             "recent_transactions": [
                 {
@@ -796,6 +947,31 @@ def _validate_rule_triggers_and_actions(
     return True, clean_triggers, clean_actions, ""
 
 
+def _resolve_jar_slug_id(
+    raw_slug: Any,
+    jars_map: Dict[int, Dict[str, Any]],
+    jars_slugs: Dict[str, Dict[str, Any]],
+) -> Optional[int]:
+    """Resolve a jar slug, semantic alias (e.g. 'supplies' -> 'daily'), or display name to jar_id."""
+    if not isinstance(raw_slug, str):
+        return None
+    key = raw_slug.strip().lower()
+    if not key:
+        return None
+    j_obj = jars_slugs.get(key)
+    if j_obj:
+        return _strict_int(j_obj.get("id"))
+    canonical = _JAR_SLUG_ALIASES.get(key)
+    if canonical:
+        j_obj = jars_slugs.get(canonical)
+        if j_obj:
+            return _strict_int(j_obj.get("id"))
+    for jid, j in jars_map.items():
+        if str(j.get("name") or "").strip().lower() == key:
+            return jid
+    return None
+
+
 def _validate_single_action(
     raw: Dict[str, Any],
     context: AgentLedgerContext,
@@ -833,9 +1009,20 @@ def _validate_single_action(
         if amt is None or amt <= 0 or amt > MAX_MONEY_CENTS:
             return None, "create_transaction requires positive integer `amount_cents` within bounds"
 
-        tx_type = str(payload.get("tx_type") or "expense").strip().lower()
+        raw_tx_type = payload.get("tx_type") if payload.get("tx_type") is not None else payload.get("direction")
+        tx_type = str(raw_tx_type or "expense").strip().lower()
         if tx_type not in _VALID_TX_TYPES:
             return None, f"create_transaction invalid tx_type `{tx_type}`"
+
+        transfer_direction = ""
+        if "transfer_direction" in payload and payload["transfer_direction"] is not None:
+            td = str(payload["transfer_direction"]).strip().lower()
+            if td:
+                if tx_type != "transfer":
+                    return None, "create_transaction `transfer_direction` is only valid when `tx_type` is `transfer`"
+                if td not in _VALID_TRANSFER_DIRECTIONS:
+                    return None, f"create_transaction invalid transfer_direction `{td}`"
+                transfer_direction = td
 
         account_id = _strict_int(payload.get("account_id"))
         if account_id is not None:
@@ -850,15 +1037,19 @@ def _validate_single_action(
             account_id = default_acc
 
         jar_id = _strict_int(payload.get("jar_id"))
-        if jar_id is None and isinstance(payload.get("jar_slug"), str):
-            j_obj = jars_slugs.get(payload["jar_slug"].strip().lower())
-            if j_obj:
-                jar_id = _strict_int(j_obj.get("id"))
+        if jar_id is None:
+            jar_id = _resolve_jar_slug_id(
+                payload.get("jar_slug") if payload.get("jar_slug") is not None else payload.get("jar"),
+                jars_map,
+                jars_slugs,
+            )
         if jar_id is not None and jars_map and jar_id not in jars_map:
             return None, f"create_transaction references non-existent jar_id {jar_id}"
 
         # Bills jar firewall: block transfer/withdrawal raiding Bills jar
         from_jar_id = _strict_int(payload.get("from_jar_id"))
+        if from_jar_id is None and isinstance(payload.get("from_jar_slug"), str):
+            from_jar_id = _resolve_jar_slug_id(payload.get("from_jar_slug"), jars_map, jars_slugs)
         if from_jar_id in bills_ids or (tx_type == "transfer" and jar_id in bills_ids):
             return None, "Protected Bills jar firewall: cannot transfer or raid money out of Bills jar"
 
@@ -866,10 +1057,62 @@ def _validate_single_action(
         if payload.get("tx_date") and _validate_iso_date(payload.get("tx_date")) is None:
             return None, "create_transaction has invalid ISO `tx_date`"
 
-        subcat, _ = _clean_text(payload.get("subcategory") or "", max_len=60)
+        raw_subcat = payload.get("subcategory") if payload.get("subcategory") else payload.get("category")
+        subcat, _ = _clean_text(raw_subcat or "", max_len=60)
         memo, memo_rsd = _clean_text(payload.get("memo") or "", max_len=300)
         if m_rsd or memo_rsd:
             safety_notes.append("RSD-safe tone applied")
+
+        # Optional inline multi-category splits (must conserve exact cent sum!)
+        clean_inline_splits: Optional[List[Dict[str, Any]]] = None
+        if "splits" in payload and payload["splits"] is not None:
+            raw_inline_splits = payload["splits"]
+            if not isinstance(raw_inline_splits, list) or len(raw_inline_splits) < 2 or len(raw_inline_splits) > 20:
+                return None, "create_transaction inline `splits` requires between 2 and 20 split items"
+            clean_inline_splits = []
+            running_sum = 0
+            for idx, sp in enumerate(raw_inline_splits):
+                if not isinstance(sp, dict):
+                    return None, f"create_transaction split item {idx} must be a JSON object"
+                sp_amt = _strict_int(sp.get("amount_cents"))
+                if sp_amt is None or sp_amt <= 0 or sp_amt > MAX_MONEY_CENTS:
+                    return None, f"create_transaction split item {idx} requires positive integer `amount_cents`"
+                sp_jar = _strict_int(sp.get("jar_id"))
+                if sp_jar is None:
+                    sp_jar = _resolve_jar_slug_id(
+                        sp.get("jar_slug") if sp.get("jar_slug") is not None else sp.get("jar"),
+                        jars_map,
+                        jars_slugs,
+                    )
+                if sp_jar is not None and jars_map and sp_jar not in jars_map:
+                    return None, f"create_transaction split item {idx} references non-existent jar_id {sp_jar}"
+                if (jar_id in bills_ids and sp_jar is not None and sp_jar not in bills_ids) or (
+                    tx_type == "transfer" and sp_jar in bills_ids
+                ):
+                    return None, "Protected Bills jar firewall: cannot split across protected Bills jar boundary"
+                sp_goal = _strict_int(sp.get("goal_id"))
+                if sp_goal is not None and goals_map and sp_goal not in goals_map:
+                    return None, f"create_transaction split item {idx} references non-existent goal_id {sp_goal}"
+                sp_memo, sp_rsd = _clean_text(sp.get("memo") or "", max_len=200)
+                sp_sub, _ = _clean_text(sp.get("subcategory") or sp.get("category") or "", max_len=60)
+                if sp_rsd:
+                    safety_notes.append("RSD-safe tone applied")
+                running_sum += sp_amt
+                sp_entry: Dict[str, Any] = {
+                    "jar_id": sp_jar,
+                    "goal_id": sp_goal,
+                    "amount_cents": sp_amt,
+                    "memo": sp_memo,
+                }
+                if sp_sub:
+                    sp_entry["subcategory"] = sp_sub
+                clean_inline_splits.append(sp_entry)
+            if running_sum != amt:
+                return (
+                    None,
+                    f"Split sum invariant violated: SUM(splits)={running_sum} != amount_cents={amt}",
+                )
+            safety_notes.append(f"Exact split sum verified ({_fmt_dollars(running_sum)})")
 
         clean_payload: Dict[str, Any] = {
             "account_id": account_id,
@@ -882,10 +1125,22 @@ def _validate_single_action(
             "tx_date": tx_date,
             "source": "ai_agent",
         }
+        if transfer_direction:
+            clean_payload["transfer_direction"] = transfer_direction
+        if clean_inline_splits is not None:
+            clean_payload["splits"] = clean_inline_splits
+
         jar_label = jars_map[jar_id]["name"] if (jar_id is not None and jar_id in jars_map) else "Auto-Jar"
-        diff = [f'+ CREATE {tx_type.upper()}: {_fmt_dollars(amt)} at "{merchant}" on {tx_date} -> {jar_label}']
+        dir_suffix = f" ({transfer_direction})" if transfer_direction else ""
+        diff = [f'+ CREATE {tx_type.upper()}{dir_suffix}: {_fmt_dollars(amt)} at "{merchant}" on {tx_date} -> {jar_label}']
         if memo:
             diff.append(f'  memo: "{memo}"')
+        if clean_inline_splits is not None:
+            for sp in clean_inline_splits:
+                sp_j = sp.get("jar_id")
+                sp_j_label = jars_map[sp_j]["name"] if (sp_j is not None and sp_j in jars_map) else "Auto-Jar"
+                sp_memo_part = f' ({sp["memo"]})' if sp.get("memo") else ""
+                diff.append(f'  split -> {_fmt_dollars(int(sp["amount_cents"]))} to {sp_j_label}{sp_memo_part}')
         return (
             ValidatedAgentAction(
                 action_id=action_id,
@@ -913,12 +1168,14 @@ def _validate_single_action(
         updates: Dict[str, Any] = {"transaction_id": tx_id}
         diff_lines: List[str] = []
 
-        if "jar_id" in payload or "jar_slug" in payload:
+        if "jar_id" in payload or "jar_slug" in payload or "jar" in payload:
             new_jar = _strict_int(payload.get("jar_id"))
-            if new_jar is None and isinstance(payload.get("jar_slug"), str):
-                j_obj = jars_slugs.get(payload["jar_slug"].strip().lower())
-                if j_obj:
-                    new_jar = _strict_int(j_obj.get("id"))
+            if new_jar is None:
+                new_jar = _resolve_jar_slug_id(
+                    payload.get("jar_slug") if payload.get("jar_slug") is not None else payload.get("jar"),
+                    jars_map,
+                    jars_slugs,
+                )
             if new_jar is None or (jars_map and new_jar not in jars_map):
                 return None, f"update_transaction references non-existent jar_id {payload.get('jar_id')}"
             if existing_jar in bills_ids and new_jar not in bills_ids:
@@ -1044,10 +1301,12 @@ def _validate_single_action(
                 return None, f"split_transaction item {idx} requires positive integer `amount_cents`"
 
             sp_jar = _strict_int(sp.get("jar_id"))
-            if sp_jar is None and isinstance(sp.get("jar_slug"), str):
-                j_obj = jars_slugs.get(sp["jar_slug"].strip().lower())
-                if j_obj:
-                    sp_jar = _strict_int(j_obj.get("id"))
+            if sp_jar is None:
+                sp_jar = _resolve_jar_slug_id(
+                    sp.get("jar_slug") if sp.get("jar_slug") is not None else sp.get("jar"),
+                    jars_map,
+                    jars_slugs,
+                )
             if sp_jar is not None and jars_map and sp_jar not in jars_map:
                 return None, f"split_transaction item {idx} references non-existent jar_id {sp_jar}"
 
@@ -1194,6 +1453,24 @@ def _validate_single_action(
                 return None, "update_goal `saved_cents` must be non-negative integer cents"
             updates["saved_cents"] = new_s
             diff_lines.append(f"~ GOAL #{goal_id} saved: {_fmt_dollars(int(existing.get('saved_cents') or 0))} -> {_fmt_dollars(new_s)}")
+        elif payload.get("add_saved_cents") is not None or payload.get("fund_cents") is not None:
+            raw_delta = payload.get("add_saved_cents") if payload.get("add_saved_cents") is not None else payload.get("fund_cents")
+            delta_s = _strict_int(raw_delta)
+            if delta_s is None or delta_s <= 0 or delta_s > MAX_MONEY_CENTS:
+                return None, "update_goal `add_saved_cents` must be positive integer cents"
+            from_jar_id = _strict_int(payload.get("from_jar_id"))
+            if from_jar_id is None and isinstance(payload.get("from_jar_slug"), str):
+                from_jar_id = _resolve_jar_slug_id(payload.get("from_jar_slug"), jars_map, jars_slugs)
+            if from_jar_id in bills_ids:
+                return None, "Protected Bills jar firewall: goals cannot be funded from the Bills jar"
+            prev_s = max(0, int(existing.get("saved_cents") or 0))
+            new_s = prev_s + delta_s
+            if new_s > MAX_MONEY_CENTS:
+                return None, "update_goal resulting `saved_cents` exceeds safe bounds"
+            updates["saved_cents"] = new_s
+            diff_lines.append(
+                f"~ GOAL #{goal_id} saved: {_fmt_dollars(prev_s)} -> {_fmt_dollars(new_s)} (+{_fmt_dollars(delta_s)})"
+            )
 
         if "target_date" in payload and payload["target_date"] is not None:
             new_d = _validate_iso_date(payload["target_date"])
@@ -2001,25 +2278,33 @@ def _parse_single_deterministic_clause(
         if len(payload) > 1:
             return {"action_type": "update_transaction", "payload": payload}, None
 
-    # 11. CREATE TRANSACTION: "log $45 gas" / "spend $12.50 at Starbucks" / "log income $2200 paycheck"
-    if any(k in low for k in ("log", "spend", "spent", "add expense", "record", "bought", "paid", "income", "paycheck")) and _DOLLAR_TOKEN_RE.search(text):
+    # 11. CREATE TRANSACTION: "log $45 gas" / "spend $12.50 at Starbucks" / "I spent $18.40 on Uber because pouring rain"
+    if any(k in low for k in ("log", "spend", "spent", "add expense", "record", "bought", "paid", "income", "paycheck", "earned")) and _DOLLAR_TOKEN_RE.search(text):
         amt = _parse_dollars_to_cents(text)
         if amt is not None:
-            tx_type = "income" if any(k in low for k in ("income", "paycheck", "earned", "refund")) else "expense"
+            tx_type = "income" if any(k in low for k in ("income", "paycheck", "earned", "refund", "got paid")) else "expense"
             dm = _ISO_DATE_RE.search(text)
             tx_date = dm.group(1) if dm else date.today().isoformat()
-            merch_part = _DOLLAR_TOKEN_RE.sub("", text)
+            memo = ""
+            core_text = text
+            reason_m = re.search(r"\b(?:because(?:\s+of)?|b/c|since|due\s+to)\s+(.+)$", text, flags=re.I)
+            if reason_m:
+                raw_reason = reason_m.group(1).strip(" .;-:")
+                if raw_reason:
+                    memo = raw_reason[0].upper() + raw_reason[1:] if len(raw_reason) > 1 else raw_reason.upper()
+                core_text = text[: reason_m.start()].strip()
+            merch_part = _DOLLAR_TOKEN_RE.sub("", core_text)
             if dm:
                 merch_part = merch_part.replace(dm.group(1), "")
             merch_part = re.sub(
-                r"\b(?:log|spend|spent|add|record|expense|income|transaction|tx|bought|paid|at|on|for|a|an)\b",
+                r"\b(?:i|just|log|spend|spent|add|record|expense|income|transaction|tx|bought|paid|earned|got|from|at|on|for|a|an|the)\b",
                 " ",
                 merch_part,
                 flags=re.I,
             )
             merch_part = re.sub(r"\s+", " ", merch_part).strip(" -:'\"")
             merchant = merch_part[:80] if merch_part else ("Paycheck" if tx_type == "income" else "General Purchase")
-            jar_id = None if tx_type == "income" else _guess_jar_id(text, context)
+            jar_id = None if tx_type == "income" else _guess_jar_id(core_text, context)
             return (
                 {
                     "action_type": "create_transaction",
@@ -2028,6 +2313,7 @@ def _parse_single_deterministic_clause(
                         "amount_cents": amt,
                         "tx_type": tx_type,
                         "jar_id": jar_id,
+                        "memo": memo,
                         "tx_date": tx_date,
                     },
                 },
