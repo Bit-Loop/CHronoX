@@ -176,8 +176,8 @@ def sanitize_csv_text(value: object) -> str:
 
 
 def sanitize_sheet_text(value: object) -> str:
-    """Apply both XML 1.0 character safety and formula-injection neutralization."""
-    return sanitize_xml_text(sanitize_csv_text(value))
+    """Apply XML 1.0 character safety for OOXML shared strings (CSV formula quoting stays CSV-only)."""
+    return sanitize_xml_text(value)
 
 
 def cents_to_decimal_str(cents: int) -> str:
@@ -2762,17 +2762,18 @@ class FinanceExporter:
         charts_xml.update(d2_charts)
 
         sheet3, d3_anchors, d3_charts = self._build_sheet3_portfolio(snapshot, sst)
-        sheet3.set_drawing_rid("rId1")
-        drawings_xml[3] = _build_drawing_xml(d3_anchors)
-        drawing_rels[3] = [
-            (
-                a.rid,
-                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart",
-                f"../charts/chart{a.chart_index}.xml",
-            )
-            for a in d3_anchors
-        ]
-        charts_xml.update(d3_charts)
+        if d3_anchors:
+            sheet3.set_drawing_rid("rId1")
+            drawings_xml[3] = _build_drawing_xml(d3_anchors)
+            drawing_rels[3] = [
+                (
+                    a.rid,
+                    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart",
+                    f"../charts/chart{a.chart_index}.xml",
+                )
+                for a in d3_anchors
+            ]
+            charts_xml.update(d3_charts)
 
         sheet4 = self._build_sheet4_credit(snapshot, sst)
         sheet5 = self._build_sheet5_goals_bills(snapshot, sst)
@@ -3485,7 +3486,16 @@ class FinanceExporter:
         )
         ws.write_formula(a_tot_row, 4, f"SUM(D{a_start}:D{a_end})", str(a_total_cnt), STYLE_INT_TOTAL)
 
-        # Chart 5: Portfolio Allocation by Asset Class (Pie)
+        # Chart 5: Portfolio Allocation by Asset Class (Pie) — skip when total is $0 so Numbers never renders a blank pie
+        if a_total_val <= 0:
+            ws.write_text(
+                a_sec_row,
+                5,
+                "Add holdings or connect a brokerage to render your Portfolio Allocation chart.",
+                STYLE_TEXT,
+            )
+            return ws, [], {}
+
         chart5_xml = _build_radial_chart_xml(
             chart_tag="pieChart",
             title="Portfolio Allocation by Asset Class",

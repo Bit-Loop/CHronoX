@@ -181,16 +181,38 @@ function renderKpiStrip(data) {
   const netSurplus = Number(data.net_surplus_cents || 0);
   const top5 = Array.isArray(data.top_5_expenses) ? data.top_5_expenses.slice(0, 5) : [];
 
-  const rateColor =
-    savingsRate >= 20 ? "var(--primary)" : savingsRate >= 5 ? "var(--cyan)" : savingsRate >= 0 ? "var(--amber)" : "var(--crimson)";
-  const rateBadgeCls =
-    savingsRate >= 20 ? "pill-calm" : savingsRate >= 5 ? "pill-blue" : savingsRate >= 0 ? "pill-watch" : "pill-danger";
-  const rateBadgeTxt =
-    savingsRate >= 30 ? "STRONG SURPLUS" : savingsRate >= 15 ? "HEALTHY RATE" : savingsRate >= 0 ? "TIGHT MARGIN" : "DEFICIT";
+  const hasNoActivity = totalIncome === 0 && totalExpense === 0;
+  const rateColor = hasNoActivity
+    ? "var(--muted)"
+    : savingsRate >= 20
+    ? "var(--primary)"
+    : savingsRate >= 5
+    ? "var(--cyan)"
+    : savingsRate >= 0
+    ? "var(--amber)"
+    : "var(--crimson)";
+  const rateBadgeCls = hasNoActivity
+    ? "pill-soft"
+    : savingsRate >= 20
+    ? "pill-calm"
+    : savingsRate >= 5
+    ? "pill-blue"
+    : savingsRate >= 0
+    ? "pill-watch"
+    : "pill-danger";
+  const rateBadgeTxt = hasNoActivity
+    ? "NO DATA YET"
+    : savingsRate >= 30
+    ? "STRONG SURPLUS"
+    : savingsRate >= 15
+    ? "HEALTHY RATE"
+    : savingsRate >= 0
+    ? "TIGHT MARGIN"
+    : "DEFICIT";
 
-  const clampedRate = Math.max(0, Math.min(100, savingsRate));
+  const clampedRate = hasNoActivity ? 0 : Math.max(0, Math.min(100, savingsRate));
 
-  const card1 = el("article", { class: "card stat-tile", style: { borderTopColor: rateColor } }, [
+  const card1 = el("article", { class: "card stat-tile", style: { borderTopColor: hasNoActivity ? "var(--border-strong)" : rateColor } }, [
     el("div", { class: "item-row" }, [
       el("span", { class: "eyebrow", text: "SAVINGS RATE" }),
       el("span", { class: `pill ${rateBadgeCls}`, text: rateBadgeTxt }),
@@ -208,16 +230,22 @@ function renderKpiStrip(data) {
     ]),
     el("div", {
       class: "muted small tabular-nums",
-      text: `Net ${netSurplus >= 0 ? "+" : ""}${fmtMoney(netSurplus)} of ${fmtMoney(totalIncome)} income`,
+      text: hasNoActivity
+        ? "$0.00 net of $0.00 income"
+        : `Net ${netSurplus >= 0 ? "+" : ""}${fmtMoney(netSurplus)} of ${fmtMoney(totalIncome)} income`,
     }),
   ]);
 
-  const surplusColor = avgSurplus >= 0 ? "var(--primary)" : "var(--crimson)";
+  const surplusColor = hasNoActivity
+    ? "var(--muted)"
+    : avgSurplus >= 0
+    ? "var(--primary)"
+    : "var(--crimson)";
   const periodCaption = chartState.month
     ? `Selected month (${fmtMonthShort(chartState.month)})`
     : `${data.start_date || "--"} to ${data.end_date || "--"}`;
 
-  const card2 = el("article", { class: "card stat-tile", style: { borderTopColor: surplusColor } }, [
+  const card2 = el("article", { class: "card stat-tile", style: { borderTopColor: hasNoActivity ? "var(--border-strong)" : surplusColor } }, [
     el("div", { class: "item-row" }, [
       el("span", { class: "eyebrow", text: "AVG MONTHLY SURPLUS" }),
       el("span", { class: "pill pill-soft", text: String(data.period || chartState.period).toUpperCase() }),
@@ -225,7 +253,7 @@ function renderKpiStrip(data) {
     el("div", {
       class: "metric-md tabular-nums",
       style: { color: surplusColor, fontSize: "1.95rem" },
-      text: `${avgSurplus >= 0 ? "+" : ""}${fmtMoney(avgSurplus)}`,
+      text: hasNoActivity ? fmtMoney(0) : `${avgSurplus >= 0 ? "+" : ""}${fmtMoney(avgSurplus)}`,
     }),
     el("div", { class: "item-row small tabular-nums" }, [
       el("span", { style: { color: "var(--primary)" }, text: `IN ${fmtMoneyCompact(totalIncome)}` }),
@@ -282,13 +310,22 @@ function renderKpiStrip(data) {
         }),
       ];
 
-  const card3 = el("article", { class: "card stat-tile", style: { borderTopColor: "var(--amber)" } }, [
-    el("div", { class: "item-row" }, [
-      el("span", { class: "eyebrow", text: "TOP 5 EXPENSES" }),
-      el("span", { class: "pill pill-watch", text: `${top5.length} CATEGORIES` }),
-    ]),
-    el("div", { class: "stack-xs", style: { gap: "7px", marginTop: "2px" } }, top5Rows),
-  ]);
+  const card3 = el(
+    "article",
+    { class: "card stat-tile", style: { borderTopColor: top5.length ? "var(--amber)" : "var(--border-strong)" } },
+    [
+      el("div", { class: "item-row" }, [
+        el("span", { class: "eyebrow", text: "TOP 5 EXPENSES" }),
+        top5.length
+          ? el("span", {
+              class: "pill pill-watch",
+              text: `${top5.length} ${top5.length === 1 ? "CATEGORY" : "CATEGORIES"}`,
+            })
+          : null,
+      ]),
+      el("div", { class: "stack-xs", style: { gap: "7px", marginTop: "2px" } }, top5Rows),
+    ]
+  );
 
   host.replaceChildren(card1, card2, card3);
 }

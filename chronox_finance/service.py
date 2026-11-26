@@ -62,6 +62,8 @@ from chronox_finance.ai.local_cli_clients import (
     LOCAL_CLI_PRIORITY,
     LOCAL_CLI_SPECS,
     LocalCLIRegistry,
+    LocalHTTPGatewayInfo,
+    detect_local_http_gateways,
     get_default_local_cli_registry,
 )
 from chronox_finance.ai.opencode_client import (
@@ -252,6 +254,11 @@ from chronox_finance.storage import FinanceStorage, compute_tx_fingerprint
 
 logger = logging.getLogger(__name__)
 
+
+class PlanConflictError(ValueError):
+    """Raised when an optimistic plan fingerprint or post-apply undo snapshot conflicts with later edits (HTTP 409)."""
+
+
 _LOOKBACK_730D = 730
 _MAX_TX_LIMIT = 250_000
 
@@ -321,7 +328,8 @@ class FinanceService:
         local_cli_registry: Optional[LocalCLIRegistry] = None,
         plaid_poll_interval_seconds: float = 3.0,
         plaid_poll_max_seconds: float = 900.0,
-        plaid_retry_delays: Sequence[float] = (15.0, 45.0, 120.0, 300.0),
+        plaid_retry_delays: Sequence[float] = (15.0, 45.0, 120.0, 300.0) + (900.0,) * 92,
+        plaid_periodic_sync_interval_seconds: float = 14400.0,
         plaid_callback_base_url: Optional[str] = None,
     ):
         self.db_path = db_path
@@ -370,12 +378,15 @@ class FinanceService:
         self._plaid_poll_interval_seconds = max(0.02, float(plaid_poll_interval_seconds))
         self._plaid_poll_max_seconds = max(1.0, float(plaid_poll_max_seconds))
         self._plaid_retry_delays: Tuple[float, ...] = tuple(max(0.01, float(d)) for d in plaid_retry_delays)
+        self._plaid_periodic_sync_interval_seconds = max(1.0, float(plaid_periodic_sync_interval_seconds))
         self._plaid_callback_base_url = plaid_callback_base_url
         self._plaid_bg_lock = threading.RLock()
         self._plaid_stop_event = threading.Event()
         self._plaid_poller_thread: Optional[threading.Thread] = None
         self._plaid_poller_stop_event: Optional[threading.Event] = None
         self._plaid_retry_timers: Dict[int, threading.Timer] = {}
+        self._plaid_periodic_holder: List[Optional[threading.Timer]] = [None]
+        self._plaid_check_in_flight: bool = False
         self._plaid_pending_state: Optional[Dict[str, Any]] = None
         self._plaid_completed_nonces: Dict[str, Dict[str, Any]] = {}
         self._plaid_completed_link_tokens: Dict[str, Dict[str, Any]] = {}
@@ -393,6 +404,7 @@ class FinanceService:
             self._plaid_bg_lock,
             self._plaid_stop_event,
             self._plaid_retry_timers,
+            self._plaid_periodic_holder,
         )
 
     @staticmethod
@@ -400,6 +412,7 @@ class FinanceService:
         bg_lock: threading.RLock,
         stop_event: threading.Event,
         retry_timers: Dict[int, threading.Timer],
+        periodic_holder: Optional[List[Optional[threading.Timer]]] = None,
     ) -> None:
         from contextlib import suppress
 
@@ -407,12 +420,15 @@ class FinanceService:
             stop_event.set()
             timers = list(retry_timers.values())
             retry_timers.clear()
+            if periodic_holder and periodic_holder[0] is not None:
+                timers.append(periodic_holder[0])
+                periodic_holder[0] = None
         for timer in timers:
             with suppress(Exception):
                 timer.cancel()
 
     def _stop_plaid_background_tasks(self) -> None:
-        """Stop all active Plaid Hosted Link poller threads and backfill retry timers cleanly."""
+        """Stop all active Plaid Hosted Link poller threads, backfill retry timers, and periodic sync timers."""
         with self._plaid_bg_lock:
             self._plaid_stop_event.set()
             poller_stop = self._plaid_poller_stop_event
@@ -423,6 +439,9 @@ class FinanceService:
             self._plaid_poller_thread = None
             timers = list(self._plaid_retry_timers.values())
             self._plaid_retry_timers.clear()
+            if self._plaid_periodic_holder[0] is not None:
+                timers.append(self._plaid_periodic_holder[0])
+                self._plaid_periodic_holder[0] = None
             self._plaid_pending_state = None
             self._plaid_completed_nonces.clear()
             self._plaid_completed_link_tokens.clear()
@@ -538,7 +557,7 @@ class FinanceService:
         if ok:
             self._plaid_stop_event.clear()
             self.storage.log_budget_event("security", "Local vault unlocked")
-            self._resume_pending_plaid_poller_if_any()
+            self._resume_plaid_background_syncs_if_any()
         return ok
 
     def recover_vault(self, req: VaultRecoverRequest) -> VaultRecoverResponse:
@@ -549,7 +568,7 @@ class FinanceService:
         )
         self._plaid_stop_event.clear()
         self.storage.log_budget_event("security", "Local vault recovered via Recovery Key (DEK rewrapped)")
-        self._resume_pending_plaid_poller_if_any()
+        self._resume_plaid_background_syncs_if_any()
         status = self.get_vault_status(authenticated=True)
         return VaultRecoverResponse(
             status=status,
@@ -681,12 +700,49 @@ class FinanceService:
             transport=self._codex_transport,
         )
 
-    def build_wrapper_client(self) -> CodexResponsesClient:
+    def _detect_local_http_gateway(
+        self,
+        *,
+        settings: Optional[Dict[str, Any]] = None,
+        force_refresh: bool = False,
+    ) -> Optional[LocalHTTPGatewayInfo]:
+        """Auto-detect a running local OpenAI-compatible server (Ollama/LM Studio/LiteLLM/vLLM)."""
+        if not self._is_local_cli_auto_detect_enabled(settings):
+            return None
+        hits = detect_local_http_gateways(
+            force_refresh=force_refresh,
+            transport=self._wrapper_transport,
+        )
+        return hits[0] if hits else None
+
+    def _build_auto_local_gateway_client(
+        self,
+        *,
+        settings: Optional[Dict[str, Any]] = None,
+        force_refresh: bool = False,
+    ) -> Optional[CodexResponsesClient]:
+        hit = self._detect_local_http_gateway(settings=settings, force_refresh=force_refresh)
+        if hit is None:
+            return None
+        return CodexResponsesClient(
+            api_key="",
+            base_url=hit.base_url,
+            model=hit.model,
+            provider_name="chat_wrapper",
+            wire_api="chat_completions",
+            transport=self._wrapper_transport,
+        )
+
+    def build_wrapper_client(self, *, auto_detect_local: bool = False) -> CodexResponsesClient:
         settings = self.storage.get_settings()
         wire = str(settings.get("wrapper_wire_api") or "chat_completions").strip().lower()
         if wire not in ("responses", "chat_completions"):
             wire = "chat_completions"
         raw_base = (settings.get("wrapper_base_url") or os.getenv("CHRONOX_WRAPPER_BASE_URL") or "").strip()
+        if not raw_base and auto_detect_local:
+            detected = self._build_auto_local_gateway_client(settings=settings)
+            if detected is not None:
+                return detected
         return CodexResponsesClient(
             api_key=self._resolve_wrapper_api_key(),
             base_url=raw_base,
@@ -754,61 +810,19 @@ class FinanceService:
             clients[pid] = self._build_local_cli_client(pid, enabled=is_en, settings=settings)
         return clients
 
-    def resolve_active_provider(
-        self,
-        provider_override: Optional[str] = None,
-    ) -> ActiveProviderResolved:
-        settings = self.storage.get_settings()
-        pref = self._resolve_ai_provider_setting(settings, override=provider_override)
-        if pref != AIProvider.AUTO:
-            if pref.value in LOCAL_CLI_SPECS:
-                c = self._build_local_cli_client(pref.value, enabled=True, settings=settings)
-                if c.is_configured:
-                    return pref.value  # type: ignore[return-value]
-                return "none"
-            cloud = self._build_cloud_ai_clients()
-            c = cloud.get(pref.value)
-            if c and c.is_configured:
-                return pref.value  # type: ignore[return-value]
-            return "none"
-
-        cloud = self._build_cloud_ai_clients()
-        for pid in ("opencode_go", "gemini", "openai_codex", "chat_wrapper"):
-            if cloud[pid].is_configured:
-                return pid  # type: ignore[return-value]
-
-        if self._is_local_cli_auto_detect_enabled(settings):
-            failover = self._local_cli_registry.get_failover_clients(
-                run_auth_probe=False, include_cooldown=False
-            )
-            if failover:
-                return str(failover[0].provider_name)  # type: ignore[return-value]
-        elif bool(settings.get("codex_cli_enabled", 0)):
-            if not self._local_cli_registry.is_auth_failed("codex_cli"):
-                c = self._build_local_cli_client("codex_cli", enabled=True, settings=settings)
-                if c.is_configured:
-                    return "codex_cli"
-        return "none"
-
-    def _build_coach_clients_list(
-        self,
-        provider_override: Optional[str] = None,
-    ) -> List[LLMClient]:
-        settings = self.storage.get_settings()
-        pref = self._resolve_ai_provider_setting(settings, override=provider_override)
-        if pref != AIProvider.AUTO:
-            if pref.value in LOCAL_CLI_SPECS:
-                chosen = self._build_local_cli_client(pref.value, enabled=True, settings=settings)
-                return [chosen]
-            cloud = self._build_cloud_ai_clients()
-            chosen = cloud.get(pref.value)
-            return [chosen] if chosen is not None else []
-
+    def _build_auto_clients_chain(self, settings: Dict[str, Any]) -> List[LLMClient]:
         ordered: List[LLMClient] = []
         cloud = self._build_cloud_ai_clients()
         for pid in ("opencode_go", "gemini", "openai_codex", "chat_wrapper"):
             if cloud[pid].is_configured:
                 ordered.append(cloud[pid])
+
+        # Auto-detected local OpenAI-compatible HTTP gateway (Ollama/LM Studio/LiteLLM/vLLM)
+        # sits right after explicit cloud keys and before local CLIs
+        if not cloud["chat_wrapper"].is_configured:
+            auto_gw = self._build_auto_local_gateway_client(settings=settings)
+            if auto_gw is not None and auto_gw.is_configured:
+                ordered.append(auto_gw)
 
         if self._is_local_cli_auto_detect_enabled(settings):
             custom_codex_model = str(settings.get("codex_cli_model") or "").strip()
@@ -825,6 +839,64 @@ class FinanceService:
                 if c.is_configured:
                     ordered.append(c)
         return ordered
+
+    def resolve_active_provider(
+        self,
+        provider_override: Optional[str] = None,
+    ) -> ActiveProviderResolved:
+        settings = self.storage.get_settings()
+        pref = self._resolve_ai_provider_setting(settings, override=provider_override)
+        if pref != AIProvider.AUTO:
+            if pref.value in LOCAL_CLI_SPECS:
+                c = self._build_local_cli_client(pref.value, enabled=True, settings=settings)
+                if c.is_configured:
+                    return pref.value  # type: ignore[return-value]
+                return "none"
+            cloud = self._build_cloud_ai_clients()
+            c = cloud.get(pref.value)
+            if c and c.is_configured:
+                return pref.value  # type: ignore[return-value]
+            if pref.value == "chat_wrapper":
+                auto_gw = self._build_auto_local_gateway_client(settings=settings)
+                if auto_gw is not None and auto_gw.is_configured:
+                    return "chat_wrapper"
+            return "none"
+
+        chain = self._build_auto_clients_chain(settings)
+        if chain:
+            return str(getattr(chain[0], "provider_name", "none") or "none")  # type: ignore[return-value]
+        return "none"
+
+    def _build_coach_clients_list(
+        self,
+        provider_override: Optional[str] = None,
+    ) -> List[LLMClient]:
+        settings = self.storage.get_settings()
+        pref = self._resolve_ai_provider_setting(settings, override=provider_override)
+        auto_chain = self._build_auto_clients_chain(settings)
+        if pref != AIProvider.AUTO:
+            chosen: Optional[LLMClient] = None
+            if pref.value in LOCAL_CLI_SPECS:
+                chosen = self._build_local_cli_client(pref.value, enabled=True, settings=settings)
+            else:
+                cloud = self._build_cloud_ai_clients()
+                chosen = cloud.get(pref.value)
+                if (chosen is None or not chosen.is_configured) and pref.value == "chat_wrapper":
+                    chosen = self._build_auto_local_gateway_client(settings=settings) or chosen
+            ordered: List[LLMClient] = []
+            seen_pids: set[str] = set()
+            if chosen is not None and chosen.is_configured:
+                ordered.append(chosen)
+                seen_pids.add(str(getattr(chosen, "provider_name", pref.value) or pref.value))
+            # Always append auto failover chain behind a pinned provider so signed-out/uninstalled pins never break AI
+            for candidate in auto_chain:
+                cpid = str(getattr(candidate, "provider_name", "") or "")
+                if cpid and cpid not in seen_pids:
+                    ordered.append(candidate)
+                    seen_pids.add(cpid)
+            return ordered
+
+        return auto_chain
 
     def _provider_display_label(self, provider_id: str) -> str:
         labels = {
@@ -868,6 +940,24 @@ class FinanceService:
                     "in_cooldown": bool(d.get("in_cooldown", False)),
                 }
             )
+        if auto_detect:
+            gw_hit = self._detect_local_http_gateway(settings=settings, force_refresh=bool(probe))
+            if gw_hit is not None:
+                clis.insert(
+                    0,
+                    {
+                        "provider_id": "chat_wrapper",
+                        "display_name": f"{gw_hit.name} (Local)",
+                        "installed": True,
+                        "auth_ready": True,
+                        "binary_path": gw_hit.base_url,
+                        "version": f"{gw_hit.model_count} model{'s' if gw_hit.model_count != 1 else ''}",
+                        "status_detail": f"Auto-detected at {gw_hit.base_url} · {gw_hit.model}",
+                        "is_active": bool(active == "chat_wrapper"),
+                        "default_model": gw_hit.model,
+                        "in_cooldown": False,
+                    },
+                )
         return {
             "auto_detect_enabled": auto_detect,
             "active_provider": active,
@@ -2211,6 +2301,77 @@ class FinanceService:
                 env=str(pending.get("env") or "production"),
             )
 
+    def _is_connection_stale_for_sync(self, conn: Dict[str, Any], *, stale_seconds: float = 14400.0) -> bool:
+        if str(conn.get("backfill_status") or "").lower() == "backfill_pending":
+            return True
+        last_str = str(conn.get("last_synced_at") or "").strip()
+        if not last_str:
+            return True
+        try:
+            dt = datetime.fromisoformat(last_str.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - dt).total_seconds() >= stale_seconds
+        except ValueError:
+            return True
+
+    def _schedule_plaid_periodic_sync(self) -> None:
+        """Schedule a daemon timer to refresh linked Plaid institutions every 4h while unlocked."""
+        if self._plaid_stop_event.is_set() or getattr(self.storage, "_closed", False):
+            return
+        if not self.secrets.is_unlocked():
+            return
+        plaid_conns = [c for c in self.storage.list_connections() if str(c.get("provider") or "") == "plaid"]
+        if not plaid_conns:
+            return
+        delay = float(self._plaid_periodic_sync_interval_seconds)
+        master_stop = self._plaid_stop_event
+        bg_lock = self._plaid_bg_lock
+        svc_ref = weakref.ref(self)
+
+        def _run_periodic() -> None:
+            with bg_lock:
+                svc = svc_ref()
+                if svc is not None:
+                    svc._plaid_periodic_holder[0] = None
+            if master_stop.is_set() or svc is None:
+                return
+            if getattr(svc.storage, "_closed", False) or not svc.secrets.is_unlocked():
+                return
+            try:
+                svc.sync_plaid()
+            except (VaultLockedError, VaultNotInitializedError, sqlite3.ProgrammingError):
+                return
+            except Exception as exc:
+                logger.debug("Periodic Plaid sync deferred: %s", exc)
+            finally:
+                if not master_stop.is_set() and not getattr(svc.storage, "_closed", False) and svc.secrets.is_unlocked():
+                    svc._schedule_plaid_periodic_sync()
+
+        with self._plaid_bg_lock:
+            existing = self._plaid_periodic_holder[0]
+            if existing is not None:
+                existing.cancel()
+            timer = threading.Timer(delay, _run_periodic)
+            timer.daemon = True
+            timer.name = "chronox-plaid-periodic-sync"
+            self._plaid_periodic_holder[0] = timer
+            timer.start()
+
+    def _resume_plaid_background_syncs_if_any(self) -> None:
+        """Resume pending Hosted Link polling, stale/backfill_pending syncs, and periodic 4h sync."""
+        if self._plaid_stop_event.is_set() or getattr(self.storage, "_closed", False) or not self.secrets.is_unlocked():
+            return
+        self._resume_pending_plaid_poller_if_any()
+        plaid_conns = [c for c in self.storage.list_connections() if str(c.get("provider") or "") == "plaid"]
+        if not plaid_conns:
+            return
+        for conn in plaid_conns:
+            cid = int(conn["id"])
+            if self._is_connection_stale_for_sync(conn):
+                self._schedule_plaid_backfill_retry(cid, attempt=0, delay_override=0.15)
+        self._schedule_plaid_periodic_sync()
+
     def _start_plaid_poller(self, *, link_token: str, env: str) -> None:
         with self._plaid_bg_lock:
             old_stop = self._plaid_poller_stop_event
@@ -2246,7 +2407,7 @@ class FinanceService:
                     try:
                         res = svc.check_pending_plaid_link(link_token=link_token)
                         st = str(res.get("status") or "pending")
-                        if st in ("completed", "exited", "idle"):
+                        if st in ("completed", "exited", "expired", "idle"):
                             return
                     except (VaultLockedError, VaultNotInitializedError):
                         return
@@ -2266,15 +2427,25 @@ class FinanceService:
             self._plaid_poller_thread = t
             t.start()
 
-    def _schedule_plaid_backfill_retry(self, connection_id: int, *, attempt: int = 0) -> None:
+    def _schedule_plaid_backfill_retry(
+        self,
+        connection_id: int,
+        *,
+        attempt: int = 0,
+        delay_override: Optional[float] = None,
+    ) -> None:
         """Schedule non-blocking follow-up Plaid sync retry for `NOT_READY` / `backfill_pending`."""
-        if attempt >= len(self._plaid_retry_delays):
+        if delay_override is None and attempt >= len(self._plaid_retry_delays):
             return
         if self._plaid_stop_event.is_set() or getattr(self.storage, "_closed", False):
             return
         if not self.secrets.is_unlocked():
             return
-        delay = float(self._plaid_retry_delays[attempt])
+        delay = (
+            max(0.01, float(delay_override))
+            if delay_override is not None
+            else float(self._plaid_retry_delays[attempt])
+        )
         master_stop = self._plaid_stop_event
         bg_lock = self._plaid_bg_lock
         retry_timers = self._plaid_retry_timers
@@ -2381,22 +2552,50 @@ class FinanceService:
         client, env = self._build_plaid_client()
         state_nonce = secrets.token_urlsafe(24)
         base_cb = (callback_base_url or self._plaid_callback_base_url or "").strip().rstrip("/")
-        effective_redirect = (req.completion_redirect_uri or "").strip() or None
-        if not effective_redirect and base_cb:
-            if (
-                env == "sandbox"
+
+        def _compute_redirect(target_env_val: str) -> Optional[str]:
+            explicit = (req.completion_redirect_uri or "").strip() or None
+            if explicit:
+                return explicit
+            if base_cb and (
+                target_env_val == "sandbox"
                 or base_cb.lower().startswith("https://")
                 or base_cb.lower().startswith("chronox://")
             ):
-                effective_redirect = f"{base_cb}/api/v1/plaid/hosted-complete?state={state_nonce}"
+                return f"{base_cb}/api/v1/plaid/hosted-complete?state={state_nonce}"
+            return None
 
-        res = client.create_link_token(
-            days_requested=req.days_requested,
-            products=tuple(req.products or ["transactions"]),
-            optional_products=tuple(req.optional_products or ["liabilities", "investments"]),
-            completion_redirect_uri=effective_redirect,
-            url_lifetime_seconds=3600,
-        )
+        effective_redirect = _compute_redirect(env)
+        try:
+            res = client.create_link_token(
+                days_requested=req.days_requested,
+                products=tuple(req.products or ["transactions"]),
+                optional_products=tuple(req.optional_products or ["liabilities", "investments"]),
+                completion_redirect_uri=effective_redirect,
+                url_lifetime_seconds=3600,
+            )
+        except (ConnectorAuthError, ConnectorError) as exc:
+            if "INVALID_API_KEYS" not in str(exc).upper():
+                raise
+            alt_env: Literal["sandbox", "production"] = "sandbox" if env == "production" else "production"
+            alt_client, _ = self._build_plaid_client(env_override=alt_env)
+            res = alt_client.create_link_token(
+                days_requested=req.days_requested,
+                products=tuple(req.products or ["transactions"]),
+                optional_products=tuple(req.optional_products or ["liabilities", "investments"]),
+                completion_redirect_uri=_compute_redirect(alt_env),
+                url_lifetime_seconds=3600,
+            )
+            env = alt_env
+            saved_cfg = self._safe_get_secret_json("plaid:config") or {}
+            if saved_cfg.get("client_id") and saved_cfg.get("secret"):
+                self.configure_plaid(
+                    PlaidConfigRequest(
+                        client_id=str(saved_cfg["client_id"]),
+                        secret=str(saved_cfg["secret"]),
+                        env=alt_env,
+                    )
+                )
         default_exp = (
             (datetime.now(timezone.utc) + timedelta(hours=6))
             .replace(microsecond=0)
@@ -2535,6 +2734,21 @@ class FinanceService:
                 row = refreshed
         return self._to_connection_out(row)
 
+    @staticmethod
+    def _is_plaid_terminal_token_error(exc: Exception) -> bool:
+        if isinstance(exc, ConnectorAuthError):
+            return True
+        upper_msg = str(exc).upper()
+        return any(
+            code in upper_msg
+            for code in (
+                "PUBLIC_TOKEN_EXPIRED",
+                "INVALID_PUBLIC_TOKEN",
+                "LINK_TOKEN_EXPIRED",
+                "INVALID_LINK_TOKEN",
+            )
+        )
+
     def check_pending_plaid_link(
         self,
         link_token: Optional[str] = None,
@@ -2545,6 +2759,9 @@ class FinanceService:
         Poll the persisted pending Plaid Hosted Link session, exchange ALL newly linked
         items idempotently, seed accounts from link metadata if balances haven't settled,
         and trigger immediate sync + non-blocking backfill retries.
+
+        `_plaid_bg_lock` is held ONLY for short in-memory state reads/commits — never
+        across network I/O — so `get_plaid_config()` and `lock_vault()` never block.
         """
         self._require_vault_unlocked()
         with self._plaid_bg_lock:
@@ -2552,8 +2769,38 @@ class FinanceService:
             target_lt = (link_token or "").strip() or str((pending or {}).get("link_token") or "").strip()
             if target_lt and target_lt in self._plaid_completed_link_tokens:
                 return dict(self._plaid_completed_link_tokens[target_lt])
+            if self._plaid_check_in_flight:
+                return {
+                    "status": "pending",
+                    "pending_link_active": True,
+                    "in_flight": True,
+                    "link_token": target_lt,
+                    "hosted_link_url": str((pending or {}).get("hosted_link_url") or ""),
+                    "exchanged_count": 0,
+                }
+            if not (public_token and public_token.strip()) and not target_lt:
+                last_status = self._plaid_last_status
+                last_error = self._plaid_last_error
+                plaid_conns = [
+                    c.model_dump()
+                    for c in self.list_connections()
+                    if c.provider == "plaid"
+                ]
+                return {
+                    "status": "idle",
+                    "pending_link_active": False,
+                    "exchanged_count": 0,
+                    "connections": plaid_conns,
+                    "last_status": last_status,
+                    "last_error": last_error,
+                }
             already_exchanged = set((pending or {}).get("exchanged_tokens") or [])
+            pending_env = str((pending or {}).get("env") or "").strip().lower() or None
+            hosted_url_snap = str((pending or {}).get("hosted_link_url") or "")
+            nonce_snap = str((pending or {}).get("state_nonce") or "").strip()
+            self._plaid_check_in_flight = True
 
+        try:
             items_to_exchange: List[Dict[str, Any]] = []
             poll_status = "idle"
             poll_error_code = ""
@@ -2569,24 +2816,25 @@ class FinanceService:
                         "accounts": [],
                     }
                 )
-            elif not target_lt:
-                plaid_conns = [
-                    c.model_dump()
-                    for c in self.list_connections()
-                    if c.provider == "plaid"
-                ]
-                return {
-                    "status": "idle",
-                    "pending_link_active": False,
-                    "exchanged_count": 0,
-                    "connections": plaid_conns,
-                    "last_status": self._plaid_last_status,
-                    "last_error": self._plaid_last_error,
-                }
             else:
-                pending_env = str((pending or {}).get("env") or "").strip().lower() or None
                 client, _env = self._build_plaid_client(env_override=pending_env)
-                poll = client.poll_link_token(target_lt)
+                try:
+                    poll = client.poll_link_token(target_lt)
+                except (ConnectorAuthError, ConnectorError) as exc:
+                    if self._is_plaid_terminal_token_error(exc):
+                        expired_msg = "Bank sign-in expired — click Connect Bank to try again."
+                        with self._plaid_bg_lock:
+                            self._plaid_last_status = "expired"
+                            self._plaid_last_error = expired_msg
+                        self._clear_pending_plaid_link()
+                        return {
+                            "status": "exited",
+                            "pending_link_active": False,
+                            "error_code": "TOKEN_EXPIRED",
+                            "error_message": expired_msg,
+                            "exchanged_count": 0,
+                        }
+                    raise
                 poll_status = poll.status
                 poll_error_code = poll.error_code
                 poll_error_msg = poll.error_message
@@ -2608,19 +2856,21 @@ class FinanceService:
                     "status": "pending",
                     "pending_link_active": True,
                     "link_token": target_lt,
-                    "hosted_link_url": str((pending or {}).get("hosted_link_url") or ""),
+                    "hosted_link_url": hosted_url_snap,
                     "exchanged_count": 0,
                 }
 
             if poll_status == "exited":
-                self._plaid_last_status = "exited"
-                self._plaid_last_error = poll_error_msg or "Bank sign-in was closed before completion."
+                exit_msg = poll_error_msg or "Bank sign-in was closed before completion."
+                with self._plaid_bg_lock:
+                    self._plaid_last_status = "exited"
+                    self._plaid_last_error = exit_msg
                 self._clear_pending_plaid_link()
                 return {
                     "status": "exited",
                     "pending_link_active": False,
                     "error_code": poll_error_code,
-                    "error_message": self._plaid_last_error,
+                    "error_message": exit_msg,
                     "exchanged_count": 0,
                 }
 
@@ -2637,15 +2887,32 @@ class FinanceService:
                     continue
                 inst = str(item.get("institution_name") or "").strip() or "Plaid Institution"
                 link_accts = item.get("accounts") if isinstance(item.get("accounts"), list) else []
-                conn_out = self.exchange_plaid_token(
-                    PlaidExchangeRequest(public_token=ptok, institution=inst),
-                    auto_sync=False,
-                    link_accounts=link_accts,
-                )
+                try:
+                    conn_out = self.exchange_plaid_token(
+                        PlaidExchangeRequest(public_token=ptok, institution=inst),
+                        auto_sync=False,
+                        link_accounts=link_accts,
+                    )
+                except (ConnectorAuthError, ConnectorError) as exc:
+                    if self._is_plaid_terminal_token_error(exc):
+                        expired_msg = "Bank sign-in expired — click Connect Bank to try again."
+                        with self._plaid_bg_lock:
+                            self._plaid_last_status = "expired"
+                            self._plaid_last_error = expired_msg
+                        self._clear_pending_plaid_link()
+                        return {
+                            "status": "exited",
+                            "pending_link_active": False,
+                            "error_code": "TOKEN_EXPIRED",
+                            "error_message": expired_msg,
+                            "exchanged_count": len(connections_out),
+                        }
+                    raise
                 already_exchanged.add(ptok)
-                if pending is not None and self.secrets.is_unlocked():
-                    pending["exchanged_tokens"] = sorted(already_exchanged)
-                    self.secrets.set_json("plaid:pending_link", pending)
+                with self._plaid_bg_lock:
+                    if self._plaid_pending_state is not None and self.secrets.is_unlocked():
+                        self._plaid_pending_state["exchanged_tokens"] = sorted(already_exchanged)
+                        self.secrets.set_json("plaid:pending_link", dict(self._plaid_pending_state))
 
                 try:
                     sync_res = self.sync_plaid(connection_id=conn_out.id)
@@ -2675,20 +2942,24 @@ class FinanceService:
                 "backfill_status": "backfill_pending" if any_backfill_pending else "complete",
                 "sync_errors": sync_errors,
             }
-            nonce_done = str((pending or {}).get("state_nonce") or "").strip()
-            if nonce_done:
-                if len(self._plaid_completed_nonces) >= 16:
-                    self._plaid_completed_nonces.clear()
-                self._plaid_completed_nonces[nonce_done] = dict(summary)
-            if target_lt:
-                if len(self._plaid_completed_link_tokens) >= 16:
-                    self._plaid_completed_link_tokens.clear()
-                self._plaid_completed_link_tokens[target_lt] = dict(summary)
-            self._plaid_last_status = "completed"
-            self._plaid_last_error = "; ".join(sync_errors)[:240]
+            with self._plaid_bg_lock:
+                if nonce_snap:
+                    if len(self._plaid_completed_nonces) >= 16:
+                        self._plaid_completed_nonces.clear()
+                    self._plaid_completed_nonces[nonce_snap] = dict(summary)
+                if target_lt:
+                    if len(self._plaid_completed_link_tokens) >= 16:
+                        self._plaid_completed_link_tokens.clear()
+                    self._plaid_completed_link_tokens[target_lt] = dict(summary)
+                self._plaid_last_status = "completed"
+                self._plaid_last_error = "; ".join(sync_errors)[:240]
             self._clear_pending_plaid_link()
+            self._schedule_plaid_periodic_sync()
 
             return summary
+        finally:
+            with self._plaid_bg_lock:
+                self._plaid_check_in_flight = False
 
     def handle_plaid_hosted_complete(
         self,
@@ -3189,6 +3460,7 @@ class FinanceService:
         next_attempt = 0 if _from_retry_attempt is None else (_from_retry_attempt + 1)
         for pending_cid in pending_retry_cids:
             self._schedule_plaid_backfill_retry(pending_cid, attempt=next_attempt)
+        self._schedule_plaid_periodic_sync()
 
         self._backfill_net_worth_snapshots(days=_LOOKBACK_730D)
         sync_summary = self.run_self_updating_sync(reason=f"Plaid synced ({total_imported} new tx)")
@@ -5735,7 +6007,7 @@ class FinanceService:
                         needs_review=False,
                         source="ai_agent",
                         transfer_direction=str(pl.get("transfer_direction") or ""),
-                        adjust_balance=True,
+                        adjust_balance=bool(pl.get("affects_balance", True)),
                     )
                     assert row is not None
                     inline_splits = pl.get("splits")
@@ -6385,14 +6657,16 @@ class FinanceService:
         *,
         horizon_days: int = 30,
         apply: bool = False,
+        expected_fingerprint: Optional[str] = None,
         mode_override: Optional[str] = None,
         provider_override: Optional[str] = None,
         completion_fn: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Build a statistical CVaR/EWMA + KKT One-Tap optimization plan paired with
-        a grounded executive narrative. When `apply=True`, atomically commits all
-        executable actions and records an exact pre-image undo batch.
+        a grounded executive narrative. When `apply=True`, validates optional
+        `expected_fingerprint` (409 on stale plan), atomically commits all
+        executable actions, and records a touched-rows-only, conflict-checked undo batch.
         """
         horizon = max(7, min(90, int(horizon_days or 30)))
         settings = self.storage.get_settings()
@@ -6418,6 +6692,19 @@ class FinanceService:
             current_trading_cap_cents=current_cap,
             horizon_days=horizon,
         )
+        plan_fingerprint = hashlib.sha256(
+            json.dumps(
+                [a.model_dump() for a in plan.actions],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+
+        if apply and expected_fingerprint and expected_fingerprint.strip() != plan_fingerprint:
+            raise PlanConflictError(
+                "One-Tap plan changed since preview (e.g. a bank sync or edit occurred). "
+                "Refresh the preview before applying."
+            )
 
         mode = self._resolve_intelligence_mode(settings, override=mode_override)
         max_daily = int(settings.get("opencode_max_daily_requests", 60))
@@ -6449,23 +6736,11 @@ class FinanceService:
                 with self.storage.transaction(immediate=True) as conn:
                     raw_jars_before = self.storage.list_jars()
                     jars_by_id = {int(j["id"]): j for j in raw_jars_before}
-                    settings_before = {
-                        "emergency_buffer_cents": int(settings.get("emergency_buffer_cents", 50_000)),
-                        "safe_invest_cap_cents": settings.get("safe_invest_cap_cents"),
-                    }
-                    jars_before_snapshot = [
-                        {
-                            "id": int(j["id"]),
-                            "auto_allocated_cents": int(j["auto_allocated_cents"]),
-                            "rollover_cents": int(j["rollover_cents"]),
-                            "target_pct": float(j["target_pct"]),
-                            "monthly_target_cents": int(j["monthly_target_cents"]),
-                            "is_locked": int(j["is_locked"]),
-                        }
-                        for j in raw_jars_before
-                    ]
+                    touched_settings_before: Dict[str, Any] = {}
+                    touched_settings_after: Dict[str, Any] = {}
+                    touched_jar_ids: set[int] = set()
                     created_transfer_ids: List[int] = []
-                    goals_before_snapshot: Dict[int, Dict[str, Any]] = {}
+                    goals_changes: Dict[int, Dict[str, Any]] = {}
                     applied_any = False
 
                     for act in executable_actions:
@@ -6491,22 +6766,34 @@ class FinanceService:
                                     reason=str(pl.get("reason") or "One-Tap statistical rebalance"),
                                 )
                                 created_transfer_ids.append(int(tr["id"]))
+                                touched_jar_ids.add(from_id)
+                                touched_jar_ids.add(to_id)
                                 applied_any = True
 
                         elif act.action_type == "set_emergency_buffer":
                             new_buf = max(0, int(pl["emergency_buffer_cents"]))
+                            if "emergency_buffer_cents" not in touched_settings_before:
+                                touched_settings_before["emergency_buffer_cents"] = int(
+                                    settings.get("emergency_buffer_cents", 50_000)
+                                )
                             conn.execute(
                                 "UPDATE profile_settings SET emergency_buffer_cents = ?, updated_at = ? WHERE id = 1",
                                 (new_buf, utc_now_iso()),
                             )
+                            touched_settings_after["emergency_buffer_cents"] = new_buf
                             applied_any = True
 
                         elif act.action_type == "set_safe_invest_cap":
                             new_cap = max(0, int(pl["safe_to_invest_cents"]))
+                            if "safe_invest_cap_cents" not in touched_settings_before:
+                                touched_settings_before["safe_invest_cap_cents"] = settings.get(
+                                    "safe_invest_cap_cents"
+                                )
                             conn.execute(
                                 "UPDATE profile_settings SET safe_invest_cap_cents = ?, updated_at = ? WHERE id = 1",
                                 (new_cap, utc_now_iso()),
                             )
+                            touched_settings_after["safe_invest_cap_cents"] = new_cap
                             self.storage.log_budget_event(
                                 "trading_guardrail",
                                 f"One-Tap set safe-to-invest cap at ${new_cap / 100:,.2f}",
@@ -6522,11 +6809,14 @@ class FinanceService:
                             g_before = self.storage.get_goal(gid)
                             if not g_before:
                                 continue
-                            if gid not in goals_before_snapshot:
-                                goals_before_snapshot[gid] = {
+                            if gid not in goals_changes:
+                                goals_changes[gid] = {
                                     "goal_id": gid,
-                                    "saved_cents": int(g_before["saved_cents"]),
-                                    "status": str(g_before["status"]),
+                                    "before_saved_cents": int(g_before["saved_cents"]),
+                                    "before_status": str(g_before["status"]),
+                                    "funded_amount_cents": 0,
+                                    "after_saved_cents": int(g_before["saved_cents"]),
+                                    "after_status": str(g_before["status"]),
                                 }
                             new_saved = int(g_before["saved_cents"]) + amt
                             new_status = (
@@ -6538,15 +6828,32 @@ class FinanceService:
                                 gid,
                                 {"saved_cents": new_saved, "status": new_status},
                             )
+                            goals_changes[gid]["funded_amount_cents"] += amt
+                            goals_changes[gid]["after_saved_cents"] = new_saved
+                            goals_changes[gid]["after_status"] = new_status
                             applied_any = True
 
                     if applied_any:
+                        touched_jars_before = [
+                            {
+                                "id": int(j["id"]),
+                                "auto_allocated_cents": int(j["auto_allocated_cents"]),
+                                "rollover_cents": int(j["rollover_cents"]),
+                                "target_pct": float(j["target_pct"]),
+                                "monthly_target_cents": int(j["monthly_target_cents"]),
+                                "is_locked": int(j["is_locked"]),
+                            }
+                            for j in raw_jars_before
+                            if int(j["id"]) in touched_jar_ids
+                        ]
                         undo_snap = {
-                            "version": 1,
-                            "settings_before": settings_before,
-                            "jars_before": jars_before_snapshot,
+                            "version": 2,
+                            "plan_fingerprint": plan_fingerprint,
+                            "settings_before": touched_settings_before,
+                            "settings_after": touched_settings_after,
+                            "jars_before": touched_jars_before,
                             "created_transfer_ids": created_transfer_ids,
-                            "goals_before": list(goals_before_snapshot.values()),
+                            "goals_changes": list(goals_changes.values()),
                         }
                         saved_batch = self.storage.create_onetap_batch(
                             {
@@ -6572,6 +6879,7 @@ class FinanceService:
 
         return {
             "batch_id": batch_id,
+            "plan_fingerprint": plan_fingerprint,
             "applied": applied,
             "undo_available": undo_available,
             "needs_setup": plan.needs_setup,
@@ -6593,7 +6901,10 @@ class FinanceService:
         }
 
     def undo_onetap_batch(self, batch_id: int) -> Dict[str, Any]:
-        """Atomically restore exact pre-One-Tap jar balances/allocations, settings, and goal saved amounts."""
+        """
+        Atomically restore ONLY rows touched by this One-Tap batch, verifying post-apply
+        fingerprints so later manual edits are never silently overwritten.
+        """
         batch = self.storage.get_onetap_batch(batch_id)
         if not batch:
             raise ValueError(f"One-Tap batch #{batch_id} not found")
@@ -6601,10 +6912,40 @@ class FinanceService:
             raise ValueError(f"One-Tap batch #{batch_id} has status '{batch['status']}' and cannot be undone.")
 
         snap = batch.get("undo_snapshot") or {}
+        snap_version = int(snap.get("version") or 1)
         now = utc_now_iso()
         restored_count = 0
 
         with self.storage.transaction(immediate=True) as conn:
+            # 1. Conflict verification before mutating anything (v2 snapshots)
+            if snap_version >= 2:
+                cur_settings = self.storage.get_settings()
+                settings_after = snap.get("settings_after") or {}
+                for skey, expected_val in settings_after.items():
+                    cur_val = cur_settings.get(skey)
+                    if expected_val is None:
+                        if cur_val is not None:
+                            raise PlanConflictError(
+                                f"Undo conflict on One-Tap batch #{batch_id}: setting '{skey}' was modified after apply."
+                            )
+                    elif cur_val is None or int(cur_val) != int(expected_val):
+                        raise PlanConflictError(
+                            f"Undo conflict on One-Tap batch #{batch_id}: setting '{skey}' was modified after apply."
+                        )
+
+                for g_chg in snap.get("goals_changes") or []:
+                    gid = int(g_chg["goal_id"])
+                    cur_g = self.storage.get_goal(gid)
+                    if not cur_g:
+                        raise PlanConflictError(
+                            f"Undo conflict on One-Tap batch #{batch_id}: goal #{gid} no longer exists."
+                        )
+                    if int(cur_g["saved_cents"]) != int(g_chg["after_saved_cents"]):
+                        raise PlanConflictError(
+                            f"Undo conflict on One-Tap batch #{batch_id}: goal #{gid} was modified after apply."
+                        )
+
+            # 2. Reverse created jar rebalance transfers (and only touched jars)
             for tid in snap.get("created_transfer_ids") or []:
                 conn.execute("DELETE FROM budget_transfers WHERE id = ?", (int(tid),))
                 restored_count += 1
@@ -6629,33 +6970,58 @@ class FinanceService:
                 )
                 restored_count += 1
 
+            # 3. Restore ONLY touched settings columns
             settings_before = snap.get("settings_before") or {}
             if settings_before:
-                conn.execute(
-                    """
-                    UPDATE profile_settings
-                    SET emergency_buffer_cents = ?, safe_invest_cap_cents = ?, updated_at = ?
-                    WHERE id = 1
-                    """,
-                    (
-                        int(settings_before.get("emergency_buffer_cents", 50_000)),
-                        settings_before.get("safe_invest_cap_cents"),
-                        now,
-                    ),
-                )
-                restored_count += 1
+                set_clauses: List[str] = []
+                set_params: List[Any] = []
+                if "emergency_buffer_cents" in settings_before:
+                    set_clauses.append("emergency_buffer_cents = ?")
+                    set_params.append(int(settings_before["emergency_buffer_cents"]))
+                if "safe_invest_cap_cents" in settings_before:
+                    set_clauses.append("safe_invest_cap_cents = ?")
+                    set_params.append(settings_before["safe_invest_cap_cents"])
+                if set_clauses:
+                    set_clauses.append("updated_at = ?")
+                    set_params.append(now)
+                    conn.execute(
+                        f"UPDATE profile_settings SET {', '.join(set_clauses)} WHERE id = 1",
+                        tuple(set_params),
+                    )
+                    restored_count += 1
 
-            for g_row in snap.get("goals_before") or []:
-                conn.execute(
-                    "UPDATE goals SET saved_cents = ?, status = ?, updated_at = ? WHERE id = ?",
-                    (
-                        int(g_row["saved_cents"]),
-                        str(g_row["status"]),
-                        now,
-                        int(g_row["goal_id"]),
-                    ),
-                )
-                restored_count += 1
+            # 4. Reverse goal funding cleanly via delta subtraction (`saved_cents -= funded_amount_cents`)
+            if snap_version >= 2:
+                for g_chg in snap.get("goals_changes") or []:
+                    gid = int(g_chg["goal_id"])
+                    cur_g = self.storage.get_goal(gid)
+                    if not cur_g:
+                        continue
+                    funded_amt = max(0, int(g_chg.get("funded_amount_cents", 0)))
+                    new_saved = max(0, int(cur_g["saved_cents"]) - funded_amt)
+                    before_status = str(g_chg.get("before_status") or "active")
+                    restored_status = (
+                        before_status
+                        if new_saved < int(cur_g["target_cents"])
+                        else str(cur_g["status"])
+                    )
+                    conn.execute(
+                        "UPDATE goals SET saved_cents = ?, status = ?, updated_at = ? WHERE id = ?",
+                        (new_saved, restored_status, now, gid),
+                    )
+                    restored_count += 1
+            else:
+                for g_row in snap.get("goals_before") or []:
+                    conn.execute(
+                        "UPDATE goals SET saved_cents = ?, status = ?, updated_at = ? WHERE id = ?",
+                        (
+                            int(g_row["saved_cents"]),
+                            str(g_row["status"]),
+                            now,
+                            int(g_row["goal_id"]),
+                        ),
+                    )
+                    restored_count += 1
 
             conn.execute(
                 "UPDATE onetap_batches SET status = 'undone', updated_at = ? WHERE id = ?",
@@ -6669,15 +7035,38 @@ class FinanceService:
             "restored_count": restored_count,
         }
 
-    def undo_last_action(self, batch_id: Optional[int] = None) -> Dict[str, Any]:
-        """Undo a specific batch ID or the most recent executed `--say` or `--one-tap` batch."""
+    def undo_last_action(
+        self,
+        batch_id: Optional[int] = None,
+        *,
+        kind: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Undo a specific `agent:N` / `onetap:N` batch or the most recent `--say` or `--one-tap` batch."""
+        norm_kind = (kind or "").strip().lower() or None
+        if norm_kind not in (None, "agent", "onetap"):
+            raise ValueError(f"Unsupported undo kind '{kind}'. Use 'agent' or 'onetap'.")
+
         if batch_id is not None:
-            agent_b = self.storage.get_agent_batch(batch_id)
-            if agent_b and agent_b.get("status") == "executed":
+            if norm_kind == "agent":
                 res = self.undo_agent_batch(batch_id)
                 return {"kind": "agent", **res.model_dump()}
+            if norm_kind == "onetap":
+                res_ot = self.undo_onetap_batch(batch_id)
+                return {"kind": "onetap", **res_ot}
+
+            agent_b = self.storage.get_agent_batch(batch_id)
             ot_b = self.storage.get_onetap_batch(batch_id)
-            if ot_b and ot_b.get("status") == "applied":
+            agent_ready = bool(agent_b and agent_b.get("status") == "executed")
+            ot_ready = bool(ot_b and ot_b.get("status") == "applied")
+            if agent_ready and ot_ready:
+                raise ValueError(
+                    f"Batch #{batch_id} is ambiguous (matches both agent:{batch_id} and onetap:{batch_id}). "
+                    f"Specify 'agent:{batch_id}' or 'onetap:{batch_id}'."
+                )
+            if agent_ready:
+                res = self.undo_agent_batch(batch_id)
+                return {"kind": "agent", **res.model_dump()}
+            if ot_ready:
                 res_ot = self.undo_onetap_batch(batch_id)
                 return {"kind": "onetap", **res_ot}
             if agent_b:
@@ -6685,6 +7074,17 @@ class FinanceService:
             if ot_b:
                 raise ValueError(f"One-Tap batch #{batch_id} has status '{ot_b['status']}' and cannot be undone.")
             raise ValueError(f"Batch #{batch_id} not found.")
+
+        if norm_kind == "agent":
+            res = self.undo_last_agent_batch()
+            return {"kind": "agent", **res.model_dump()}
+        if norm_kind == "onetap":
+            ot_batches_only = self.storage.list_onetap_batches(limit=25)
+            latest_ot_only = next((b for b in ot_batches_only if b.get("status") == "applied"), None)
+            if latest_ot_only is None:
+                raise ValueError("No applied One-Tap plan is available to undo.")
+            res_ot = self.undo_onetap_batch(int(latest_ot_only["id"]))
+            return {"kind": "onetap", **res_ot}
 
         agent_batches = self.storage.list_agent_batches(limit=25)
         exec_agent_by_id = {int(b["id"]): b for b in agent_batches if b.get("status") == "executed"}

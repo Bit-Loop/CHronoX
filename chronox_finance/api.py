@@ -111,7 +111,7 @@ from chronox_finance.security import (
     validate_loopback_host,
     validate_loopback_origin,
 )
-from chronox_finance.service import FinanceService
+from chronox_finance.service import FinanceService, PlanConflictError
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +183,8 @@ def create_app(
     # initialized on disk, unlock an ephemeral in-memory DEK so secret-writing tests work cleanly.
     if not enforce_vault_lock and not svc.secrets.is_initialized() and not svc.secrets.is_unlocked():
         svc.secrets.unlock_ephemeral_for_testing()
+    if svc.secrets.is_unlocked():
+        svc._resume_plaid_background_syncs_if_any()
 
     auth_limiter = SlidingWindowRateLimiter(max_requests=15, window_seconds=60)
     ai_limiter = SlidingWindowRateLimiter(max_requests=25, window_seconds=60)
@@ -323,6 +325,13 @@ def create_app(
         return JSONResponse(
             status_code=422,
             content={"detail": detail, "code": "validation_error", "errors": clean_errors},
+        )
+
+    @app.exception_handler(PlanConflictError)
+    async def plan_conflict_handler(_request: Request, exc: PlanConflictError):
+        return JSONResponse(
+            status_code=409,
+            content={"detail": str(exc) or "Plan or state conflict.", "code": "conflict"},
         )
 
     @app.exception_handler(ValueError)
@@ -949,26 +958,38 @@ def create_app(
         public_token: Optional[str] = None,
     ):
         # Validated via one-time cryptographic `state` nonce + unlocked vault check (top-level OAuth redirect)
-        res = svc.handle_plaid_hosted_complete(state=state, public_token=public_token)
+        def _render_plaid_card(title: str, subtitle: str, accent: str = "#10b981") -> HTMLResponse:
+            body = (
+                "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+                f"<title>{html.escape(title)}</title>"
+                "<style>body{background:#0b0e14;color:#e5e7eb;font-family:Inter,system-ui,sans-serif;"
+                "display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}"
+                ".card{background:#121722;border:1px solid #263042;border-radius:2px;padding:32px;max-width:460px}"
+                f"h1{{margin:0 0 12px;font-size:20px;color:{accent}}}p{{margin:0;color:#9ca3af;line-height:1.5}}</style>"
+                f"</head><body><div class='card'><h1>{html.escape(title)}</h1>"
+                f"<p>{html.escape(subtitle)}</p></div></body></html>"
+            )
+            return HTMLResponse(content=body, status_code=200)
+
+        try:
+            res = svc.handle_plaid_hosted_complete(state=state, public_token=public_token)
+        except (VaultLockedError, VaultNotInitializedError):
+            return _render_plaid_card(
+                "Unlock ChronoX to Finish Syncing",
+                "Your bank sign-in completed while ChronoX was locked. Open ChronoX and enter your passcode — your pending bank connection will sync automatically.",
+                accent="#f59e0b",
+            )
         count = int(res.get("exchanged_count", 0))
         imported = int(res.get("imported_count", 0))
-        status_label = html.escape(str(res.get("status") or "completed"))
+        status_label = str(res.get("status") or "completed")
+        tx_word = "transaction" if imported == 1 else "transactions"
+        inst_word = "institution" if count == 1 else "institutions"
         subtitle = (
-            f"Linked {count} institution(s) and imported {imported} transaction(s). You can close this tab and return to ChronoX."
+            f"Linked {count} {inst_word} and imported {imported} {tx_word}. You can close this tab and return to ChronoX."
             if status_label == "completed"
             else "Your bank sign-in update was received. Return to ChronoX to finish syncing."
         )
-        body = (
-            "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
-            "<title>Bank Connected — Return to ChronoX</title>"
-            "<style>body{background:#0b0e14;color:#e5e7eb;font-family:Inter,system-ui,sans-serif;"
-            "display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}"
-            ".card{background:#121722;border:1px solid #263042;border-radius:2px;padding:32px;max-width:460px}"
-            "h1{margin:0 0 12px;font-size:20px;color:#10b981}p{margin:0;color:#9ca3af;line-height:1.5}</style>"
-            f"</head><body><div class='card'><h1>Bank Connected — Return to ChronoX</h1>"
-            f"<p>{html.escape(subtitle)}</p></div></body></html>"
-        )
-        return HTMLResponse(content=body, status_code=200)
+        return _render_plaid_card("Bank Connected — Return to ChronoX", subtitle)
 
     @v1.post("/plaid/poll-link", tags=["Connectors"], dependencies=[Depends(require_auth)])
     def plaid_poll_link(req: PlaidPollLinkRequest):
@@ -1377,6 +1398,7 @@ def create_app(
         return svc.run_onetap_optimization(
             horizon_days=effective.horizon_days,
             apply=effective.apply,
+            expected_fingerprint=effective.plan_fingerprint,
             mode_override=mode,
             provider_override=clean_provider,
         )
@@ -1428,7 +1450,9 @@ def create_app(
         return svc.execute_agent_batch(batch_id)
 
     @v1.post("/ai/agent/undo-last", tags=["AI Coach"], dependencies=[Depends(require_auth)])
-    def undo_last_agent_batch():
+    def undo_last_agent_batch(kind: Optional[str] = None):
+        if kind:
+            return svc.undo_last_action(kind=kind)
         return svc.undo_last_agent_batch()
 
     @v1.post("/ai/agent/undo/{batch_id}", tags=["AI Coach"], dependencies=[Depends(require_auth)])

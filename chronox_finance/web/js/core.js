@@ -1058,12 +1058,42 @@ export async function api(path, options = {}) {
     }
   }
 
-  const resp = await fetch(path, {
-    credentials: "same-origin",
-    ...options,
-    method,
-    headers,
-  });
+  const isAiSlowEndpoint =
+    path.startsWith("/api/v1/ai/say") || path.startsWith("/api/v1/optimize/one-tap");
+  const timeoutMs =
+    typeof options.timeoutMs === "number"
+      ? options.timeoutMs
+      : isAiSlowEndpoint
+      ? 45000
+      : 0;
+  let controller = null;
+  let timeoutId = null;
+  if (timeoutMs > 0 && !options.signal && typeof AbortController === "function") {
+    controller = new AbortController();
+    timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  }
+
+  let resp;
+  try {
+    resp = await fetch(path, {
+      credentials: "same-origin",
+      ...options,
+      method,
+      headers,
+      signal: options.signal || (controller ? controller.signal : undefined),
+    });
+  } catch (fetchErr) {
+    if (fetchErr && fetchErr.name === "AbortError") {
+      const timeoutErr = new Error(
+        "Request timed out after 45s. Your local AI may be busy — try again or switch to Built-in Math."
+      );
+      timeoutErr.status = 504;
+      throw timeoutErr;
+    }
+    throw fetchErr;
+  } finally {
+    if (timeoutId !== null) clearTimeout(timeoutId);
+  }
 
   const respCsrf = resp.headers.get("X-ChronoX-CSRF");
   if (respCsrf) setCsrfToken(respCsrf);

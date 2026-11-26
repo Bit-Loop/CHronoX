@@ -360,10 +360,14 @@ class AgentLedgerContext:
             if gname == q:
                 return g
 
-        # 2. Substring match
+        # 2. Word-boundary phrase match (prevents e.g. "car" matching "Scarf")
+        q_boundary_re = re.compile(rf"\b{re.escape(q)}\b")
         for g in active:
             gname = re.sub(r"[^a-z0-9\s]+", " ", str(g.get("name") or "").lower()).strip()
-            if gname and (q in gname or gname in q):
+            if gname and (
+                q_boundary_re.search(gname)
+                or re.search(rf"\b{re.escape(gname)}\b", q)
+            ):
                 return g
 
         # 3. Token-overlap match (ignoring generic words like "fund", "goal", "my")
@@ -1127,6 +1131,8 @@ def _validate_single_action(
         }
         if transfer_direction:
             clean_payload["transfer_direction"] = transfer_direction
+        if "affects_balance" in payload and payload["affects_balance"] is not None:
+            clean_payload["affects_balance"] = bool(payload["affects_balance"])
         if clean_inline_splits is not None:
             clean_payload["splits"] = clean_inline_splits
 

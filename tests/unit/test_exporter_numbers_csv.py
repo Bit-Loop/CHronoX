@@ -159,20 +159,25 @@ def _parse_xlsx_strict(xlsx_bytes: bytes) -> Dict[str, object]:
         assert part_name.startswith("/")
         assert part_name[1:] in names, f"Content_Types override missing in ZIP: {part_name}"
 
+    has_chart5 = "xl/charts/chart5.xml" in names
+    expected_drawings = (1, 2, 3) if has_chart5 else (1, 2)
+    expected_charts = (1, 2, 3, 4, 5) if has_chart5 else (1, 2, 3, 4)
+
     expected_overrides = {
         "/xl/workbook.xml": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
         "/xl/styles.xml": "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml",
         "/xl/sharedStrings.xml": "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml",
-        "/xl/drawings/drawing1.xml": "application/vnd.openxmlformats-officedocument.drawing+xml",
-        "/xl/drawings/drawing2.xml": "application/vnd.openxmlformats-officedocument.drawing+xml",
-        "/xl/drawings/drawing3.xml": "application/vnd.openxmlformats-officedocument.drawing+xml",
     }
+    for d_idx in expected_drawings:
+        expected_overrides[f"/xl/drawings/drawing{d_idx}.xml"] = (
+            "application/vnd.openxmlformats-officedocument.drawing+xml"
+        )
     for i in range(1, 7):
         expected_overrides[f"/xl/worksheets/sheet{i}.xml"] = (
             "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"
         )
-    for i in range(1, 6):
-        expected_overrides[f"/xl/charts/chart{i}.xml"] = (
+    for c_idx in expected_charts:
+        expected_overrides[f"/xl/charts/chart{c_idx}.xml"] = (
             "application/vnd.openxmlformats-officedocument.drawingml.chart+xml"
         )
     for part_name, expected_ct in expected_overrides.items():
@@ -320,7 +325,7 @@ def _parse_xlsx_strict(xlsx_bytes: bytes) -> Dict[str, object]:
             assert d_rid in rels_map[s_rels_path]
 
     # 6. Validate drawings & non-overlapping twoCellAnchor coordinates
-    for d_idx in range(1, 4):
+    for d_idx in expected_drawings:
         d_path = f"xl/drawings/drawing{d_idx}.xml"
         d_rels_path = f"xl/drawings/_rels/drawing{d_idx}.xml.rels"
         d_root = parsed_xml[d_path]
@@ -350,9 +355,9 @@ def _parse_xlsx_strict(xlsx_bytes: bytes) -> Dict[str, object]:
             c_rid = c_el.attrib[f"{{{NS_DOC_REL}}}id"]
             assert c_rid in d_rels
 
-    # 7. Validate all 5 charts, series ranges, cell-type consistency, and caches
+    # 7. Validate charts, series ranges, cell-type consistency, and caches
     chart_types: Dict[int, str] = {}
-    for c_idx in range(1, 6):
+    for c_idx in expected_charts:
         c_path = f"xl/charts/chart{c_idx}.xml"
         c_root = parsed_xml[c_path]
         plot_area = c_root.find(f"{{{NS_C}}}chart/{{{NS_C}}}plotArea")
@@ -1120,9 +1125,11 @@ class TestAppleNumbersGraphicalWorkbook:
 
         parsed = _parse_xlsx_strict(artifact.content)
 
-        # All 6 sheets & all 5 charts exist and reference valid $0.00 placeholder cells
+        # All 6 sheets exist; empty $0 portfolio cleanly skips blank zero-value pie chart (chart5)
         assert tuple(parsed["sheet_order"]) == SHEET_NAMES
-        assert set(parsed["chart_types"].keys()) == {1, 2, 3, 4, 5}
+        assert set(parsed["chart_types"].keys()) == {1, 2, 3, 4}
+        s3_strs = {v for kind, v, _ in parsed["sheet_cells"][SHEET_PORTFOLIO].values() if kind == "str"}
+        assert any("Portfolio Allocation chart" in s for s in s3_strs)
 
         # Zero invented balances or income on a fresh $0 profile
         s1 = parsed["sheet_cells"][SHEET_EXECUTIVE]
@@ -1211,12 +1218,12 @@ class TestAppleNumbersGraphicalWorkbook:
         parsed = _parse_xlsx_strict(artifact.content)
 
         s6 = parsed["sheet_cells"][SHEET_TRANSACTIONS]
-        # Formula-injection neutralized text cells
-        assert s6["B5"] == ("str", "'@SUM(1+1) <Checking>", "")
+        # OOXML shared strings (`t="s"`) never evaluate as formulas, so no spurious leading apostrophe junk
+        assert s6["B5"] == ("str", "@SUM(1+1) <Checking>", "")
         assert s6["C5"] == ("str", "EUR", "")
-        assert s6["E5"] == ("str", "'=CMD|' /C calc'!A0", "")
-        assert s6["F5"] == ("str", "'+2+5*cmd|' /C calc'!A0", "")
-        assert s6["G5"] == ("str", "'-negative-jar", "")
+        assert s6["E5"] == ("str", "=CMD|' /C calc'!A0", "")
+        assert s6["F5"] == ("str", "+2+5*cmd|' /C calc'!A0", "")
+        assert s6["G5"] == ("str", "-negative-jar", "")
         # XML special chars preserved safely, illegal XML 1.0 control chars stripped
         assert s6["I5"] == ("str", "<script>&\"' payload", "")
         # Numeric amount remains TRUE number, never neutralized as text
@@ -1229,9 +1236,9 @@ class TestAppleNumbersGraphicalWorkbook:
         assert s6["H7"] == ("formula", "82.50", "SUM(H5:H6)")
         assert s6["C7"] == ("str", "MIXED", "")
 
-        # Holding symbol neutralized & unknown cost basis respected
+        # Holding symbol clean in OOXML shared strings & unknown cost basis respected
         s3 = parsed["sheet_cells"][SHEET_PORTFOLIO]
-        assert s3["A6"] == ("str", "'=CMD", "")
+        assert s3["A6"] == ("str", "=CMD", "")
         assert s3["G6"] == ("str", "Unknown", "")
         assert s3["H6"] == ("str", "Unknown", "")
 

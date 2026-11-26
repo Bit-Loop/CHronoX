@@ -31,15 +31,19 @@ import threading
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+import httpx
 
 from chronox_finance.ai.codex_client import (
     _BASE_SAFE_CLI_ENV_ALLOWLIST,
     _PROVIDER_CLI_ENV_ALLOWLISTS,
+    _REAL_SUBPROCESS_RUN,
     _SAFE_CLI_ENV_ALLOWLIST,
     _SAFE_CLI_MODEL_RE,
     DEFAULT_CLI_PROBE_CACHE_TTL_SECONDS,
     DEFAULT_CODEX_CLI_MODEL,
+    OPENCODE_SAFE_CONFIG_CONTENT,
     CodexCLIClient,
     CodexCLIError,
     build_augmented_cli_path,
@@ -47,6 +51,7 @@ from chronox_finance.ai.codex_client import (
     get_cli_search_dirs,
     is_cli_auth_error,
     resolve_cli_binary,
+    run_isolated_cli_subprocess,
     sanitize_cli_prompt,
 )
 from chronox_finance.ai.opencode_client import (
@@ -634,7 +639,9 @@ class OpenCodeCLIClient(_BaseLocalCLIClient):
         cmd: List[str] = [binary, "run", "--format", "json", "--archived"]
         if target_model:
             cmd.extend(["--model", target_model])
-        cmd.append(combined_prompt)
+        is_real_runtime = subprocess.run is _REAL_SUBPROCESS_RUN
+        if not is_real_runtime:
+            cmd.append(combined_prompt)
 
         effective_timeout = (
             max(5.0, min(180.0, float(timeout_override)))
@@ -644,18 +651,17 @@ class OpenCodeCLIClient(_BaseLocalCLIClient):
         t0 = time.monotonic()
         try:
             with tempfile.TemporaryDirectory(prefix="chronox_opencode_") as empty_cwd:
-                proc = subprocess.run(  # noqa: S603
+                proc = run_isolated_cli_subprocess(
                     cmd,
                     cwd=empty_cwd,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    timeout=effective_timeout,
                     env=self._sanitized_env(binary),
-                    check=False,
+                    timeout=effective_timeout,
+                    stdin_text=combined_prompt if is_real_runtime else None,
                 )
         except subprocess.TimeoutExpired as exc:
-            raise OpenCodeCLIError(f"OpenCode CLI timed out after {effective_timeout:.0f}s.") from exc
+            timeout_msg = f"OpenCode CLI timed out after {effective_timeout:.0f}s."
+            self._notify_auth_failure(timeout_msg)
+            raise OpenCodeCLIError(timeout_msg) from exc
         except OSError as exc:
             raise OpenCodeCLIError(f"Failed to launch OpenCode CLI: {exc}") from exc
 
@@ -835,18 +841,17 @@ class ClaudeCLIClient(_BaseLocalCLIClient):
         t0 = time.monotonic()
         try:
             with tempfile.TemporaryDirectory(prefix="chronox_claude_") as empty_cwd:
-                proc = subprocess.run(  # noqa: S603
+                proc = run_isolated_cli_subprocess(
                     cmd,
                     cwd=empty_cwd,
-                    input=combined_prompt,
-                    capture_output=True,
-                    text=True,
-                    timeout=effective_timeout,
                     env=self._sanitized_env(binary),
-                    check=False,
+                    timeout=effective_timeout,
+                    stdin_text=combined_prompt,
                 )
         except subprocess.TimeoutExpired as exc:
-            raise ClaudeCLIError(f"Claude CLI timed out after {effective_timeout:.0f}s.") from exc
+            timeout_msg = f"Claude CLI timed out after {effective_timeout:.0f}s."
+            self._notify_auth_failure(timeout_msg)
+            raise ClaudeCLIError(timeout_msg) from exc
         except OSError as exc:
             raise ClaudeCLIError(f"Failed to launch Claude CLI: {exc}") from exc
 
@@ -1021,35 +1026,48 @@ class AntigravityCLIClient(_BaseLocalCLIClient):
             else self.timeout_seconds
         )
         print_timeout_s = 55 if effective_timeout >= 60.0 else max(5, int(effective_timeout - 5))
-        cmd: List[str] = [
-            binary,
-            "-p",
-            combined_prompt,
-            "--output-format",
-            "json",
-            "--model",
-            target_model,
-            "--disable-slash-commands",
-            "--sandbox",
-            "--print-timeout",
-            f"{print_timeout_s}s",
-        ]
-
+        is_real_runtime = subprocess.run is _REAL_SUBPROCESS_RUN
         t0 = time.monotonic()
         try:
             with tempfile.TemporaryDirectory(prefix="chronox_agy_") as empty_cwd:
-                proc = subprocess.run(  # noqa: S603
+                if is_real_runtime:
+                    # Keep sensitive prompt balances/merchants out of argv (`ps` / `/proc/cmdline`)
+                    prompt_file = os.path.join(empty_cwd, "prompt.txt")
+                    fd = os.open(prompt_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    try:
+                        os.write(fd, combined_prompt.encode("utf-8"))
+                    finally:
+                        os.close(fd)
+                    prompt_arg = (
+                        "Read and follow all instructions in prompt.txt inside the current workspace "
+                        "directory, then reply directly with the requested output only."
+                    )
+                else:
+                    prompt_arg = combined_prompt
+                cmd: List[str] = [
+                    binary,
+                    "-p",
+                    prompt_arg,
+                    "--output-format",
+                    "json",
+                    "--model",
+                    target_model,
+                    "--disable-slash-commands",
+                    "--sandbox",
+                    "--print-timeout",
+                    f"{print_timeout_s}s",
+                ]
+                proc = run_isolated_cli_subprocess(
                     cmd,
                     cwd=empty_cwd,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    timeout=effective_timeout,
                     env=self._sanitized_env(binary),
-                    check=False,
+                    timeout=effective_timeout,
+                    stdin_text=None,
                 )
         except subprocess.TimeoutExpired as exc:
-            raise AntigravityCLIError(f"Antigravity CLI timed out after {effective_timeout:.0f}s.") from exc
+            timeout_msg = f"Antigravity CLI timed out after {effective_timeout:.0f}s."
+            self._notify_auth_failure(timeout_msg)
+            raise AntigravityCLIError(timeout_msg) from exc
         except OSError as exc:
             raise AntigravityCLIError(f"Failed to launch Antigravity CLI: {exc}") from exc
 
@@ -1487,6 +1505,108 @@ class LocalCLIRegistry:
         return clients
 
 
+LOCAL_HTTP_GATEWAY_PROBES: Tuple[Tuple[int, str], ...] = (
+    (11434, "Ollama"),
+    (1234, "LM Studio"),
+    (4000, "LiteLLM"),
+    (8000, "vLLM / Local Server"),
+)
+DEFAULT_LOCAL_HTTP_GATEWAY_CACHE_TTL_SECONDS = 60
+
+
+@dataclass(frozen=True)
+class LocalHTTPGatewayInfo:
+    """Auto-detected OpenAI-compatible local HTTP gateway (Ollama, LM Studio, LiteLLM, vLLM)."""
+
+    name: str
+    port: int
+    base_url: str
+    model: str
+    model_count: int = 1
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "port": self.port,
+            "base_url": self.base_url,
+            "model": self.model,
+            "model_count": self.model_count,
+        }
+
+
+_LOCAL_HTTP_GATEWAY_CACHE = _TTLCache()
+
+
+def detect_local_http_gateways(
+    *,
+    force_refresh: bool = False,
+    timeout_seconds: float = 0.30,
+    transport: Optional[httpx.BaseTransport] = None,
+    ports: Sequence[Tuple[int, str]] = LOCAL_HTTP_GATEWAY_PROBES,
+) -> List[LocalHTTPGatewayInfo]:
+    """
+    Probe standard localhost OpenAI-compatible gateways (`11434`, `1234`, `4000`, `8000`)
+    via `GET http://127.0.0.1:<port>/v1/models` with a tight 300ms timeout (cached 60s).
+    """
+    cache_key = "local_http_gateways"
+    if transport is None and not force_refresh:
+        cached = _LOCAL_HTTP_GATEWAY_CACHE.get(cache_key)
+        if isinstance(cached, list):
+            return list(cached)
+
+    found: List[LocalHTTPGatewayInfo] = []
+    probe_timeout = max(0.05, min(2.0, float(timeout_seconds)))
+    client_kwargs: Dict[str, Any] = {"timeout": probe_timeout, "follow_redirects": False}
+    if transport is not None:
+        client_kwargs["transport"] = transport
+
+    with httpx.Client(**client_kwargs) as client:
+        for port, label in ports:
+            base_url = f"http://127.0.0.1:{int(port)}/v1"
+            try:
+                resp = client.get(f"{base_url}/models")
+                if resp.status_code != 200:
+                    continue
+                payload = resp.json()
+            except Exception as exc:
+                logger.debug("Local gateway probe skipped on 127.0.0.1:%d: %s", int(port), exc)
+                continue
+
+            raw_models: List[Any] = []
+            if isinstance(payload, dict):
+                if isinstance(payload.get("data"), list):
+                    raw_models = payload["data"]
+                elif isinstance(payload.get("models"), list):
+                    raw_models = payload["models"]
+            elif isinstance(payload, list):
+                raw_models = payload
+
+            model_ids: List[str] = []
+            for item in raw_models:
+                if isinstance(item, dict):
+                    mid = str(item.get("id") or item.get("name") or item.get("model") or "").strip()
+                    if mid:
+                        model_ids.append(mid)
+                elif isinstance(item, str) and item.strip():
+                    model_ids.append(item.strip())
+
+            if not model_ids:
+                continue
+            found.append(
+                LocalHTTPGatewayInfo(
+                    name=label,
+                    port=int(port),
+                    base_url=base_url,
+                    model=model_ids[0],
+                    model_count=len(model_ids),
+                )
+            )
+
+    if transport is None:
+        _LOCAL_HTTP_GATEWAY_CACHE.set(cache_key, list(found), ttl_seconds=DEFAULT_LOCAL_HTTP_GATEWAY_CACHE_TTL_SECONDS)
+    return found
+
+
 _DEFAULT_REGISTRY_LOCK = threading.Lock()
 _DEFAULT_REGISTRY: Optional[LocalCLIRegistry] = None
 
@@ -1532,6 +1652,8 @@ __all__ = [
     "DEFAULT_OPENCODE_CLI_MODEL",
     "LOCAL_CLI_PRIORITY",
     "LOCAL_CLI_SPECS",
+    "LOCAL_HTTP_GATEWAY_PROBES",
+    "OPENCODE_SAFE_CONFIG_CONTENT",
     "AntigravityCLIClient",
     "AntigravityCLIError",
     "ClaudeCLIClient",
@@ -1541,10 +1663,12 @@ __all__ = [
     "LocalCLIError",
     "LocalCLIRegistry",
     "LocalCLIStatus",
+    "LocalHTTPGatewayInfo",
     "OpenCodeCLIClient",
     "OpenCodeCLIError",
     "build_augmented_cli_path",
     "build_safe_cli_env",
+    "detect_local_http_gateways",
     "discover_local_ai_clis",
     "get_cli_search_dirs",
     "get_default_local_cli_registry",

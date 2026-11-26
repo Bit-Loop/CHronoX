@@ -897,7 +897,17 @@ class FinanceStorage:
         if env_mode not in ("deterministic_only", "hybrid", "ai_standalone"):
             env_mode = "hybrid"
         env_provider = (os.getenv("CHRONOX_AI_PROVIDER") or "auto").strip().lower()
-        if env_provider not in ("auto", "opencode_go", "gemini", "openai_codex", "chat_wrapper", "codex_cli"):
+        if env_provider not in (
+            "auto",
+            "opencode_go",
+            "gemini",
+            "openai_codex",
+            "chat_wrapper",
+            "codex_cli",
+            "opencode_cli",
+            "claude_cli",
+            "agy_cli",
+        ):
             env_provider = "auto"
         env_gemini_model = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash").strip() or "gemini-2.5-flash"
         env_gemini_url = (
@@ -2619,10 +2629,18 @@ class FinanceStorage:
     # --- AI Usage Telemetry, Threads & Agent Action Batches ---
 
     def count_ai_requests_today(self, ctx: RequestContext = LOCAL_CONTEXT) -> int:
+        """Count metered cloud AI requests today (excludes free/subscription local CLIs and zero-cost local gateways)."""
         today = date.today().isoformat()
         with self._lock:
             row = self._conn.execute(
-                "SELECT COUNT(*) FROM ai_usage_log WHERE usage_date = ? AND cached = 0",
+                """
+                SELECT COUNT(*)
+                FROM ai_usage_log
+                WHERE usage_date = ?
+                  AND cached = 0
+                  AND provider NOT IN ('claude_cli', 'opencode_cli', 'codex_cli', 'agy_cli')
+                  AND NOT (provider = 'chat_wrapper' AND cost_microdollars = 0)
+                """,
                 (today,),
             ).fetchone()
             return int(row[0]) if row else 0

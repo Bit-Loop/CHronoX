@@ -31,9 +31,11 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Sequence, Tuple
 
@@ -48,6 +50,13 @@ from chronox_finance.ai.opencode_client import (
     is_local_url,
 )
 from chronox_finance.security import redact_pii, validate_external_api_url
+
+_REAL_SUBPROCESS_RUN = subprocess.run
+
+OPENCODE_SAFE_CONFIG_CONTENT = (
+    '{"permission":{"bash":"deny","edit":"deny","webfetch":"deny"},'
+    '"tools":{"bash":false,"write":false,"edit":false,"read":false,"webfetch":false}}'
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,9 +105,15 @@ _BASE_SAFE_CLI_ENV_ALLOWLIST = frozenset(
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
         "REQUESTS_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
         "HTTP_PROXY",
         "HTTPS_PROXY",
         "NO_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "all_proxy",
         "APPDATA",
         "LOCALAPPDATA",
         "USERPROFILE",
@@ -121,13 +136,27 @@ _PROVIDER_CLI_ENV_ALLOWLISTS: Dict[str, frozenset[str]] = {
     "claude_cli": frozenset(
         {
             "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_OAUTH_TOKEN",
             "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "AWS_REGION",
+            "AWS_PROFILE",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "CLOUD_ML_REGION",
+            "ANTHROPIC_VERTEX_PROJECT_ID",
         }
     ),
     "opencode_cli": frozenset(
         {
             "OPENCODE_API_KEY",
             "OPENCODE_GO_API_KEY",
+            "OPENCODE_CONFIG_CONTENT",
+            "OPENROUTER_API_KEY",
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
             "ANTHROPIC_API_KEY",
@@ -228,6 +257,11 @@ def get_cli_search_dirs(
             str(home / ".bun" / "bin"),
             str(home / ".cargo" / "bin"),
             str(home / ".npm-global" / "bin"),
+            str(home / ".local" / "share" / "pnpm"),
+            str(home / "Library" / "pnpm"),
+            str(home / ".asdf" / "shims"),
+            str(home / ".local" / "share" / "mise" / "shims"),
+            "/home/linuxbrew/.linuxbrew/bin",
             "/opt/homebrew/bin",
             "/usr/local/bin",
             "/usr/bin",
@@ -407,7 +441,79 @@ def build_safe_cli_env(
         env=source_env,
         only_existing=True,
     )
+    if provider_id == "opencode_cli":
+        # Lock down OpenCode CLI tools/permissions so untrusted ledger text can never trigger shell/file/web actions
+        sanitized["OPENCODE_CONFIG_CONTENT"] = OPENCODE_SAFE_CONFIG_CONTENT
     return sanitized
+
+
+def run_isolated_cli_subprocess(
+    cmd: Sequence[str],
+    *,
+    cwd: str,
+    env: Mapping[str, str],
+    timeout: float,
+    stdin_text: Optional[str] = None,
+) -> subprocess.CompletedProcess[str]:
+    """
+    Execute a local AI CLI inside its own process session (`start_new_session=True` on POSIX)
+    so timed-out commands reap the entire child process group (`os.killpg(..., SIGKILL)`)
+    with zero orphan grandchildren.
+
+    Preserves 100% compatibility with unit tests that monkeypatch `subprocess.run`.
+    """
+    cmd_list = list(cmd)
+    if subprocess.run is not _REAL_SUBPROCESS_RUN:
+        if stdin_text is not None:
+            return subprocess.run(  # noqa: S603
+                cmd_list,
+                cwd=cwd,
+                input=stdin_text,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=dict(env),
+                check=False,
+            )
+        return subprocess.run(  # noqa: S603
+            cmd_list,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=dict(env),
+            check=False,
+        )
+
+    popen_kwargs: Dict[str, Any] = {
+        "cwd": cwd,
+        "stdin": subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "env": dict(env),
+    }
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(cmd_list, **popen_kwargs)  # noqa: S603
+    try:
+        stdout_str, stderr_str = proc.communicate(input=stdin_text, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if os.name != "nt":
+            with suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+        with suppress(ProcessLookupError, OSError):
+            proc.kill()
+        with suppress(Exception):
+            proc.communicate(timeout=2.0)
+        raise
+    return subprocess.CompletedProcess(
+        cmd_list,
+        proc.returncode if proc.returncode is not None else 1,
+        stdout=stdout_str or "",
+        stderr=stderr_str or "",
+    )
 
 CURATED_OPENAI_CODEX_MODELS: List[Dict[str, str]] = [
     {
@@ -1423,10 +1529,11 @@ class CodexCLIClient:
         if target_model:
             cmd.extend(["--model", target_model])
 
+        is_real_runtime = subprocess.run is _REAL_SUBPROCESS_RUN
         pipe_stdin = (
             bool(self.use_stdin)
             if self.use_stdin is not None
-            else (len(combined_prompt) > CODEX_CLI_STDIN_THRESHOLD_CHARS)
+            else (True if is_real_runtime else (len(combined_prompt) > CODEX_CLI_STDIN_THRESHOLD_CHARS))
         )
         if pipe_stdin:
             cmd.append("-")
@@ -1442,30 +1549,17 @@ class CodexCLIClient:
         try:
             with tempfile.TemporaryDirectory(prefix="chronox_codex_") as empty_cwd:
                 run_env = self._sanitized_env(binary)
-                if pipe_stdin:
-                    proc = subprocess.run(  # noqa: S603
-                        cmd,
-                        cwd=empty_cwd,
-                        input=combined_prompt,
-                        capture_output=True,
-                        text=True,
-                        timeout=effective_timeout,
-                        env=run_env,
-                        check=False,
-                    )
-                else:
-                    proc = subprocess.run(  # noqa: S603
-                        cmd,
-                        cwd=empty_cwd,
-                        stdin=subprocess.DEVNULL,
-                        capture_output=True,
-                        text=True,
-                        timeout=effective_timeout,
-                        env=run_env,
-                        check=False,
-                    )
+                proc = run_isolated_cli_subprocess(
+                    cmd,
+                    cwd=empty_cwd,
+                    env=run_env,
+                    timeout=effective_timeout,
+                    stdin_text=combined_prompt if pipe_stdin else None,
+                )
         except subprocess.TimeoutExpired as exc:
-            raise CodexCLIError(f"Codex CLI timed out after {effective_timeout:.0f}s.") from exc
+            timeout_msg = f"Codex CLI timed out after {effective_timeout:.0f}s."
+            self._notify_auth_failure(timeout_msg)
+            raise CodexCLIError(timeout_msg) from exc
         except OSError as exc:
             raise CodexCLIError(f"Failed to launch Codex CLI: {exc}") from exc
 

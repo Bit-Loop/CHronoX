@@ -972,7 +972,7 @@ function renderOneTapModal(plan) {
       el("div", {
         class: "metric-md tabular-nums",
         style: { color: survivalPct >= 95 ? "var(--primary)" : survivalPct >= 85 ? "var(--amber)" : "var(--crimson)" },
-        text: `${survivalPct.toFixed(1)}%`,
+        text: survivalPct >= 99.95 ? ">99.9%" : `${survivalPct.toFixed(1)}%`,
       }),
       el("span", { class: "muted small", text: "Probability of staying above $0" }),
     ]),
@@ -1072,6 +1072,7 @@ function renderOneTapModal(plan) {
     undoBtn.addEventListener("click", () => undoOneTapBatch(appliedBatchId, undoBtn));
     footerBtns.push(undoBtn);
   } else {
+    const advisoryCount = Math.max(0, actions.length - executableCount);
     const applyBtn = el(
       "button",
       {
@@ -1087,9 +1088,13 @@ function renderOneTapModal(plan) {
     applyBtn.addEventListener("click", () =>
       withBusy(applyBtn, async () => {
         try {
+          const applyBody = { horizon_days: horizon, apply: true };
+          if (plan && plan.plan_fingerprint) {
+            applyBody.plan_fingerprint = plan.plan_fingerprint;
+          }
           const appliedRes = await api("/api/v1/optimize/one-tap", {
             method: "POST",
-            body: JSON.stringify({ horizon_days: horizon, apply: true }),
+            body: JSON.stringify(applyBody),
           });
           aiState.oneTapLastBatchId = appliedRes.batch_id || null;
           renderOneTapModal(appliedRes);
@@ -1100,21 +1105,33 @@ function renderOneTapModal(plan) {
           });
           await refreshAll();
         } catch (err) {
+          if (err && err.status === 409) {
+            toast("Plan changed after recent activity — refreshing preview...", true);
+            await loadOneTapPreview(horizon);
+            return;
+          }
           toast(err.message || "Could not apply One-Tap plan.", true);
         }
       })
     );
     footerBtns.push(applyBtn);
+    footer.dataset.advisoryCount = String(advisoryCount);
   }
 
   const closeBtn = el("button", { type: "button", class: "btn btn-ghost btn-sm", text: "Close" });
   closeBtn.addEventListener("click", () => closeOverlay($("onetap-overlay")));
   footerBtns.push(closeBtn);
 
+  const advisoryTotal = Math.max(0, actions.length - executableCount);
+  const footCaption =
+    executableCount > 0 && advisoryTotal > 0
+      ? `${executableCount} of ${actions.length} actions apply · ${advisoryTotal} advisory · Bills & locked jars protected`
+      : "Bills and locked jars are always protected. Every change is 1-click undoable.";
+
   footer.replaceChildren(
     el("span", {
       class: "muted small",
-      text: "Bills and locked jars are always protected. Every change is 1-click undoable.",
+      text: footCaption,
     }),
     el("div", { class: "row-gap wrap" }, footerBtns)
   );

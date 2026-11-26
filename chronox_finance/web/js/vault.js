@@ -1459,9 +1459,14 @@ async function openExternalUrl(url) {
       return { ok: false, error: (err && err.message) || "Could not open your system browser." };
     }
   }
-  const win = window.open(url, "_blank", "noopener,noreferrer");
+  const win = window.open(url, "_blank");
   if (!win) {
     return { ok: false, error: "Your browser blocked the sign-in window. Click Open Bank Sign-In below." };
+  }
+  try {
+    win.opener = null;
+  } catch (_e) {
+    // ignore cross-origin opener guard
   }
   return { ok: true, error: "" };
 }
@@ -1577,10 +1582,11 @@ async function checkPlaidHostedLinkNow(triggerBtn = null, manualClick = false) {
         if (st === "completed") {
           stopPlaidPolling();
           _plaidPendingState = null;
+          const impCount = res && res.imported_count != null ? Number(res.imported_count) : null;
           const note =
             (res && res.history_note) ||
             (res && res.message) ||
-            `Bank connected${res && res.imported_count != null ? ` (${res.imported_count} transactions imported)` : ""}.`;
+            `Bank connected${impCount != null ? ` (${impCount} transaction${impCount === 1 ? "" : "s"} imported)` : ""}.`;
           renderPlaidProgress({ tone: "done", message: note });
           toast(note);
           await loadPlaidConfig();
@@ -1928,7 +1934,7 @@ function renderLocalAiClis(data) {
       const needsSignIn = cli.installed && cli.auth_ready === false;
       const badgeCls = isActive
         ? "pill-calm"
-        : authVerified || (cli.installed && !needsSignIn)
+        : authVerified
         ? "pill-blue"
         : needsSignIn
         ? "pill-watch"
@@ -1943,11 +1949,12 @@ function renderLocalAiClis(data) {
         ? "Installed"
         : "Not Installed";
 
+      const useDisabled = isActive || !cli.installed || needsSignIn;
       const useBtn = el("button", {
         type: "button",
-        class: `btn ${isActive ? "btn-soft" : "btn-primary"} btn-xs`,
-        text: isActive ? "Selected" : "Use",
-        disabled: isActive || !cli.installed,
+        class: `btn ${useDisabled ? "btn-soft" : "btn-primary"} btn-xs`,
+        text: isActive ? "Selected" : !cli.installed ? "Not Installed" : needsSignIn ? "Sign in..." : "Use",
+        disabled: useDisabled,
       });
       useBtn.addEventListener("click", () =>
         withBusy(useBtn, async () => {

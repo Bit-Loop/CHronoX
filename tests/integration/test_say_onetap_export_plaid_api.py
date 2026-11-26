@@ -648,7 +648,25 @@ class TestAppleNumbersAndCSVExportsAPI:
         try:
             seed_workspace(svc)
 
-            # 1. Apple Numbers Graphical Workbook (.xlsx)
+            # 1a. Apple Numbers Graphical Workbook (.xlsx) — omits blank empty portfolio pie (4 charts)
+            r_num_empty_port = client.get("/api/v1/export/numbers?days=365&native=false")
+            assert r_num_empty_port.status_code == 200
+            with zipfile.ZipFile(io.BytesIO(r_num_empty_port.content), "r") as zf:
+                empty_charts = [n for n in zf.namelist() if n.startswith("xl/charts/chart") and n.endswith(".xml")]
+                assert len(empty_charts) == 4
+
+            # 1b. With a portfolio holding, all 5 embedded charts (including Portfolio Allocation pie) emit
+            svc.storage.upsert_holding(
+                {
+                    "symbol": "VTI",
+                    "name": "Vanguard Total Stock Market ETF",
+                    "asset_class": "etf",
+                    "quantity_e8": 10 * 10**8,
+                    "price_e8": 265 * 10**8,
+                    "cost_basis_cents": 240_000,
+                    "cost_basis_known": True,
+                }
+            )
             r_num = client.get("/api/v1/export/numbers?days=365&native=false")
             assert r_num.status_code == 200
             assert "spreadsheetml.sheet" in r_num.headers["content-type"]

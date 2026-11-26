@@ -553,6 +553,30 @@ class AnalyticsEngine:
         cat_slug_map: Dict[str, str] = {}
         cat_preferred_color: Dict[str, str] = {}
 
+        # Pre-index in-period paired transfer legs so two-leg transfers (checking out + savings in)
+        # are NEVER double-counted in verified savings or reserve draws.
+        savings_in_legs: Dict[Tuple[str, int], int] = defaultdict(int)
+        savings_out_legs: Dict[Tuple[str, int], int] = defaultdict(int)
+        for tx in transactions:
+            tx_date_str = str(_get(tx, "tx_date", "") or "")[:10]
+            if len(tx_date_str) < 10 or not (start_iso <= tx_date_str <= end_iso):
+                continue
+            if _enum_val(_get(tx, "tx_type", "expense")) != "transfer":
+                continue
+            amt = int(_get(tx, "amount_cents", 0) or 0)
+            if amt <= 0:
+                continue
+            xfer_dir = str(_get(tx, "transfer_direction", "") or "").strip().lower()
+            acct_id = _get(tx, "account_id", None)
+            atype = acct_type_by_id.get(int(acct_id), "") if acct_id is not None else ""
+            if atype in ("savings", "trading") and xfer_dir == "in":
+                savings_in_legs[(tx_date_str, amt)] += 1
+            elif atype == "savings" and xfer_dir == "out":
+                savings_out_legs[(tx_date_str, amt)] += 1
+
+        unmatched_savings_in = dict(savings_in_legs)
+        unmatched_savings_out = dict(savings_out_legs)
+
         for tx in transactions:
             tx_date_str = str(_get(tx, "tx_date", "") or "")[:10]
             if len(tx_date_str) < 10:
@@ -572,20 +596,30 @@ class AnalyticsEngine:
                     xfer_dir = str(_get(tx, "transfer_direction", "") or "").strip().lower()
                     acct_id = _get(tx, "account_id", None)
                     atype = acct_type_by_id.get(int(acct_id), "") if acct_id is not None else ""
-                    if (
-                        (atype in ("savings", "trading") and xfer_dir == "in")
-                        or (
-                            atype == "checking"
-                            and xfer_dir == "out"
-                            and any(k in merch_low for k in ("saving", "hysa", "invest", "broker", "schwab", "coinbase", "robinhood", "ira", "401k"))
-                        )
-                    ):
+                    pair_key = (tx_date_str, amt)
+                    if atype in ("savings", "trading") and xfer_dir == "in":
                         verified_savings_transfer_cents += amt
                     elif (
-                        (atype == "savings" and xfer_dir == "out")
-                        or (atype == "checking" and xfer_dir == "in" and any(k in merch_low for k in ("saving", "reserve", "hysa")))
+                        atype == "checking"
+                        and xfer_dir == "out"
+                        and any(k in merch_low for k in ("saving", "hysa", "invest", "broker", "schwab", "coinbase", "robinhood", "ira", "401k"))
                     ):
+                        # Only count checking out-leg when no matching savings/trading in-leg exists on same date & amount
+                        if unmatched_savings_in.get(pair_key, 0) > 0:
+                            unmatched_savings_in[pair_key] -= 1
+                        else:
+                            verified_savings_transfer_cents += amt
+                    elif atype == "savings" and xfer_dir == "out":
                         verified_reserve_draw_cents += amt
+                    elif (
+                        atype == "checking"
+                        and xfer_dir == "in"
+                        and any(k in merch_low for k in ("saving", "reserve", "hysa"))
+                    ):
+                        if unmatched_savings_out.get(pair_key, 0) > 0:
+                            unmatched_savings_out[pair_key] -= 1
+                        else:
+                            verified_reserve_draw_cents += amt
                 continue
 
             if ttype == "income":

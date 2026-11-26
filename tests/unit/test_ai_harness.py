@@ -493,7 +493,7 @@ class TestOfflineDeterministicUtteranceHarness:
         assert r_b.actions[2].payload["saved_cents"] == 160_000
         assert r_b.execution_policy.auto_execute_eligible is True  # 3 safe actions <= AUTO_EXECUTE_MAX_ACTIONS
 
-        # Case C: NO savings account AND NO goals -> transfer out + create_goal with exact 10,000c
+        # Case C: NO savings account AND NO goals -> transfer out + create_goal with sensible target > saved
         ctx_bare = _sample_context(include_savings_account=False, include_goals=False)
         r_c = harness.process_utterance(
             "Put $100 in savings",
@@ -501,7 +501,7 @@ class TestOfflineDeterministicUtteranceHarness:
             intelligence_mode="deterministic_only",
         )
         assert [a.action_type for a in r_c.actions] == ["create_transaction", "create_goal"]
-        assert r_c.actions[1].payload["target_cents"] == 10_000
+        assert r_c.actions[1].payload["target_cents"] == 100_000
         assert r_c.actions[1].payload["saved_cents"] == 10_000
         assert r_c.actions[1].payload["funding_jar_slug"] == "safety"
         assert r_c.execution_policy.auto_execute_eligible is True

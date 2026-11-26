@@ -311,7 +311,7 @@ def _print_onetap_result(res: Dict[str, Any]) -> None:
     print("-" * 72)
     if res.get("applied") and res.get("batch_id") is not None:
         print(f"  Applied One-Tap batch #{res['batch_id']}.")
-        print("  Undo anytime: chronox --undo")
+        print(f"  Undo anytime: chronox --undo onetap:{res['batch_id']}")
     elif not res.get("needs_setup") and any(a.get("executable") for a in actions):
         print("  Preview only. Apply with: chronox --one-tap --apply")
     print("=" * 72 + "\n")
@@ -389,7 +389,7 @@ def _run_say(
             f"({_money(int(res.get('safe_to_spend_cents', 0)))} until payday)"
         )
         if res.get("undo_available") and res.get("batch_id") is not None:
-            print(f"  Batch #{res['batch_id']} · Undo anytime: chronox --undo")
+            print(f"  Batch #{res['batch_id']} · Undo anytime: chronox --undo agent:{res['batch_id']}")
     elif res.get("requires_confirmation") and actions:
         print(f"  Proposed plan (batch #{res.get('batch_id')}):")
         for idx, act in enumerate(actions, 1):
@@ -408,15 +408,36 @@ def _run_say(
 
 def _run_undo(svc: FinanceService, batch_spec: str) -> int:
     batch_id: Optional[int] = None
+    kind: Optional[str] = None
     cleaned = (batch_spec or "").strip().lower()
     if cleaned and cleaned != "latest":
-        try:
-            batch_id = int(cleaned)
-        except ValueError:
-            print(f"Error: invalid batch ID '{batch_spec}'. Pass an integer batch ID or omit for latest.", file=sys.stderr)
-            return 1
+        if ":" in cleaned:
+            raw_kind, raw_id = cleaned.split(":", 1)
+            if raw_kind not in ("agent", "onetap"):
+                print(
+                    f"Error: invalid undo target '{batch_spec}'. Use 'agent:N', 'onetap:N', an integer ID, or omit for latest.",
+                    file=sys.stderr,
+                )
+                return 1
+            kind = raw_kind
+            try:
+                batch_id = int(raw_id)
+            except ValueError:
+                print(f"Error: invalid batch ID '{batch_spec}'. Use '{raw_kind}:N'.", file=sys.stderr)
+                return 1
+        elif cleaned in ("agent", "onetap"):
+            kind = cleaned
+        else:
+            try:
+                batch_id = int(cleaned)
+            except ValueError:
+                print(
+                    f"Error: invalid batch ID '{batch_spec}'. Use 'agent:N', 'onetap:N', an integer ID, or omit for latest.",
+                    file=sys.stderr,
+                )
+                return 1
     try:
-        res = svc.undo_last_action(batch_id=batch_id)
+        res = svc.undo_last_action(batch_id=batch_id, kind=kind)
     except ValueError as exc:
         print(f"\n[Undo] {exc}\n", file=sys.stderr)
         return 1

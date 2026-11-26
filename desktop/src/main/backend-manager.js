@@ -184,12 +184,16 @@ function buildAugmentedCliPath(basePath, options = {}) {
       pathLib.join(homeDir, ".volta", "bin"),
       pathLib.join(homeDir, ".bun", "bin"),
       pathLib.join(homeDir, ".cargo", "bin"),
-      pathLib.join(homeDir, ".npm-global", "bin")
+      pathLib.join(homeDir, ".npm-global", "bin"),
+      pathLib.join(homeDir, ".local", "share", "pnpm"),
+      pathLib.join(homeDir, "Library", "pnpm"),
+      pathLib.join(homeDir, ".asdf", "shims"),
+      pathLib.join(homeDir, ".local", "share", "mise", "shims")
     );
   }
 
   if (!isWin) {
-    extraCandidates.push("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin");
+    extraCandidates.push("/home/linuxbrew/.linuxbrew/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin");
   }
 
   const appData = String(sourceEnv.APPDATA || "").trim();

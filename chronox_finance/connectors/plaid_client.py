@@ -670,7 +670,7 @@ class PlaidClient:
                 request_id=req_id,
             )
 
-        # Pass 2: No completed items yet — inspect ONLY the latest session (`sessions[-1]`)
+        # Pass 2: No completed items yet — sort chronologically before inspecting latest session
         if not valid_sessions:
             return PlaidLinkPollResult(
                 status="pending",
@@ -678,7 +678,16 @@ class PlaidClient:
                 request_id=req_id,
             )
 
-        latest = valid_sessions[-1]
+        def _session_order_key(pair: Tuple[int, Dict[str, Any]]) -> Tuple[str, int, str, int]:
+            idx, sess = pair
+            started = str(sess.get("started_at") or "").strip()
+            finished = str(sess.get("finished_at") or "").strip()
+            primary_ts = started or finished
+            is_in_progress = 1 if (started and not finished) else 0
+            return (primary_ts, is_in_progress, finished, idx)
+
+        ordered_sessions = [s for _, s in sorted(enumerate(valid_sessions), key=_session_order_key)]
+        latest = ordered_sessions[-1]
         finished_at = latest.get("finished_at")
         has_finished = bool(finished_at and str(finished_at).strip())
         exit_info, err_code, err_msg = _extract_session_exit(latest)

@@ -63,6 +63,28 @@ def _build_populated_backup_json(tmp_path: Path) -> Path:
     try:
         svc.secrets.unlock_ephemeral_for_testing()
         seed_workspace(svc)
+        svc.storage.upsert_holding(
+            {
+                "symbol": "VTI",
+                "name": "Vanguard Total Stock Market ETF",
+                "asset_class": "etf",
+                "quantity_e8": 10 * 10**8,
+                "price_e8": 265 * 10**8,
+                "cost_basis_cents": 240_000,
+                "cost_basis_known": True,
+            }
+        )
+        svc.storage.upsert_holding(
+            {
+                "symbol": "AAPL",
+                "name": "Apple Inc.",
+                "asset_class": "equity",
+                "quantity_e8": 8 * 10**8,
+                "price_e8": 225 * 10**8,
+                "cost_basis_cents": 150_000,
+                "cost_basis_known": True,
+            }
+        )
         svc.storage.update_settings({"onboarding_completed": 1})
         backup_payload = svc.storage.export_backup()
         out_path = tmp_path / "chronox_populated_backup.json"
@@ -170,18 +192,33 @@ class _E2ELocalCLIClient:
         savings_str = str(plan_obj.get("total_annual_savings_dollars") or "$0.00")
         ruin = float(plan_obj.get("ruin_probability_pct") or 0.0)
         rationales = []
-        for act in actions:
+        for idx, act in enumerate(actions):
             aid = str(act.get("action_id") or "")
             if not aid:
                 continue
+            atype = str(act.get("action_type") or "")
             amt = int(act.get("amount_cents") or 0)
-            amt_part = f" allocating ${amt / 100:,.2f}" if amt > 0 else ""
-            rationales.append(
-                {
-                    "action_id": aid,
-                    "rationale": f"AI-verified priority move{amt_part} while protecting bills and locked jars.",
-                }
-            )
+            amt_str = f"${amt / 100:,.2f}"
+            raw_target = str(act.get("target_name") or "")
+            clean_target = re.sub(r"</?UNTRUSTED_DATA>", "", raw_target)
+            clean_target = re.sub(r"\$?\d[\d,]*(?:\.\d+)?%?", "", clean_target).strip(" -:")
+            if atype == "set_emergency_buffer":
+                txt = (
+                    f"AI-verified cushion step: reserve {amt_str} to align directly with your {cvar_str} tail-risk buffer."
+                )
+            elif atype == "set_safe_invest_cap":
+                txt = f"AI-verified guardrail: cap discretionary brokerage transfers at {amt_str} above protected bills."
+            elif atype == "fund_goal":
+                goal_hint = f" ({clean_target})" if clean_target else ""
+                verb = "accelerate milestone progress" if idx % 2 == 0 else "close the remaining target gap"
+                txt = f"AI-verified goal boost{goal_hint}: direct {amt_str} of unlocked surplus to {verb}."
+            else:
+                card_hint = f" on {clean_target}" if clean_target else ""
+                reason = (
+                    "curb reported statement balance" if idx % 2 == 0 else "trim revolving interest drag ahead of close"
+                )
+                txt = f"AI-verified card move{card_hint}: schedule {amt_str} early to {reason}."
+            rationales.append({"action_id": aid, "rationale": txt})
         return {
             "executive_summary": (
                 f"Your 95%-safe daily spend is {daily_str} with a {cvar_str} tail-risk cushion, "
@@ -258,10 +295,10 @@ class _E2ELocalCLIRegistry(LocalCLIRegistry):
                 "binary_name": "agy",
                 "priority": 40,
                 "installed": True,
-                "auth_ready": True,
+                "auth_ready": None,
                 "binary_path": "/home/user/.local/bin/agy",
                 "version": "1.5.15",
-                "detail": "Ready (v1.5.15)",
+                "detail": "Installed (v1.5.15)",
                 "model": "gemini-3.8-flash-low",
             },
         }
@@ -726,6 +763,20 @@ app.whenReady().then(async () => {
         await sleep(180);
         if (tab === "analytics" && vw === 1380) {
           await sleep(200);
+          results.emptyCashFlowKpis = await win.webContents.executeJavaScript(`
+            (() => {
+              const strip = document.getElementById("analytics-kpi-strip");
+              const txt = strip ? strip.innerText : "";
+              return {
+                text: txt,
+                hasNoDataYet: txt.includes("NO DATA YET"),
+                hasTightMargin: txt.includes("TIGHT MARGIN"),
+                hasZeroCategories: txt.includes("0 CATEGORIES"),
+                hasPlusZero: txt.includes("+$0.00"),
+                tabbarTop: getComputedStyle(document.getElementById("main-tabbar")).top,
+              };
+            })()
+          `);
           const s2 = await captureShot(win, "after_02_cashflow_empty_1380x880.png");
           if (s2) screenshots.cashflowEmpty = s2;
         }
@@ -806,7 +857,14 @@ app.whenReady().then(async () => {
     await sleep(300);
 
     // Capture populated Overview with Say-Anything bar response & all 5 zero-overflow Jars!
-    await win.webContents.executeJavaScript(`window.scrollTo(0, 140); true;`);
+    // Scroll cleanly to #command-say (honoring scroll-margin-top below top:0 sticky .tabbar!)
+    await win.webContents.executeJavaScript(`
+      (() => {
+        const sec = document.getElementById("command-say");
+        if (sec) sec.scrollIntoView({ behavior: "instant", block: "start" });
+        return true;
+      })()
+    `);
     const s3 = await captureShot(win, "after_03_overview_say_jars_1380x880.png");
     if (s3) screenshots.overviewPopulated = s3;
     await win.webContents.executeJavaScript(`window.scrollTo(0, 0); true;`);
@@ -883,8 +941,9 @@ app.whenReady().then(async () => {
         const actionCount = document.querySelectorAll("#onetap-body .onetap-action-card").length;
         return {
           hasCvar: bodyText.includes("CVaR"),
-          hasSurvivalPct: /\\d+\\.\\d+%/.test(bodyText),
-          hasAiRationale: bodyText.includes("AI-verified priority move"),
+          hasSurvivalPct: /(?:>99\.9%|\d+\.\d+%)/.test(bodyText),
+          hasCappedSurvival: bodyText.includes(">99.9%"),
+          hasAiRationale: bodyText.includes("AI-verified cushion step") && bodyText.includes("AI-verified guardrail"),
           actionCount,
           footText,
         };
@@ -1023,13 +1082,24 @@ app.whenReady().then(async () => {
     );
 
     results.localCliUi = await win.webContents.executeJavaScript(`
-      ({
-        statusText: document.getElementById("local-cli-status-text").textContent.trim(),
-        cardCount: document.querySelectorAll("#local-cli-cards-grid .local-cli-card").length,
-        autoDetectChecked: Boolean(document.getElementById("set-local-cli-auto-detect").checked),
-        opencodeActive: Array.from(document.querySelectorAll("#local-cli-cards-grid .local-cli-card"))
-          .some((c) => c.classList.contains("is-active") && c.innerText.includes("OpenCode")),
-      })
+      (() => {
+        const cards = Array.from(document.querySelectorAll("#local-cli-cards-grid .local-cli-card"));
+        const claudeCard = cards.find((c) => c.innerText.includes("Claude"));
+        const claudeUse = claudeCard ? claudeCard.querySelector("button") : null;
+        const codexCard = cards.find((c) => c.innerText.includes("Codex"));
+        const codexUse = codexCard ? codexCard.querySelector("button") : null;
+        const agyCard = cards.find((c) => c.innerText.includes("Antigravity"));
+        const agyBadge = agyCard ? agyCard.querySelector(".pill") : null;
+        return {
+          statusText: document.getElementById("local-cli-status-text").textContent.trim(),
+          cardCount: cards.length,
+          autoDetectChecked: Boolean(document.getElementById("set-local-cli-auto-detect").checked),
+          opencodeActive: cards.some((c) => c.classList.contains("is-active") && c.innerText.includes("OpenCode")),
+          claudeUseMuted: Boolean(claudeUse && claudeUse.disabled && !claudeUse.classList.contains("btn-primary")),
+          codexUseDisabled: Boolean(codexUse && codexUse.disabled && codexUse.textContent.includes("Sign in")),
+          agyBadgeText: agyBadge ? agyBadge.textContent.trim() : "",
+        };
+      })()
     `);
 
     // Exercise 1-step Plaid Connect flow in Settings
@@ -1318,25 +1388,39 @@ def test_consumer_overhaul_full_stack_zero_overflow_say_onetap_exports_and_ai_pl
         assert "client pitch ran late" in str(matched_tx["memo"]).lower()
         assert rep["sayAfterUndo"]["remainingMatch"] is None, "Undo did not remove the $14.50 transaction!"
 
-        # 5. Live "One-Tap Optimize" Modal -> CVaR, survival %, AI rationales -> Apply -> Undo
+        # 5. Live "One-Tap Optimize" Modal -> CVaR, >99.9% survival, distinct AI rationales -> Apply -> Undo
         ot = rep["oneTapPreview"]
         assert ot["hasCvar"] is True, f"CVaR cushion missing from One-Tap modal: {ot}"
         assert ot["hasSurvivalPct"] is True, f"Survival % missing from One-Tap modal: {ot}"
+        assert ot["hasCappedSurvival"] is True, f"100.0% survival should render as >99.9%: {ot}"
         assert ot["hasAiRationale"] is True, f"AI action rationales did not render in One-Tap modal: {ot}"
+        assert "of 6 actions apply" in ot["footText"], f"Expected advisory breakdown in footer: {ot}"
         assert ot["actionCount"] >= 2
         assert rep["oneTapApplied"] is True
         assert rep["oneTapUndone"] is True
+
+        # 5b. Empty Cash Flow KPI polish (#21) & solid top:0 sticky tabbar (#24)
+        cf_kpis = rep["emptyCashFlowKpis"]
+        assert cf_kpis["hasNoDataYet"] is True, f"Expected NO DATA YET on $0 Cash Flow: {cf_kpis}"
+        assert cf_kpis["hasTightMargin"] is False, f"TIGHT MARGIN should not show on $0 Cash Flow: {cf_kpis}"
+        assert cf_kpis["hasZeroCategories"] is False, f"0 CATEGORIES should be hidden on $0 Cash Flow: {cf_kpis}"
+        assert cf_kpis["hasPlusZero"] is False, f"Empty surplus should render $0.00 without +: {cf_kpis}"
+        assert cf_kpis["tabbarTop"] == "0px", f"Sticky .tabbar should sit at top:0px: {cf_kpis}"
 
         # 6. Live Automagic Local AI CLI Status & Plaid 1-Step Connect UI
         cli_ui = rep["localCliUi"]
         assert cli_ui["cardCount"] == 4
         assert cli_ui["autoDetectChecked"] is True
         assert cli_ui["opencodeActive"] is True
+        assert cli_ui["claudeUseMuted"] is True, f"Uninstalled CLI Use button should be muted non-primary: {cli_ui}"
+        assert cli_ui["codexUseDisabled"] is True, f"Sign-in-needed CLI should disable Use button: {cli_ui}"
+        assert cli_ui["agyBadgeText"] == "Installed", f"Unprobed agy should show Installed until auth_ready: {cli_ui}"
         assert "OpenCode" in cli_ui["statusText"]
 
         plaid_ui = rep["plaidUi"]
         assert plaid_ui["pillBefore"] == "Not Connected"
         assert plaid_ui["pillAfter"] == "Connected (1)"
+        assert "1 transaction imported" in plaid_ui["progressText"], f"Singular pluralization expected: {plaid_ui}"
         assert "Chase Bank" in plaid_ui["connectionsText"]
 
         # 7. Live Export Endpoints: UI requests + .xlsx (6 sheets, 5 charts) + .zip (7 CSVs)

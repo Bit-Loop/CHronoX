@@ -736,6 +736,7 @@ class SayRequest(BaseModel):
 class OneTapOptimizeRequest(BaseModel):
     horizon_days: int = Field(30, ge=7, le=90)
     apply: bool = False
+    plan_fingerprint: Optional[str] = Field(None, max_length=128)
 
 
 class AIUsageProviderBreakdown(BaseModel):

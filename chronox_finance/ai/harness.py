@@ -33,6 +33,7 @@ import inspect
 import json
 import logging
 import re
+import time
 from dataclasses import asdict, is_dataclass
 from datetime import date, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
@@ -1542,7 +1543,7 @@ def _parse_savings_or_transfer(
                 "action_type": "create_transaction",
                 "payload": {
                     "account_id": int(sav["id"]),
-                    "jar_id": safety_jar_id,
+                    "jar_id": None,
                     "tx_type": "transfer",
                     "transfer_direction": "in",
                     "amount_cents": amt_cents,
@@ -1560,7 +1561,7 @@ def _parse_savings_or_transfer(
                 "action_type": "create_transaction",
                 "payload": {
                     "account_id": int(sav["id"]),
-                    "jar_id": safety_jar_id,
+                    "jar_id": None,
                     "tx_type": "transfer",
                     "transfer_direction": "in",
                     "amount_cents": amt_cents,
@@ -1568,6 +1569,7 @@ def _parse_savings_or_transfer(
                     "subcategory": "Savings & Buffer",
                     "memo": memo_txt,
                     "tx_date": tx_date,
+                    "affects_balance": False,
                 },
             }
         )
@@ -1609,12 +1611,13 @@ def _parse_savings_or_transfer(
             f"bringing saved progress to {_fmt_dollars(new_saved)}."
         )
     elif not savings_accts or not is_generic_savings:
+        sensible_target_cents = max(amt_cents * 10, 100_000)
         actions.append(
             {
                 "action_type": "create_goal",
                 "payload": {
                     "name": clean_target_label,
-                    "target_cents": amt_cents,
+                    "target_cents": sensible_target_cents,
                     "saved_cents": amt_cents,
                     "category": "emergency" if any(w in clean_target_label.lower() for w in ("saving", "emergency", "buffer", "rainy")) else "custom",
                     "funding_jar_slug": "safety",
@@ -1854,9 +1857,12 @@ class FinancialAIHarness:
         json_mode: bool,
         use_cache: bool,
         override_completion_fn: Optional[Callable[..., Any]] = None,
+        total_timeout_seconds: float = 30.0,
     ) -> Tuple[Optional[CompletionResult], Optional[str], Optional[str], Optional[str]]:
         """
-        Invoke configured providers in priority order with transparent failover.
+        Invoke configured providers in priority order with transparent failover and a
+        strict overall deadline budget (`total_timeout_seconds=30.0s`) so multi-CLI
+        failover never stalls interactively for minutes.
         Returns `(completion, active_provider, failover_notice, last_error_str)`.
         """
         self.last_completion = None
@@ -1864,19 +1870,33 @@ class FinancialAIHarness:
         if not chain:
             return None, None, None, None
 
+        deadline = time.monotonic() + max(5.0, float(total_timeout_seconds))
         last_err: Optional[str] = None
         first_failed_pid: Optional[str] = None
         for idx, client in enumerate(chain):
+            remaining = deadline - time.monotonic()
+            if idx > 0 and remaining <= 1.0:
+                last_err = f"Overall AI timeout budget ({total_timeout_seconds:.0f}s) exhausted."
+                break
             pid = str(getattr(client, "provider_name", "opencode_go") or "opencode_go").strip().lower()
+            call_kwargs: Dict[str, Any] = {
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "json_mode": json_mode,
+                "use_cache": use_cache,
+            }
             try:
-                res = client.chat_completion(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    json_mode=json_mode,
-                    use_cache=use_cache,
-                )
+                try:
+                    res = client.chat_completion(
+                        **call_kwargs,
+                        timeout_override=max(5.0, remaining),
+                    )
+                except TypeError as type_err:
+                    if "timeout_override" not in str(type_err):
+                        raise
+                    res = client.chat_completion(**call_kwargs)
                 self._record_completion(res)
                 active_pid = (res.provider or pid or "opencode_go").strip().lower()
                 failover_notice = (
@@ -2632,11 +2652,35 @@ class FinancialAIHarness:
                 if aid and txt:
                     rat_by_id[aid] = txt
 
+        # Deduplicate boilerplate AI rationales (>=80% token overlap after stripping numbers)
+        def _rationale_skeleton_tokens(text: str) -> Set[str]:
+            stripped = re.sub(r"[+-]?\$?\d[\d,]*(?:\.\d+)?%?", " ", text or "")
+            return {tok for tok in re.findall(r"[a-z]+", stripped.lower()) if len(tok) > 1}
+
+        ai_token_sets: List[Tuple[str, Set[str]]] = [
+            (aid, _rationale_skeleton_tokens(txt))
+            for aid, txt in rat_by_id.items()
+        ]
+        duplicated_ids: Set[str] = set()
+        for i in range(len(ai_token_sets)):
+            aid_i, toks_i = ai_token_sets[i]
+            if not toks_i:
+                continue
+            for j in range(i + 1, len(ai_token_sets)):
+                aid_j, toks_j = ai_token_sets[j]
+                if not toks_j:
+                    continue
+                union_len = len(toks_i | toks_j)
+                if union_len > 0 and (len(toks_i & toks_j) / union_len) >= 0.80:
+                    duplicated_ids.add(aid_i)
+                    duplicated_ids.add(aid_j)
+
         # Align LLM rationales 1-to-1 against exact deterministic actions (never altering IDs/amounts)
         candidate_rationales_dicts: List[Dict[str, Any]] = []
         merged_rationales: List[OneTapActionRationale] = []
         for det_r in det_rationales:
-            chosen_txt = rat_by_id.get(det_r.action_id) or det_r.rationale
+            ai_txt = None if det_r.action_id in duplicated_ids else rat_by_id.get(det_r.action_id)
+            chosen_txt = ai_txt or det_r.rationale
             candidate_rationales_dicts.append({"action_id": det_r.action_id, "rationale": chosen_txt})
             merged_rationales.append(
                 OneTapActionRationale(

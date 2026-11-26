@@ -314,7 +314,7 @@ body.is-desktop .app-shell {
   padding-top: calc(var(--titlebar-h) + 14px);
 }
 body.is-desktop .tabbar {
-  top: calc(var(--titlebar-h) + 6px);
+  top: var(--titlebar-h);
 }
 body.is-desktop .overlay {
   padding-top: calc(var(--titlebar-h) + 16px);
@@ -557,7 +557,7 @@ svg.ui-icon.ui-icon-lg,
 /* Sticky 8-Tab Precision Nav Rail (<740px total width — zero overflow at 960px+) */
 .tabbar {
   position: sticky;
-  top: 6px;
+  top: 0;
   z-index: 40;
   isolation: isolate;
   display: flex;
@@ -568,7 +568,12 @@ svg.ui-icon.ui-icon-lg,
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.32);
   margin-bottom: 20px;
+}
+#command-say,
+.quick-add-card {
+  scroll-margin-top: 72px;
 }
 .tabbar::-webkit-scrollbar { display: none; }
 
