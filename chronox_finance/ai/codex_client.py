@@ -34,6 +34,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from contextlib import suppress
 from pathlib import Path
@@ -70,6 +71,24 @@ DEFAULT_CLI_PROBE_CACHE_TTL_SECONDS = 300
 CODEX_CLI_STDIN_THRESHOLD_CHARS = 8_000
 
 _SAFE_CLI_MODEL_RE = re.compile(r"^[A-Za-z0-9._:/#-]{1,100}$")
+_SAFE_CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,160}$")
+
+# Tracks local chat-wrapper conversation IDs that have already received the static
+# ChronoX knowledge prefix on Turn 1 so follow-up turns in the same persistent
+# session stay lean without duplicating 10KB of constitution text every turn.
+_PRIMED_WRAPPER_LOCK = threading.Lock()
+_PRIMED_WRAPPER_CONVERSATIONS: set[Tuple[str, str]] = set()
+
+
+def clear_primed_wrapper_conversations(conversation_id: Optional[str] = None) -> None:
+    """Clear primed-session tracking (all sessions or a single conversation ID)."""
+    with _PRIMED_WRAPPER_LOCK:
+        if conversation_id:
+            stale = [k for k in _PRIMED_WRAPPER_CONVERSATIONS if k[1] == conversation_id]
+            for k in stale:
+                _PRIMED_WRAPPER_CONVERSATIONS.discard(k)
+        else:
+            _PRIMED_WRAPPER_CONVERSATIONS.clear()
 
 # Secret-scrubbing patterns applied before passing any context to local AI CLIs
 _CLI_SECRET_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
@@ -783,6 +802,8 @@ class CodexResponsesClient:
         wire_api: Literal["responses", "chat_completions"] = "responses",
         enable_static_prefix: bool = True,
         allow_keyless_local: Optional[bool] = None,
+        conversation_id: Optional[str] = None,
+        persist_session: bool = True,
         timeout_seconds: float = 45.0,
         cache_ttl_seconds: int = 900,
         transport: Optional[httpx.BaseTransport] = None,
@@ -829,6 +850,12 @@ class CodexResponsesClient:
             if allow_keyless_local is not None
             else is_wrapper_mode
         )
+        cleaned_conv = (conversation_id or "").strip()
+        if cleaned_conv and _SAFE_CONVERSATION_ID_RE.match(cleaned_conv):
+            self.conversation_id: Optional[str] = cleaned_conv
+        else:
+            self.conversation_id = None
+        self.persist_session: bool = bool(persist_session)
         self.timeout_seconds = float(timeout_seconds)
         self.cache_ttl_seconds = int(cache_ttl_seconds)
         self._transport = transport
@@ -953,7 +980,20 @@ class CodexResponsesClient:
             raise CodexError(f"{self.provider_name} is not configured.")
 
         target_model = (model or self.model).strip()
-        use_prefix = self.enable_static_prefix if prepend_static_prefix is None else bool(prepend_static_prefix)
+        is_local_stateful = bool(
+            self.conversation_id
+            and self.provider_name != "openai_codex"
+            and is_local_url(self.base_url)
+            and self.wire_api == "chat_completions"
+        )
+        if prepend_static_prefix is not None:
+            use_prefix = bool(prepend_static_prefix)
+        elif is_local_stateful and self.conversation_id:
+            with _PRIMED_WRAPPER_LOCK:
+                already_primed = (self.base_url, self.conversation_id) in _PRIMED_WRAPPER_CONVERSATIONS
+            use_prefix = bool(self.enable_static_prefix and not already_primed)
+        else:
+            use_prefix = self.enable_static_prefix
         effective_system = (
             build_cache_optimized_system_prompt(system_prompt) if use_prefix else (system_prompt or "")
         )
@@ -1021,6 +1061,9 @@ class CodexResponsesClient:
             raise CodexError(f"{self.provider_name} returned invalid JSON payload: {exc}") from exc
 
         latency_ms = max(0, int(round((time.monotonic() - t0) * 1000)))
+        if is_local_stateful and use_prefix and self.conversation_id:
+            with _PRIMED_WRAPPER_LOCK:
+                _PRIMED_WRAPPER_CONVERSATIONS.add((self.base_url, self.conversation_id))
         cost_ud, saved_ud, full_uncached_ud = calculate_token_costs(
             model=target_model,
             input_tokens=in_tok,
@@ -1128,15 +1171,36 @@ class CodexResponsesClient:
             body["temperature"] = temperature
         if json_mode:
             body["response_format"] = {"type": "json_object"}
+        if (
+            self.conversation_id
+            and self.provider_name != "openai_codex"
+            and is_local_url(self.base_url)
+        ):
+            body["conversation_id"] = self.conversation_id
+            body["persist"] = bool(self.persist_session)
 
         with self._http_client() as client:
             resp = client.post(url, headers=headers, json=body)
-            if resp.status_code == 400 and ("response_format" in body or "temperature" in body):
+            if resp.status_code in (400, 422) and (
+                "response_format" in body or "temperature" in body or "conversation_id" in body
+            ):
                 retry_body = dict(body)
-                retry_body.pop("response_format", None)
-                if "temperature" in retry_body and "temperature" in (resp.text or "").lower():
+                err_low = (resp.text or "").lower()
+                changed = False
+                if "conversation_id" in retry_body and any(
+                    tok in err_low for tok in ("conversation_id", "persist", "unknown", "unrecognized", "extra", "additional")
+                ):
+                    retry_body.pop("conversation_id", None)
+                    retry_body.pop("persist", None)
+                    changed = True
+                if "response_format" in retry_body and (not changed or "response_format" in err_low):
+                    retry_body.pop("response_format", None)
+                    changed = True
+                if "temperature" in retry_body and "temperature" in err_low:
                     retry_body.pop("temperature", None)
-                resp = client.post(url, headers=headers, json=retry_body)
+                    changed = True
+                if changed:
+                    resp = client.post(url, headers=headers, json=retry_body)
 
             self._check_status(resp)
             data = resp.json()

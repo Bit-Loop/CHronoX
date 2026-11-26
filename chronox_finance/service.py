@@ -51,6 +51,7 @@ from chronox_finance.ai.codex_client import (
     DEFAULT_WRAPPER_MODEL,
     CodexCLIClient,
     CodexResponsesClient,
+    clear_primed_wrapper_conversations,
 )
 from chronox_finance.ai.gemini_client import (
     DEFAULT_GEMINI_BASE_URL,
@@ -750,15 +751,19 @@ class FinanceService:
         settings: Optional[Dict[str, Any]] = None,
         force_refresh: bool = False,
     ) -> Optional[CodexResponsesClient]:
-        hit = self._detect_local_http_gateway(settings=settings, force_refresh=force_refresh)
+        s = settings if settings is not None else self.storage.get_settings()
+        hit = self._detect_local_http_gateway(settings=s, force_refresh=force_refresh)
         if hit is None:
             return None
+        conv_id = self._resolve_wrapper_conversation_id("chat_wrapper", hit.model, s)
         return CodexResponsesClient(
             api_key="",
             base_url=hit.base_url,
             model=hit.model,
             provider_name="chat_wrapper",
             wire_api="chat_completions",
+            conversation_id=conv_id,
+            persist_session=bool(conv_id),
             transport=self._wrapper_transport,
         )
 
@@ -772,12 +777,16 @@ class FinanceService:
             detected = self._build_auto_local_gateway_client(settings=settings)
             if detected is not None:
                 return detected
+        chosen_model = settings.get("wrapper_model") or os.getenv("CHRONOX_WRAPPER_MODEL", DEFAULT_WRAPPER_MODEL)
+        conv_id = self._resolve_wrapper_conversation_id("chat_wrapper", chosen_model, settings)
         return CodexResponsesClient(
             api_key=self._resolve_wrapper_api_key(),
             base_url=raw_base,
-            model=settings.get("wrapper_model") or os.getenv("CHRONOX_WRAPPER_MODEL", DEFAULT_WRAPPER_MODEL),
+            model=chosen_model,
             provider_name="chat_wrapper",
             wire_api=wire,  # type: ignore[arg-type]
+            conversation_id=conv_id,
+            persist_session=bool(conv_id),
             transport=self._wrapper_transport,
         )
 
@@ -823,6 +832,83 @@ class FinanceService:
             "agy_cli": "agy",
         }.get(provider_id, "")
 
+    def _resolve_wrapper_conversation_id(
+        self,
+        provider_id: str,
+        model: str,
+        settings: Dict[str, Any],
+    ) -> Optional[str]:
+        """Return a stable per-provider conversation ID when single-session mode is enabled."""
+        if not bool(settings.get("wrapper_single_session", 1)):
+            return None
+        base_key = str(settings.get("wrapper_session_key") or "chronox-finance").strip() or "chronox-finance"
+        cleaned_model = (model or "").strip().lower()
+        ns = ""
+        if ":" in cleaned_model:
+            raw_prefix = cleaned_model.split(":", 1)[0].strip()
+            if raw_prefix in ("antigravity", "agy"):
+                ns = "agy"
+            elif raw_prefix in ("codex", "claude", "opencode"):
+                ns = raw_prefix
+        elif cleaned_model in ("antigravity", "agy"):
+            ns = "agy"
+        elif cleaned_model in ("codex", "claude", "opencode"):
+            ns = cleaned_model
+        if not ns:
+            ns = self._wrapper_prefix_for_agent(provider_id) or "default"
+        return f"{base_key}-{ns}"
+
+    def _load_cli_session_map(self, settings: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+        s = settings if settings is not None else self.storage.get_settings()
+        raw = str(s.get("ai_cli_sessions_json") or "{}").strip()
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        return {
+            str(k).strip().lower(): str(v).strip()
+            for k, v in parsed.items()
+            if isinstance(k, str) and isinstance(v, str) and v.strip()
+        }
+
+    def _save_cli_session_id(self, provider_id: str, session_id: Optional[str]) -> None:
+        if getattr(self.storage, "_closed", False):
+            return
+        pid = (provider_id or "").strip().lower()
+        if not pid:
+            return
+        try:
+            current = self._load_cli_session_map()
+            if session_id:
+                if current.get(pid) == session_id:
+                    return
+                current[pid] = session_id
+            else:
+                if pid not in current:
+                    return
+                current.pop(pid, None)
+            self.storage.update_settings({"ai_cli_sessions_json": json.dumps(current, sort_keys=True)})
+        except Exception:
+            return
+
+    def reset_ai_sessions(self) -> Dict[str, Any]:
+        """Rotate wrapper conversation key and clear persisted direct-CLI session IDs."""
+        new_key = f"chronox-finance-{secrets.token_hex(4)}"
+        self.storage.update_settings(
+            {
+                "wrapper_session_key": new_key,
+                "ai_cli_sessions_json": "{}",
+            }
+        )
+        clear_primed_wrapper_conversations()
+        return {
+            "ok": True,
+            "wrapper_session_key": new_key,
+            "cleared_cli_sessions": True,
+        }
+
     def _format_agent_wrapper_model(self, provider_id: str, raw_model: str) -> str:
         prefix = self._wrapper_prefix_for_agent(provider_id)
         cleaned = (raw_model or "").strip()
@@ -854,20 +940,36 @@ class FinanceService:
                 wire = str(s.get("wrapper_wire_api") or "chat_completions").strip().lower()
                 if wire not in ("responses", "chat_completions"):
                     wire = "chat_completions"
+                formatted_model = self._format_agent_wrapper_model(provider_id, raw_m)
+                conv_id = self._resolve_wrapper_conversation_id(provider_id, formatted_model, s)
                 return CodexResponsesClient(
                     api_key=self._resolve_wrapper_api_key(),
                     base_url=raw_base,
-                    model=self._format_agent_wrapper_model(provider_id, raw_m),
+                    model=formatted_model,
                     provider_name=provider_id,
                     wire_api=wire,  # type: ignore[arg-type]
+                    conversation_id=conv_id,
+                    persist_session=bool(conv_id),
                     transport=self._wrapper_transport,
                 )
 
-        return self._local_cli_registry.build_client(
-            provider_id,
-            model=model_override,
-            enabled=enabled,
-        )
+        single_session = bool(s.get("wrapper_single_session", 1))
+        saved_sid = self._load_cli_session_map(s).get(provider_id) if single_session else None
+        on_sid = self._save_cli_session_id if single_session else None
+        try:
+            return self._local_cli_registry.build_client(
+                provider_id,
+                model=model_override,
+                enabled=enabled,
+                session_id=saved_sid,
+                on_session_id=on_sid,
+            )
+        except TypeError:
+            return self._local_cli_registry.build_client(
+                provider_id,
+                model=model_override,
+                enabled=enabled,
+            )
 
     def build_codex_cli_client(self, *, force_enable: bool = False) -> CodexCLIClient:
         settings = self.storage.get_settings()
@@ -926,7 +1028,11 @@ class FinanceService:
                         self._local_cli_use_wrapper_setting(pid, settings)
                         and self._resolve_wrapper_base_url(settings)
                     )
-                    if has_custom_model or has_wrapper:
+                    needs_session = bool(
+                        settings.get("wrapper_single_session", 1)
+                        and pid in ("agy_cli", "opencode_cli")
+                    )
+                    if has_custom_model or has_wrapper or needs_session:
                         cli_client = self._build_local_cli_client(pid, enabled=True, settings=settings)
                 if cli_client.is_configured:
                     ordered.append(cli_client)
@@ -7772,6 +7878,8 @@ class FinanceService:
             wrapper_base_url=self._resolve_wrapper_base_url(raw),
             wrapper_model=raw.get("wrapper_model", ""),
             wrapper_wire_api=raw.get("wrapper_wire_api", "chat_completions"),
+            wrapper_single_session=bool(raw.get("wrapper_single_session", 1)),
+            wrapper_session_key=str(raw.get("wrapper_session_key") or "chronox-finance"),
             wrapper_key_configured=bool(wrap_key),
             wrapper_key_masked=mask_secret(wrap_key),
             codex_cli_enabled=bool(raw.get("codex_cli_enabled", 0)),
@@ -7835,6 +7943,8 @@ class FinanceService:
             wrapper_base_url=self._resolve_wrapper_base_url(raw),
             wrapper_model=raw.get("wrapper_model", ""),
             wrapper_wire_api=raw.get("wrapper_wire_api", "chat_completions"),
+            wrapper_single_session=bool(raw.get("wrapper_single_session", 1)),
+            wrapper_session_key=str(raw.get("wrapper_session_key") or "chronox-finance"),
             wrapper_key_configured=bool(wrap_key),
             wrapper_key_masked=mask_secret(wrap_key),
             codex_cli_enabled=bool(raw.get("codex_cli_enabled", 0)),
@@ -7892,6 +8002,7 @@ class FinanceService:
             "calm_mode",
             "auto_rebalance_enabled",
             "reserve_open_ewa_advances",
+            "wrapper_single_session",
             "onboarding_completed",
             "codex_cli_enabled",
             "claude_cli_use_wrapper",

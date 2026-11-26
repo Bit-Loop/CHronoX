@@ -684,6 +684,9 @@ def _ensure_additive_columns(conn: sqlite3.Connection) -> None:
             ("codex_cli_use_wrapper", "INTEGER NOT NULL DEFAULT 0"),
             ("agy_cli_use_wrapper", "INTEGER NOT NULL DEFAULT 0"),
             ("reserve_open_ewa_advances", "INTEGER NOT NULL DEFAULT 1"),
+            ("wrapper_single_session", "INTEGER NOT NULL DEFAULT 1"),
+            ("wrapper_session_key", "TEXT NOT NULL DEFAULT 'chronox-finance'"),
+            ("ai_cli_sessions_json", "TEXT NOT NULL DEFAULT '{}'"),
         ],
     )
     conn.execute(
@@ -1065,6 +1068,9 @@ class FinanceStorage:
             "wrapper_base_url",
             "wrapper_model",
             "wrapper_wire_api",
+            "wrapper_single_session",
+            "wrapper_session_key",
+            "ai_cli_sessions_json",
             "codex_cli_enabled",
             "codex_cli_model",
             "claude_cli_model",
@@ -1094,6 +1100,7 @@ class FinanceStorage:
             "calm_mode",
             "auto_rebalance_enabled",
             "reserve_open_ewa_advances",
+            "wrapper_single_session",
             "onboarding_completed",
             "codex_cli_enabled",
             "claude_cli_use_wrapper",

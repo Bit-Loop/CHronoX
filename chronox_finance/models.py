@@ -689,6 +689,8 @@ class AISettingsOut(BaseModel):
     wrapper_base_url: str = ""
     wrapper_model: str = ""
     wrapper_wire_api: Literal["responses", "chat_completions"] = "chat_completions"
+    wrapper_single_session: bool = True
+    wrapper_session_key: str = "chronox-finance"
     wrapper_key_configured: bool = False
     wrapper_key_masked: str = ""
     codex_cli_enabled: bool = False
@@ -725,6 +727,8 @@ class AISettingsUpdate(BaseModel):
     wrapper_base_url: Optional[str] = None
     wrapper_model: Optional[str] = None
     wrapper_wire_api: Optional[Literal["responses", "chat_completions"]] = None
+    wrapper_single_session: Optional[bool] = None
+    wrapper_session_key: Optional[str] = None
     wrapper_api_key: Optional[str] = None  # Write-only; never returned plaintext
     clear_wrapper_key: bool = False
     codex_cli_enabled: Optional[bool] = None
@@ -889,6 +893,8 @@ class ProfileSettings(BaseModel):
     wrapper_base_url: str = ""
     wrapper_model: str = ""
     wrapper_wire_api: Literal["responses", "chat_completions"] = "chat_completions"
+    wrapper_single_session: bool = True
+    wrapper_session_key: str = "chronox-finance"
     wrapper_key_configured: bool = False
     wrapper_key_masked: str = ""
     codex_cli_enabled: bool = False
@@ -937,6 +943,8 @@ class ProfileSettingsUpdate(BaseModel):
     wrapper_base_url: Optional[str] = None
     wrapper_model: Optional[str] = None
     wrapper_wire_api: Optional[Literal["responses", "chat_completions"]] = None
+    wrapper_single_session: Optional[bool] = None
+    wrapper_session_key: Optional[str] = None
     wrapper_api_key: Optional[str] = None  # Write-only; never returned plaintext
     clear_wrapper_key: bool = False
     codex_cli_enabled: Optional[bool] = None

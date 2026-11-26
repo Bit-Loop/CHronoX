@@ -1471,6 +1471,10 @@ def create_app(
     def list_local_ai_clis(probe: bool = False):
         return svc.get_local_clis(probe=probe)
 
+    @v1.post("/ai/sessions/reset", tags=["AI Coach"], dependencies=[Depends(require_auth)])
+    def reset_ai_sessions():
+        return svc.reset_ai_sessions()
+
     @v1.post("/ai/say", tags=["AI Coach"], dependencies=[Depends(require_auth), Depends(check_ai_rate_limit)])
     def ai_say(req: SayRequest):
         clean_provider = _validate_provider_param(req.provider) if req.provider is not None else None

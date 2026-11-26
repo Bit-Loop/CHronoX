@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -72,6 +73,47 @@ DEFAULT_AGY_CLI_MODEL = "gemini-3.8-flash-low"
 DEFAULT_LOCAL_CLI_TIMEOUT_SECONDS = 60.0
 DEFAULT_AGY_CLI_TIMEOUT_SECONDS = 65.0
 DEFAULT_AUTH_FAILURE_COOLDOWN_SECONDS = 300.0
+_SAFE_CLI_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,160}$")
+
+
+def _sanitize_cli_session_id(raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    cleaned = str(raw).strip()
+    if cleaned and _SAFE_CLI_SESSION_ID_RE.match(cleaned):
+        return cleaned
+    return None
+
+
+def _extract_opencode_session_id(stdout: str) -> Optional[str]:
+    for line in (stdout or "").splitlines():
+        stripped = line.strip()
+        if not stripped or not stripped.startswith("{"):
+            continue
+        try:
+            ev = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        cand = ev.get("sessionID") or ev.get("session_id")
+        if not cand and isinstance(ev.get("part"), dict):
+            cand = ev["part"].get("sessionID") or ev["part"].get("session_id")
+        valid = _sanitize_cli_session_id(cand)
+        if valid:
+            return valid
+    return None
+
+
+def _extract_agy_conversation_id(stdout: str) -> Optional[str]:
+    data = _extract_json_object(stdout or "")
+    if not isinstance(data, dict):
+        return None
+    for key in ("conversation_id", "conversationId", "session_id", "sessionId"):
+        valid = _sanitize_cli_session_id(data.get(key))
+        if valid:
+            return valid
+    return None
 
 LOCAL_CLI_PRIORITY: Tuple[str, ...] = (
     "claude_cli",
@@ -389,6 +431,8 @@ class _BaseLocalCLIClient:
         probe_cache_ttl_seconds: int = DEFAULT_CLI_PROBE_CACHE_TTL_SECONDS,
         on_auth_failure: Optional[Callable[[str, str], None]] = None,
         on_auth_success: Optional[Callable[[str], None]] = None,
+        session_id: Optional[str] = None,
+        on_session_id: Optional[Callable[[str, Optional[str]], None]] = None,
     ) -> None:
         self.enabled = bool(enabled)
         cleaned_model = (self.default_model_value if model is None else model).strip()
@@ -401,8 +445,19 @@ class _BaseLocalCLIClient:
         self.probe_cache_ttl_seconds = max(10, int(probe_cache_ttl_seconds))
         self._on_auth_failure = on_auth_failure
         self._on_auth_success = on_auth_success
+        self._session_id: Optional[str] = _sanitize_cli_session_id(session_id)
+        self._on_session_id = on_session_id
         self._cache = _TTLCache(max_items=64)
         self._probe_cache = _TTLCache(max_items=16)
+
+    def _record_session_id(self, sid: Optional[str]) -> None:
+        cleaned = _sanitize_cli_session_id(sid)
+        self._session_id = cleaned
+        if self._on_session_id is not None:
+            try:
+                self._on_session_id(self.provider_name, cleaned)
+            except Exception as exc:
+                logger.debug("Session ID callback ignored for %s: %s", self.provider_name, exc)
 
     def _resolve_binary(self) -> Optional[str]:
         if not self.binary:
@@ -636,12 +691,22 @@ class OpenCodeCLIClient(_BaseLocalCLIClient):
                     latency_ms=0,
                 )
 
-        cmd: List[str] = [binary, "run", "--format", "json", "--archived"]
-        if target_model:
-            cmd.extend(["--model", target_model])
+        def _build_oc_cmd(use_archived: bool, sid: Optional[str]) -> List[str]:
+            if use_archived:
+                out_cmd: List[str] = [binary, "run", "--format", "json", "--archived"]
+            else:
+                out_cmd = [binary, "run", "--standalone", "--format", "json"]
+            if sid:
+                out_cmd.extend(["--session", sid])
+            if target_model:
+                out_cmd.extend(["--model", target_model])
+            if not is_real_runtime:
+                out_cmd.append(combined_prompt)
+            return out_cmd
+
         is_real_runtime = subprocess.run is _REAL_SUBPROCESS_RUN
-        if not is_real_runtime:
-            cmd.append(combined_prompt)
+        active_sid = self._session_id
+        cmd = _build_oc_cmd(use_archived=True, sid=active_sid)
 
         effective_timeout = (
             max(5.0, min(180.0, float(timeout_override)))
@@ -658,19 +723,28 @@ class OpenCodeCLIClient(_BaseLocalCLIClient):
                     timeout=effective_timeout,
                     stdin_text=combined_prompt if is_real_runtime else None,
                 )
+                used_archived = True
                 if (
                     proc.returncode != 0
                     and "--archived" in cmd
                     and "unrecognized flag" in ((proc.stderr or "") + (proc.stdout or "")).lower()
                     and "--archived" in ((proc.stderr or "") + (proc.stdout or "")).lower()
                 ):
-                    fallback_cmd = [binary, "run", "--standalone", "--format", "json"]
-                    if target_model:
-                        fallback_cmd.extend(["--model", target_model])
-                    if not is_real_runtime:
-                        fallback_cmd.append(combined_prompt)
+                    used_archived = False
+                    fallback_cmd = _build_oc_cmd(use_archived=False, sid=active_sid)
                     proc = run_isolated_cli_subprocess(
                         fallback_cmd,
+                        cwd=empty_cwd,
+                        env=self._sanitized_env(binary),
+                        timeout=effective_timeout,
+                        stdin_text=combined_prompt if is_real_runtime else None,
+                    )
+                if proc.returncode != 0 and active_sid and not is_cli_auth_error((proc.stderr or "") + (proc.stdout or "")):
+                    # Self-heal if the previously persisted OpenCode session was pruned/deleted
+                    self._record_session_id(None)
+                    fresh_cmd = _build_oc_cmd(use_archived=used_archived, sid=None)
+                    proc = run_isolated_cli_subprocess(
+                        fresh_cmd,
                         cwd=empty_cwd,
                         env=self._sanitized_env(binary),
                         timeout=effective_timeout,
@@ -710,6 +784,9 @@ class OpenCodeCLIClient(_BaseLocalCLIClient):
         if not content:
             raise OpenCodeCLIError("OpenCode CLI returned empty JSONL output.")
 
+        detected_sid = _extract_opencode_session_id(proc.stdout or "")
+        if detected_sid:
+            self._record_session_id(detected_sid)
         self._notify_auth_success()
         resolved_model = target_model or detected_model or "opencode-default"
         calc_cost_ud, saved_ud, full_uncached_ud = calculate_token_costs(
@@ -970,6 +1047,8 @@ class AntigravityCLIClient(_BaseLocalCLIClient):
         probe_cache_ttl_seconds: int = DEFAULT_CLI_PROBE_CACHE_TTL_SECONDS,
         on_auth_failure: Optional[Callable[[str, str], None]] = None,
         on_auth_success: Optional[Callable[[str], None]] = None,
+        session_id: Optional[str] = None,
+        on_session_id: Optional[Callable[[str, Optional[str]], None]] = None,
     ) -> None:
         super().__init__(
             enabled=enabled,
@@ -980,6 +1059,8 @@ class AntigravityCLIClient(_BaseLocalCLIClient):
             probe_cache_ttl_seconds=probe_cache_ttl_seconds,
             on_auth_failure=on_auth_failure,
             on_auth_success=on_auth_success,
+            session_id=session_id,
+            on_session_id=on_session_id,
         )
         if not self.model:
             self.model = DEFAULT_AGY_CLI_MODEL
@@ -1139,19 +1220,26 @@ class AntigravityCLIClient(_BaseLocalCLIClient):
                     )
                 else:
                     prompt_arg = combined_prompt
-                cmd: List[str] = [
-                    binary,
-                    "-p",
-                    prompt_arg,
-                    "--output-format",
-                    "json",
-                    "--model",
-                    target_model,
-                    "--disable-slash-commands",
-                    "--sandbox",
-                    "--print-timeout",
-                    f"{print_timeout_s}s",
-                ]
+                def _build_agy_cmd(conv_id: Optional[str]) -> List[str]:
+                    out_cmd: List[str] = [
+                        binary,
+                        "-p",
+                        prompt_arg,
+                        "--output-format",
+                        "json",
+                        "--model",
+                        target_model,
+                        "--disable-slash-commands",
+                        "--sandbox",
+                        "--print-timeout",
+                        f"{print_timeout_s}s",
+                    ]
+                    if conv_id:
+                        out_cmd.extend(["--conversation", conv_id])
+                    return out_cmd
+
+                active_conv = self._session_id
+                cmd = _build_agy_cmd(active_conv)
                 proc = run_isolated_cli_subprocess(
                     cmd,
                     cwd=empty_cwd,
@@ -1159,6 +1247,16 @@ class AntigravityCLIClient(_BaseLocalCLIClient):
                     timeout=effective_timeout,
                     stdin_text=None,
                 )
+                if proc.returncode != 0 and active_conv and not is_cli_auth_error((proc.stderr or "") + (proc.stdout or "")):
+                    # Self-heal if the previously persisted Antigravity conversation was deleted/expired
+                    self._record_session_id(None)
+                    proc = run_isolated_cli_subprocess(
+                        _build_agy_cmd(None),
+                        cwd=empty_cwd,
+                        env=self._sanitized_env(binary),
+                        timeout=effective_timeout,
+                        stdin_text=None,
+                    )
         except subprocess.TimeoutExpired as exc:
             timeout_msg = f"Antigravity CLI timed out after {effective_timeout:.0f}s."
             self._notify_auth_failure(timeout_msg)
@@ -1187,6 +1285,9 @@ class AntigravityCLIClient(_BaseLocalCLIClient):
                 self._notify_auth_failure(str(exc))
             raise
 
+        detected_conv = _extract_agy_conversation_id(proc.stdout or "")
+        if detected_conv:
+            self._record_session_id(detected_conv)
         self._notify_auth_success()
         resolved_model = detected_model or target_model
         cost_ud, saved_ud, full_uncached_ud = calculate_token_costs(
@@ -1360,6 +1461,8 @@ class LocalCLIRegistry:
         model: Optional[str] = None,
         enabled: bool = True,
         timeout_seconds: Optional[float] = None,
+        session_id: Optional[str] = None,
+        on_session_id: Optional[Callable[[str, Optional[str]], None]] = None,
     ) -> LLMClient:
         """Construct a hardened `LLMClient` wired with registry auth-failure tracking."""
         pid = (provider_id or "").strip().lower()
@@ -1400,6 +1503,8 @@ class LocalCLIRegistry:
                 probe_cache_ttl_seconds=ttl_int,
                 on_auth_failure=_on_fail,
                 on_auth_success=_on_ok,
+                session_id=session_id,
+                on_session_id=on_session_id,
             )
         if pid == "codex_cli":
             return CodexCLIClient(
@@ -1419,6 +1524,8 @@ class LocalCLIRegistry:
             probe_cache_ttl_seconds=ttl_int,
             on_auth_failure=_on_fail,
             on_auth_success=_on_ok,
+            session_id=session_id,
+            on_session_id=on_session_id,
         )
 
     def _get_version(self, provider_id: str, binary_path: str, *, force_refresh: bool = False) -> str:

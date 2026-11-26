@@ -2299,6 +2299,8 @@ export async function loadSettings() {
     setVal("set-wrapper-url", s.wrapper_base_url || "");
     setVal("set-wrapper-model", s.wrapper_model || "");
     setVal("set-wrapper-wire-api", s.wrapper_wire_api || "chat_completions");
+    const singleSessCb = $("set-wrapper-single-session");
+    if (singleSessCb) singleSessCb.checked = s.wrapper_single_session !== false;
     const cliCb = $("set-codex-cli-enabled");
     if (cliCb) cliCb.checked = Boolean(s.codex_cli_enabled);
     const wrBadge = $("wrapper-key-status-badge");
@@ -3442,6 +3444,7 @@ export function initVaultAndShell() {
           wrapper_base_url: $("set-wrapper-url").value.trim(),
           wrapper_model: $("set-wrapper-model").value.trim(),
           wrapper_wire_api: $("set-wrapper-wire-api").value,
+          wrapper_single_session: Boolean($("set-wrapper-single-session") ? $("set-wrapper-single-session").checked : true),
           codex_cli_enabled: $("set-codex-cli-enabled").checked,
         };
         const key = $("set-wrapper-key").value.trim();
@@ -3467,6 +3470,17 @@ export function initVaultAndShell() {
         setNodeIconText(out, res.ok ? "check" : "alert", formatAiTestReply(res));
       } catch (err) {
         setNodeIconText(out, "alert", err.message);
+      }
+    })
+  );
+  bindClick("btn-reset-ai-sessions", (e) =>
+    withBusy(e.currentTarget, async () => {
+      try {
+        await api("/api/v1/ai/sessions/reset", { method: "POST" });
+        toast("Started a fresh single AI session — next message will initialize one clean thread.");
+        await loadSettings();
+      } catch (err) {
+        toast(err.message || "Could not reset AI session.", true);
       }
     })
   );

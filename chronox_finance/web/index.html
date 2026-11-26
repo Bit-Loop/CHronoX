@@ -2060,12 +2060,17 @@
                   <input id="set-wrapper-model" type="text" placeholder="e.g. codex:default, agy:gemini-3.8-flash-low, qwen2.5" />
                 </label>
                 <label class="checkbox-row">
+                  <input id="set-wrapper-single-session" type="checkbox" checked />
+                  <span>Keep AI wrapper &amp; CLIs in one persistent session (no session history spam)</span>
+                </label>
+                <label class="checkbox-row">
                   <input id="set-codex-cli-enabled" type="checkbox" />
                   <span>Allow local Codex assistant</span>
                 </label>
                 <div class="row-gap wrap">
                   <button type="submit" class="btn btn-primary btn-sm">Save Gateway</button>
                   <button id="btn-test-wrapper" type="button" class="btn btn-soft btn-sm">Test Gateway</button>
+                  <button id="btn-reset-ai-sessions" type="button" class="btn btn-ghost btn-xs">Reset AI Session</button>
                   <button id="btn-preset-omc-wrapper" type="button" class="btn btn-ghost btn-xs">Use OMC :8788</button>
                   <button id="btn-clear-wrapper-key" type="button" class="btn btn-ghost btn-xs">Clear Key</button>
                 </div>
