@@ -1,18 +1,18 @@
 /**
- * ChronoX Finance — Stocks & Crypto Portfolio + Credit & Debt Factor Analysis (ES Module)
- * Pure zero-CDN DOM/SVG implementation:
- * Part A — Portfolio:
- * - Total Investments, Cost Basis, Unrealized P&L (tabular-nums, cost-basis coverage aware)
- * - Sharp asset-class allocation bars (Equities, ETFs, Crypto, Cash)
- * - Holdings ledger with exact 10^-8 quantity & sub-cent price formatting (e.g. $0.00002415)
- * - Live Quote Refresh, Manual Add/Delete, Broker CSV Import
- * - Direct Read-Only Broker Adapters (Coinbase CDP, Robinhood Crypto, Charles Schwab OAuth2 + 7-day countdown, Plaid Investments)
+ * ChronoX Finance — Investments Portfolio + Credit & Debt Analysis (ES Module)
+ * Pure local DOM/SVG implementation:
+ * Part A — Investments:
+ * - Total Investments, Cost Basis, Gain/Loss (tabular-nums, cost-basis coverage aware)
+ * - Asset-class allocation bar (Equities, ETFs, Crypto, Cash)
+ * - Holdings table with fractional share and micro-price formatting
+ * - Live Market Price Refresh, Manual Add/Delete, Broker CSV Import
+ * - Direct View-Only Broker Adapters (Coinbase, Robinhood Crypto, Charles Schwab, Plaid Investments)
  * Part B — Credit & Debt:
- * - Imported Actual Bureau Score card (never fabricated!)
- * - Credit Factor Analysis (FICO 8 + VantageScore 3.0 factor weights & utilization tiers)
- * - Chase 5/24 Velocity Gauge (all issuers + AU toggle + next slot drop-off date) + Inquiries (24m) & Derogatories (7y/10y)
- * - Official Credit Report Importer (structured form primary + AnnualCreditReport PDF mandatory review confirmation)
- * - Niche Advisor Alerts, AZEO Statement-Close Calendar, Debt Payoff Strategy Comparison, Credit Lines Manager & Balance Transfer Breakeven
+ * - Imported Actual Bureau Score card (never fabricated)
+ * - Score Factor Analysis (FICO 8 + VantageScore 3.0 weights & utilization tiers)
+ * - Recent Applications Velocity Gauge + Inquiries & Negative Marks drop-off dates
+ * - Credit Report Importer (structured entry + PDF review confirmation)
+ * - Credit Alerts, Statement-Close Payment Calendar, Debt Payoff Plans & Balance Transfer Check
  */
 
 import {
@@ -37,6 +37,7 @@ import {
   refreshAll,
   registerTabHook,
   registerRefreshHook,
+  renderEmptyState,
 } from "./core.js";
 
 const ASSET_CLASS_META = {
@@ -56,10 +57,10 @@ const portState = {
 };
 
 const CREDIT_API_HINTS = {
-  spinwheel: "Equifax credit score & full liabilities profile via Bearer API Key + Spinwheel User ID.",
-  array: "1B/3B Experian, Equifax & TransUnion JSON reports via Server Token + Report Key & Display Token.",
-  crs: "Direct Experian, Equifax & TransUnion pulls via CRS Username/Password JWT login or Bearer Token.",
-  custom: "Any ChronoX-compatible HTTPS or local loopback credit bridge returning structured score/report JSON.",
+  spinwheel: "Sync Equifax credit score and liabilities using your Spinwheel API key and user ID.",
+  array: "Sync Experian, Equifax, and TransUnion reports using your Array token and report key.",
+  crs: "Pull Experian, Equifax, and TransUnion snapshots with your CRS account credentials or token.",
+  custom: "Connect a custom HTTPS credit data endpoint that returns structured score and account JSON.",
 };
 
 function normalizeDerogatoryKind(raw) {
@@ -142,26 +143,25 @@ function renderSchwabBanner(connections) {
   const needsReauth = schwab.status === "needs_reauth" || (daysLeft != null && daysLeft <= 2);
   const msg =
     daysLeft == null
-      ? "Charles Schwab Trader API enforces a 7-day OAuth refresh token window. Re-authorize weekly to keep live positions synced."
+      ? "Charles Schwab requires weekly re-approval to keep live positions synced."
       : daysLeft <= 0
-      ? "Charles Schwab 7-day OAuth refresh token has EXPIRED — click Re-Authorize Schwab to resume position & quote sync."
-      : `Charles Schwab OAuth refresh expires in ${daysLeft} day${daysLeft === 1 ? "" : "s"} (7-day Trader API policy).`;
+      ? "Your Charles Schwab connection expired — re-approve to resume syncing positions and prices."
+      : `Your Charles Schwab connection renews in ${daysLeft} day${daysLeft === 1 ? "" : "s"}.`;
 
   const reauthBtn = el(
     "button",
     { type: "button", class: `btn ${needsReauth ? "btn-primary" : "btn-soft"} btn-xs` },
-    [makeIcon("key", "ui-icon-sm"), "Re-Authorize Schwab"]
+    [makeIcon("key", "ui-icon-sm"), "Reconnect Schwab"]
   );
   reauthBtn.addEventListener("click", () => openBrokerModal("schwab"));
 
   banner.classList.remove("hidden");
   banner.style.borderLeftColor = needsReauth ? "var(--crimson)" : "var(--amber)";
-  banner.style.borderTopColor = needsReauth ? "var(--crimson)" : "var(--amber)";
   banner.replaceChildren(
     el("div", { class: "rebal-row" }, [
       el("span", { class: "inline-icon-row small" }, [
         makeIcon("clock", "ui-icon-sm"),
-        el("strong", { text: "SCHWAB 7-DAY OAUTH COUNTDOWN:" }),
+        el("strong", { text: "Schwab 7-Day Renewal:" }),
         msg,
       ]),
       reauthBtn,
@@ -254,7 +254,21 @@ function renderPortfolioAllocation(allocations, totalVal) {
 
   if (totalVal <= 0) {
     wrap.replaceChildren(
-      el("div", { class: "muted small", text: "Add holdings manually, import a broker CSV, or connect a read-only adapter to inspect allocation." })
+      renderEmptyState({
+        icon: "pie",
+        title: "No investments tracked yet",
+        subtitle: "Add a holding, import a brokerage CSV, or connect a view-only brokerage below to see your allocation.",
+        actionLabel: "+ Add Holding",
+        onAction: () => {
+          const f = $("port-add-holding-form");
+          if (f) {
+            f.classList.remove("hidden");
+            f.scrollIntoView({ behavior: "smooth", block: "center" });
+            if ($("ph-symbol")) $("ph-symbol").focus();
+          }
+        },
+        compact: true,
+      })
     );
     return;
   }
@@ -298,12 +312,24 @@ function renderHoldingsTable(holdings) {
 
   if (!holdings.length) {
     wrap.replaceChildren(
-      el("div", { class: "item-box muted small", style: { margin: "10px" } }, [
-        el("span", { class: "inline-icon-row" }, [
-          makeIcon("briefcase", "ui-icon-sm"),
-          "No investment positions recorded yet. Click '+ Add Holding' or 'Import Broker CSV' above.",
-        ]),
-      ])
+      renderEmptyState({
+        icon: "briefcase",
+        title: "No holdings recorded yet",
+        subtitle: "Track stocks, ETFs, fractional shares, and crypto in one private view.",
+        actionLabel: "+ Add Holding",
+        onAction: () => {
+          const f = $("port-add-holding-form");
+          if (f) {
+            f.classList.remove("hidden");
+            if ($("ph-symbol")) $("ph-symbol").focus();
+          }
+        },
+        secondaryLabel: "Import Broker CSV",
+        onSecondary: () => {
+          const f = $("port-csv-import-form");
+          if (f) f.classList.remove("hidden");
+        },
+      })
     );
     return;
   }
@@ -397,30 +423,30 @@ function renderBrokerCards(connections) {
   const specs = [
     {
       key: "coinbase",
-      title: "Coinbase CDP",
-      tag: "READ-ONLY ENFORCED",
-      desc: "Ed25519/ES256 120s JWT. Calls /key_permissions on connect and REFUSES keys with trade or transfer scopes.",
+      title: "Coinbase",
+      tag: "View-Only",
+      desc: "View-only crypto balances and prices. ChronoX checks permissions and refuses any key with trade or transfer access.",
       conn: findConn("coinbase"),
     },
     {
       key: "robinhood",
       title: "Robinhood Crypto",
-      tag: "OFFICIAL ED25519 API",
-      desc: "Read-only signed requests to trading.robinhood.com for crypto holdings & quotes. Use Plaid/CSV for equities.",
+      tag: "View-Only",
+      desc: "Sync crypto holdings and live prices from Robinhood Crypto. Use Plaid or CSV for stock accounts.",
       conn: findConn("robinhood"),
     },
     {
       key: "schwab",
       title: "Charles Schwab",
-      tag: "BYOK OAUTH2 · 7D REFRESH",
-      desc: "Official Trader API positions & live equity quotes. Requires weekly MFA re-consent per Schwab 7-day policy.",
+      tag: "7-Day Sync",
+      desc: "Sync stock and ETF positions and live prices. Requires weekly sign-in renewal per Schwab policy.",
       conn: findConn("schwab"),
     },
     {
       key: "plaid_csv",
-      title: "Plaid Investments & CSV",
-      tag: "EQUITIES / 401K / IRA",
-      desc: "Sync brokerage equities via Plaid Hosted Link (/investments/holdings/get) or zero-3rd-party Broker CSV.",
+      title: "Plaid & Broker CSV",
+      tag: "Stocks / 401k / IRA",
+      desc: "Sync brokerage and retirement accounts through Plaid or import a holdings CSV directly on your device.",
       conn: findConn("plaid"),
     },
   ];
@@ -433,16 +459,16 @@ function renderBrokerCards(connections) {
             class: `pill ${sp.conn.status === "active" ? "pill-calm" : needsReauth ? "pill-danger" : "pill-watch"}`,
             text:
               sp.conn.status === "active"
-                ? "CONNECTED"
+                ? "Connected"
                 : needsReauth
-                ? "RECONNECT REQUIRED"
-                : sp.conn.status.replace(/_/g, " ").toUpperCase(),
+                ? "Reconnect Needed"
+                : sp.conn.status.replace(/_/g, " "),
           })
         : el("span", { class: "pill pill-soft", text: sp.tag });
 
       const actions = [];
       if (sp.key === "plaid_csv") {
-        const plaidBtn = el("button", { type: "button", class: "btn btn-soft btn-xs", text: "Open Plaid Link" });
+        const plaidBtn = el("button", { type: "button", class: "btn btn-soft btn-xs", text: "Connect via Plaid" });
         plaidBtn.addEventListener("click", () => switchTab("settings"));
         const csvBtn = el("button", { type: "button", class: "btn btn-primary btn-xs", text: "Import CSV" });
         csvBtn.addEventListener("click", () => {
@@ -457,7 +483,7 @@ function renderBrokerCards(connections) {
         const connBtn = el("button", {
           type: "button",
           class: "btn btn-primary btn-xs",
-          text: sp.conn ? "Configure / Re-Auth" : "Connect",
+          text: sp.conn ? "Reconnect" : "Connect",
         });
         connBtn.addEventListener("click", () => openBrokerModal(sp.key));
         actions.push(connBtn);
@@ -504,25 +530,25 @@ function openBrokerModal(brokerKey) {
   if (!modal || !title || !body) return;
 
   if (brokerKey === "coinbase") {
-    title.textContent = "Connect Coinbase CDP (Read-Only Enforced)";
+    title.textContent = "Connect Coinbase (View-Only)";
     const form = el("form", { class: "stack-sm" }, [
       el("div", { class: "notice-bar" }, [
         makeIcon("shield", "ui-icon-sm"),
-        "ChronoX verifies /api/v3/brokerage/key_permissions and automatically REFUSES keys with trade or transfer access.",
+        "ChronoX verifies key permissions on connect and rejects any key that can place trades or transfer funds.",
       ]),
       el("label", { class: "field" }, [
-        el("span", { text: "CDP API Key Name" }),
+        el("span", { text: "Coinbase API Key Name" }),
         el("input", { name: "api_key_name", type: "text", placeholder: "organizations/.../apiKeys/...", required: true }),
       ]),
       el("label", { class: "field" }, [
-        el("span", { text: "Private Key PEM (sealed in secrets.enc)" }),
+        el("span", { text: "Private Key (stored privately on your device)" }),
         el("textarea", { name: "private_key_pem", rows: "4", placeholder: "-----BEGIN EC PRIVATE KEY-----", required: true }),
       ]),
       el("label", { class: "field" }, [
         el("span", { text: "Connection Label" }),
         el("input", { name: "label", type: "text", value: "Coinbase" }),
       ]),
-      el("button", { type: "submit", class: "btn btn-primary", text: "Verify Read-Only & Connect" }),
+      el("button", { type: "submit", class: "btn btn-primary", text: "Verify View-Only & Connect" }),
     ]);
     form.addEventListener("submit", async (ev) => {
       ev.preventDefault();
@@ -538,7 +564,7 @@ function openBrokerModal(brokerKey) {
             }),
           });
           closeOverlay(modal);
-          toast("Coinbase read-only connection verified & sealed in vault.");
+          toast("Coinbase view-only connection saved.");
           await loadPortfolio();
         } catch (err) {
           toast(err.message || "Coinbase connection rejected.", true);
@@ -547,25 +573,25 @@ function openBrokerModal(brokerKey) {
     });
     body.replaceChildren(form);
   } else if (brokerKey === "robinhood") {
-    title.textContent = "Connect Robinhood Crypto (Read-Only Ed25519)";
+    title.textContent = "Connect Robinhood Crypto (View-Only)";
     const form = el("form", { class: "stack-sm" }, [
       el("div", { class: "notice-bar" }, [
         makeIcon("shield", "ui-icon-sm"),
-        "Uses official Robinhood Crypto API with Ed25519 request signing. Strictly read-only — zero order placement.",
+        "Uses the official Robinhood Crypto API strictly for viewing balances and quotes — never places orders.",
       ]),
       el("label", { class: "field" }, [
         el("span", { text: "Robinhood Crypto API Key" }),
         el("input", { name: "api_key", type: "text", placeholder: "rh-api-...", required: true }),
       ]),
       el("label", { class: "field" }, [
-        el("span", { text: "Ed25519 Private Key (Base64, sealed in secrets.enc)" }),
+        el("span", { text: "Private Key (stored privately on your device)" }),
         el("input", { name: "private_key_b64", type: "password", autocomplete: "off", required: true }),
       ]),
       el("label", { class: "field" }, [
         el("span", { text: "Connection Label" }),
         el("input", { name: "label", type: "text", value: "Robinhood Crypto" }),
       ]),
-      el("button", { type: "submit", class: "btn btn-primary", text: "Connect Read-Only Crypto" }),
+      el("button", { type: "submit", class: "btn btn-primary", text: "Connect Robinhood Crypto" }),
     ]);
     form.addEventListener("submit", async (ev) => {
       ev.preventDefault();
@@ -581,7 +607,7 @@ function openBrokerModal(brokerKey) {
             }),
           });
           closeOverlay(modal);
-          toast("Robinhood Crypto read-only adapter connected.");
+          toast("Robinhood Crypto connected.");
           await loadPortfolio();
         } catch (err) {
           toast(err.message || "Robinhood Crypto connection failed.", true);
@@ -590,19 +616,19 @@ function openBrokerModal(brokerKey) {
     });
     body.replaceChildren(form);
   } else if (brokerKey === "schwab") {
-    title.textContent = "Connect Charles Schwab Trader API (BYOK OAuth2)";
+    title.textContent = "Connect Charles Schwab";
     const statusOut = el("div", { class: "notice-bar hidden" });
     const form = el("form", { class: "stack-sm" }, [
       el("div", { class: "notice-bar notice-warn" }, [
         makeIcon("clock", "ui-icon-sm"),
-        "Optional BYOK connector. ChronoX opens an ephemeral loopback HTTPS listener for your registered 127.0.0.1 callback, or you can paste the redirected URL below.",
+        "Optional Charles Schwab connector. Sign in via your browser after entering your Schwab app credentials.",
       ]),
       el("label", { class: "field" }, [
-        el("span", { text: "Schwab App Key (Client ID)" }),
+        el("span", { text: "Schwab App Key" }),
         el("input", { name: "client_id", type: "text", required: true }),
       ]),
       el("label", { class: "field" }, [
-        el("span", { text: "Schwab App Secret (sealed in secrets.enc)" }),
+        el("span", { text: "Schwab App Secret (stored privately on your device)" }),
         el("input", { name: "client_secret", type: "password", autocomplete: "off", required: true }),
       ]),
       el("label", { class: "field" }, [
@@ -618,22 +644,22 @@ function openBrokerModal(brokerKey) {
         el("span", { text: "Connection Label" }),
         el("input", { name: "label", type: "text", value: "Charles Schwab" }),
       ]),
-      el("button", { type: "submit", class: "btn btn-primary", text: "Generate OAuth2 Authorize URL" }),
+      el("button", { type: "submit", class: "btn btn-primary", text: "Continue to Schwab Sign-In" }),
     ]);
 
     const completeForm = el("form", { class: "subpanel stack-xs details-spacer" }, [
-      el("span", { class: "eyebrow", text: "FALLBACK: PASTE REDIRECT URL OR CODE" }),
+      el("span", { class: "eyebrow", text: "Manual Completion (Fallback)" }),
       el("p", {
         class: "muted small",
-        text: "If your browser warns on the local self-signed HTTPS loopback certificate, copy the full redirected https://127.0.0.1:... URL from the address bar and paste it here:",
+        text: "If your browser does not return automatically after approving Schwab, paste the redirected URL here:",
       }),
       el("input", {
         name: "callback_url_or_code",
         type: "text",
-        placeholder: "https://127.0.0.1:8787/api/v1/brokers/schwab/callback?code=...&state=...",
+        placeholder: "Paste redirected callback URL or authorization code...",
         required: true,
       }),
-      el("button", { type: "submit", class: "btn btn-soft btn-xs", text: "Complete Schwab Authorization" }),
+      el("button", { type: "submit", class: "btn btn-soft btn-xs", text: "Complete Schwab Sign-In" }),
     ]);
 
     form.addEventListener("submit", async (ev) => {
@@ -653,30 +679,30 @@ function openBrokerModal(brokerKey) {
           const authUrl = res && (res.authorize_url || res.authorization_url || res.auth_url);
           const listenerNote =
             res && (res.callback_listener_active || res.loopback_tls_listener)
-              ? `Local HTTPS callback listener active at ${res.redirect_uri || "127.0.0.1"}.`
-              : "Paste the redirected callback URL below after approving Schwab consent.";
+              ? "Waiting for Schwab sign-in to complete in your browser."
+              : "Paste the redirected URL below after approving Schwab sign-in.";
           statusOut.classList.remove("hidden");
           if (authUrl) {
             statusOut.replaceChildren(
               el("div", { class: "stack-xs" }, [
-                el("strong", { text: "Schwab OAuth2 Ready — Open in System Browser:" }),
+                el("strong", { text: "Schwab Sign-In Ready" }),
                 el("div", { class: "small muted", text: listenerNote }),
                 el("a", {
                   href: authUrl,
                   target: "_blank",
                   rel: "noopener noreferrer",
                   class: "btn btn-soft btn-xs",
-                  text: "Launch Schwab MFA Consent ->",
+                  text: "Open Schwab Sign-In →",
                 }),
               ])
             );
           } else {
-            statusOut.textContent = "Schwab credentials sealed. Complete OAuth callback to activate 7-day sync.";
+            statusOut.textContent = "Schwab credentials saved. Complete sign-in to activate syncing.";
           }
-          toast("Schwab BYOK configuration saved.");
+          toast("Charles Schwab configuration saved.");
           await loadPortfolio();
         } catch (err) {
-          toast(err.message || "Could not initialize Schwab OAuth.", true);
+          toast(err.message || "Could not start Schwab sign-in.", true);
         }
       });
     });
@@ -694,11 +720,11 @@ function openBrokerModal(brokerKey) {
             }),
           });
           closeOverlay(modal);
-          toast("Charles Schwab OAuth2 completed & positions ready to sync.");
+          toast("Charles Schwab connected and ready to sync.");
           await loadPortfolio();
           await refreshAll();
         } catch (err) {
-          toast(err.message || "Could not complete Schwab OAuth exchange.", true);
+          toast(err.message || "Could not complete Schwab authorization.", true);
         }
       });
     });
@@ -865,10 +891,10 @@ function renderFactorAnalysis(rep) {
   });
 
   const statusMeta = {
-    optimal: { cls: "pill-calm", color: "var(--primary)", fill: 96 },
-    good: { cls: "pill-blue", color: "var(--cyan)", fill: 76 },
-    fair: { cls: "pill-watch", color: "var(--amber)", fill: 50 },
-    drag: { cls: "pill-danger", color: "var(--crimson)", fill: 24 },
+    optimal: { cls: "pill-calm", label: "Optimal", color: "var(--primary)", fill: 96 },
+    good: { cls: "pill-blue", label: "Good", color: "var(--cyan)", fill: 76 },
+    fair: { cls: "pill-watch", label: "Fair", color: "var(--amber)", fill: 50 },
+    drag: { cls: "pill-danger", label: "Needs Work", color: "var(--crimson)", fill: 24 },
   };
 
   const factorRows = factors.length
@@ -878,13 +904,13 @@ function renderFactorAnalysis(rep) {
           el("div", { class: "item-row" }, [
             el("span", { class: "row-gap", style: { gap: "6px" } }, [
               el("strong", { text: f.label }),
-              el("span", { class: "pill pill-soft", text: `${f.weight_pct}% WEIGHT` }),
+              el("span", { class: "pill pill-soft", text: `${f.weight_pct}% weight` }),
             ]),
             el("span", { class: "row-gap", style: { gap: "6px" } }, [
               f.guidance
                 ? el("span", { class: "muted small tabular-nums", text: f.guidance })
                 : null,
-              el("span", { class: `pill ${sm.cls}`, text: String(f.status || "fair").toUpperCase() }),
+              el("span", { class: `pill ${sm.cls}`, text: sm.label }),
             ]),
           ]),
           el("div", { class: "progress-track", style: { height: "5px" } }, [
@@ -1257,7 +1283,7 @@ function renderAzeoCalendar(azeoPlan) {
   if (!azeoBox) return;
   if (!azeoPlan.length) {
     azeoBox.replaceChildren(
-      el("p", { class: "small muted", text: "Add a credit card with a credit limit below to compute exact AZEO statement-close dates." })
+      el("p", { class: "small muted", text: "Add a credit card with a credit limit below to see exact statement-close payment dates." })
     );
     return;
   }
@@ -1265,10 +1291,10 @@ function renderAzeoCalendar(azeoPlan) {
     ...azeoPlan.map((a) => {
       const roleBadge =
         a.role === "already_optimal"
-          ? el("span", { class: "pill pill-calm", text: "OPTIMAL" })
+          ? el("span", { class: "pill pill-calm", text: "Optimal" })
           : a.role === "primary_reporting_card"
-          ? el("span", { class: "pill pill-blue", text: "PRIMARY 1-4.9%" })
-          : el("span", { class: "pill pill-watch", text: "ZERO BEFORE CLOSE" });
+          ? el("span", { class: "pill pill-blue", text: "Keep 1–4.9%" })
+          : el("span", { class: "pill pill-watch", text: "Pay to $0" });
 
       let payBtn = null;
       if (a.pay_before_close_cents > 0) {
@@ -1284,7 +1310,7 @@ function renderAzeoCalendar(azeoPlan) {
               method: "PATCH",
               body: JSON.stringify({ balance_cents: nextBal }),
             });
-            toast(`Recorded AZEO paydown on ${a.card_name}.`);
+            toast(`Recorded paydown on ${a.card_name}.`);
             await loadCreditReport();
             await refreshAll();
           })
@@ -1296,7 +1322,7 @@ function renderAzeoCalendar(azeoPlan) {
         el("div", { class: "small", text: a.explanation }),
         el("div", {
           class: "muted small tabular-nums",
-          text: `Pay by ${a.pay_by_date} · Closes ${a.statement_close_date} -> reports ${Number(a.resulting_util_pct || 0).toFixed(1)}%`,
+          text: `Pay by ${a.pay_by_date} · Closes ${a.statement_close_date} → reports ${Number(a.resulting_util_pct || 0).toFixed(1)}%`,
         }),
         payBtn ? el("div", { class: "row-gap" }, [payBtn]) : null,
       ]);
@@ -1311,7 +1337,7 @@ function renderDebtStrategies(strategies) {
     stratGrid.replaceChildren(
       el("div", { class: "item-box muted inline-icon-row" }, [
         makeIcon("trophy", "ui-icon-sm"),
-        "Zero active debt balances.",
+        "No active debt balances.",
       ])
     );
     return;
@@ -1322,13 +1348,13 @@ function renderDebtStrategies(strategies) {
         "article",
         {
           class: "jar-card",
-          style: st.recommended_for_adhd ? { borderTopColor: "var(--primary)", borderColor: "var(--primary-border)" } : {},
+          style: st.recommended_for_adhd ? { borderColor: "var(--primary-border)" } : {},
         },
         [
           el("div", { class: "jar-top" }, [
-            el("strong", { text: st.label }),
+            el("strong", { class: "jar-name-text", text: st.label }),
             st.recommended_for_adhd
-              ? el("span", { class: "pill pill-calm" }, [makeIcon("star", "ui-icon-sm"), "RECOMMENDED"])
+              ? el("span", { class: "pill pill-calm" }, [makeIcon("star", "ui-icon-sm"), "Recommended"])
               : null,
           ]),
           el("div", { class: "small muted", text: st.tagline }),
@@ -1373,8 +1399,8 @@ function renderCreditLines(lines) {
           text: `Autopay: ${cl.autopay_mode}`,
         }),
       ];
-      if (cl.is_oldest_account) pills.push(el("span", { class: "pill pill-blue", text: "OLDEST ANCHOR" }));
-      if (cl.is_authorized_user) pills.push(el("span", { class: "pill pill-watch", text: "AU CARD" }));
+      if (cl.is_oldest_account) pills.push(el("span", { class: "pill pill-blue", text: "Oldest Account" }));
+      if (cl.is_authorized_user) pills.push(el("span", { class: "pill pill-watch", text: "Authorized User" }));
       if (cl.promo_days_remaining != null && cl.promo_days_remaining >= 0) {
         pills.push(el("span", { class: "pill pill-watch", text: `0% ends ${cl.promo_days_remaining}d` }));
       }
@@ -1431,7 +1457,7 @@ function renderCreditLines(lines) {
 }
 
 /* ============================================================================
-   PART C: OPTIONAL BYOK CREDIT SCORE APIS (Spinwheel / Array / CRS / Custom)
+   PART C: OPTIONAL AUTOMATIC CREDIT BUREAU SYNC (Spinwheel / Array / CRS / Custom)
    ============================================================================ */
 
 function setCreditApiStatus(message, isError = false) {
@@ -1574,7 +1600,7 @@ function renderCreditApis(data) {
         withBusy(delBtn, async () => {
           try {
             await api(`/api/v1/credit/apis/${c.id}`, { method: "DELETE" });
-            setCreditApiStatus(`Disconnected ${c.institution} and purged sealed credentials.`);
+            setCreditApiStatus(`Disconnected ${c.institution} and removed saved credentials.`);
             toast(`Disconnected ${c.institution}.`);
             await loadCreditApis();
           } catch (err) {
@@ -1836,7 +1862,7 @@ export function initPortfolioAndCredit() {
     });
   }
 
-  // --- Optional BYOK Credit Score APIs ---
+  // --- Optional Credit Bureau APIs ---
   const capiVendor = $("capi-vendor");
   if (capiVendor) {
     capiVendor.addEventListener("change", updateCreditApiFormFields);
@@ -1874,7 +1900,7 @@ export function initPortfolioAndCredit() {
           if ($("capi-vendor")) $("capi-vendor").value = vendor;
           updateCreditApiFormFields();
           const label = (res && res.connection && res.connection.institution) || vendor.toUpperCase();
-          setCreditApiStatus(`Sealed ${label} credentials in secrets.enc. Click Sync Score & Tradelines to pull live bureau data.`);
+          setCreditApiStatus(`Saved ${label} credentials privately on your device. Click Sync Score & Tradelines to pull live bureau data.`);
           toast(`Connected Credit Score API: ${label}.`);
           await loadCreditApis();
         } catch (err) {

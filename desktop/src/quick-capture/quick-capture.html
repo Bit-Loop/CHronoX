@@ -63,23 +63,23 @@
           type="text"
           autocomplete="off"
           spellcheck="false"
-          placeholder='"coffee 6.50", "paycheck +2450", or "impulse 189"'
-          aria-label="Quick capture expense, income, or impulse"
+          placeholder='Say or log anything: "Spent $5.75 on coffee because early flight" or "Can I afford $400?"'
+          aria-label="Say or log an expense, transfer, question, or command"
           maxlength="500"
         />
 
         <span id="intent-tag" class="intent-tag hidden"></span>
 
-        <button id="btn-submit" type="submit" class="submit-btn" aria-label="Log entry">
-          <span id="btn-submit-label">LOG</span>
+        <button id="btn-submit" type="submit" class="submit-btn" aria-label="Send entry">
+          <span id="btn-submit-label">Send</span>
         </button>
       </form>
 
-      <div class="chips-row" role="group" aria-label="One-tap quick entries">
-        <span class="chips-label">ONE-TAP</span>
-        <button type="button" class="chip" data-quick="coffee 6.50"><span>Coffee $6.50</span></button>
-        <button type="button" class="chip" data-quick="groceries 65"><span>Groceries $65</span></button>
-        <button type="button" class="chip" data-quick="gas 45"><span>Gas $45</span></button>
+      <div class="chips-row" role="group" aria-label="Quick prompts">
+        <span class="chips-label">Prompts</span>
+        <button type="button" class="chip" data-quick="I spent $"><span>Log Expense</span></button>
+        <button type="button" class="chip" data-quick="Put $ in savings"><span>Save Money</span></button>
+        <button type="button" class="chip" data-quick="Can I afford "><span>Ask Coach</span></button>
         <button type="button" class="chip chip-cool" data-quick="impulse "><span>Park Impulse</span></button>
       </div>
 

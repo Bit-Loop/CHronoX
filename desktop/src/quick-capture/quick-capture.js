@@ -173,7 +173,7 @@
     clearCloseTimer();
     isSubmitting = false;
     btnSubmit.disabled = false;
-    elSubmitLabel.textContent = "Log";
+    elSubmitLabel.textContent = "Send";
 
     if (statePayload && typeof statePayload === "object") {
       if (statePayload.theme) {
@@ -220,10 +220,18 @@
 
   function showConfirmation(result) {
     clearCloseTimer();
-    lastResultKind = result && result.kind === "impulse" ? "impulse" : "transaction";
+    const intentKind = String((result && (result.intentKind || result.kind)) || "transaction");
+    lastResultKind = intentKind === "impulse" ? "impulse" : intentKind;
 
-    elConfirmKicker.textContent =
-      lastResultKind === "impulse" ? "Parked in Cooling-Off Vault" : "Logged to ChronoX";
+    if (lastResultKind === "impulse") {
+      elConfirmKicker.textContent = "Parked in Impulse Vault";
+    } else if (lastResultKind === "question_advice") {
+      elConfirmKicker.textContent = "AI Coach Answer";
+    } else if (result && result.requiresConfirmation) {
+      elConfirmKicker.textContent = "Review Changes in ChronoX";
+    } else {
+      elConfirmKicker.textContent = "Saved to ChronoX";
+    }
 
     const cleanMsg = sanitizeText(result && result.message);
     elConfirmMessage.textContent = cleanMsg || "Saved and synced with your budget.";
@@ -257,32 +265,42 @@
     elCaptureView.classList.add("hidden");
     elConfirmView.classList.remove("hidden");
 
-    // Restart 950ms linear countdown bar smoothly
+    // Advice or confirmation replies stay open longer so the user can read them calmly
+    const isReadingReply =
+      lastResultKind === "question_advice" || Boolean(result && result.requiresConfirmation);
     elConfirmProgress.classList.remove("running");
-    void elConfirmProgress.offsetWidth;
-    elConfirmProgress.classList.add("running");
-
-    closeTimer = window.setTimeout(() => {
-      closeTimer = null;
-      hideHud();
-    }, AUTO_CLOSE_MS);
+    if (!isReadingReply) {
+      void elConfirmProgress.offsetWidth;
+      elConfirmProgress.classList.add("running");
+      closeTimer = window.setTimeout(() => {
+        closeTimer = null;
+        hideHud();
+      }, AUTO_CLOSE_MS);
+    }
   }
 
   async function submitViaFallbackApi(text) {
     if (!backendUrl) {
       return { ok: false, error: "Desktop bridge unavailable in standalone preview." };
     }
-    const resp = await fetch(`${backendUrl}/api/v1/quick-add`, {
+    let resp = await fetch(`${backendUrl}/api/v1/ai/say`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, auto_commit: true }),
     });
+    if (resp.status === 404) {
+      resp = await fetch(`${backendUrl}/api/v1/quick-add`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+    }
     if (resp.status === 401) {
-      return { ok: false, locked: true, error: "ChronoX Vault is locked — unlock the main window first." };
+      return { ok: false, locked: true, error: "ChronoX is locked — unlock the main window first." };
     }
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {
-      return { ok: false, error: data.detail || "Could not parse quick-add entry." };
+      return { ok: false, error: data.detail || "Could not process entry." };
     }
 
     let dailySafeCents = null;
@@ -304,8 +322,10 @@
 
     return {
       ok: true,
-      kind: data.kind || "transaction",
-      message: data.message || "Logged to ChronoX Finance",
+      kind: data.intent_kind || data.kind || "transaction",
+      intentKind: data.intent_kind || data.kind || "transaction",
+      requiresConfirmation: Boolean(data.requires_confirmation),
+      message: data.assistant_message || data.message || "Saved to ChronoX",
       dailySafeCents,
       safeToSpendCents,
       daysUntilPayday,
@@ -316,7 +336,7 @@
     if (isSubmitting) return;
     const text = String(rawText !== undefined ? rawText : elInput.value).trim();
     if (!text) {
-      showError('Type an entry like "coffee 6.50" or "impulse 189 keyboard".');
+      showError('Try "Spent $5.75 on coffee because early flight" or "Can I afford $400?".');
       elInput.focus();
       return;
     }
@@ -324,7 +344,7 @@
     clearError();
     isSubmitting = true;
     btnSubmit.disabled = true;
-    elSubmitLabel.textContent = "Saving";
+    elSubmitLabel.textContent = "Working";
 
     try {
       const result =
@@ -336,7 +356,7 @@
         showConfirmation(result);
       } else {
         showError(
-          (result && result.error) || "Could not parse quick-add entry.",
+          (result && result.error) || "Could not process entry.",
           { locked: Boolean(result && result.locked) }
         );
         focusInputAtEnd();
@@ -347,7 +367,7 @@
     } finally {
       isSubmitting = false;
       btnSubmit.disabled = false;
-      elSubmitLabel.textContent = "Log";
+      elSubmitLabel.textContent = "Send";
     }
   }
 
@@ -368,7 +388,7 @@
       clearError();
       updateIntentVisuals(value);
       focusInputAtEnd();
-      if (!value.endsWith(" ")) {
+      if (/\d/.test(value) && !value.endsWith(" ")) {
         void handleSubmit(value);
       }
     });

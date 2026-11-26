@@ -25,6 +25,7 @@ import {
   checkVaultBootStatus,
   initVaultAndShell,
   loadEmailQueue,
+  loadLocalAiClis,
   loadSettings,
   loadTransactions,
   loadWeeklyReset,
@@ -97,6 +98,7 @@ function bindGlobalShellControls() {
     }
     if (btn.dataset.setProvider) {
       await setPreferredProvider(btn.dataset.setProvider);
+      loadLocalAiClis(false);
     }
   });
 }

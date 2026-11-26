@@ -301,17 +301,22 @@ function isAllowedBackendUrl(targetUrl) {
   }
 }
 
-function openExternalHttps(rawUrl) {
-  if (typeof rawUrl !== "string") return false;
+async function openExternalHttps(rawUrl) {
+  if (typeof rawUrl !== "string") {
+    return { ok: false, error: "Invalid external URL." };
+  }
   try {
     const parsed = new URL(rawUrl);
     if (parsed.protocol !== "https:") {
-      return false;
+      return { ok: false, error: "Only HTTPS external links are permitted." };
     }
-    shell.openExternal(parsed.toString()).catch(() => {});
-    return true;
-  } catch {
-    return false;
+    await shell.openExternal(parsed.toString());
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err && err.message ? String(err.message) : String(err || "Could not open browser."),
+    };
   }
 }
 
@@ -409,6 +414,8 @@ async function backendRequest(method, apiPath, bodyObj = null) {
     headers["Content-Length"] = Buffer.byteLength(payload, "utf8");
   }
 
+  const reqTimeoutMs = apiPath.startsWith("/api/v1/ai/") ? 28000 : 8000;
+
   return new Promise((resolve, reject) => {
     const req = http.request(
       {
@@ -417,7 +424,7 @@ async function backendRequest(method, apiPath, bodyObj = null) {
         path: apiPath,
         method,
         headers,
-        timeout: 8000,
+        timeout: reqTimeoutMs,
       },
       (res) => {
         let raw = "";
@@ -1200,9 +1207,9 @@ function registerIpcHandlers() {
     }
   });
 
-  ipcMain.handle("desktop:openExternal", (event, url) => {
+  ipcMain.handle("desktop:openExternal", async (event, url) => {
     assertMainSender(event);
-    return { ok: openExternalHttps(url) };
+    return openExternalHttps(url);
   });
 
   // --- Native OS File Dialogs ---
@@ -1265,8 +1272,15 @@ function registerIpcHandlers() {
     assertMainSender(event);
     if (!mainWindow || mainWindow.isDestroyed()) return { canceled: true };
     const opts = options && typeof options === "object" ? options : {};
+    const isBinary = Boolean(opts.isBinary && typeof opts.contentBase64 === "string");
+    let rawBuffer = null;
     const content = typeof opts.content === "string" ? opts.content : "";
-    if (Buffer.byteLength(content, "utf8") > MAX_SAVE_BYTES) {
+    if (isBinary) {
+      rawBuffer = Buffer.from(opts.contentBase64, "base64");
+      if (rawBuffer.length > MAX_SAVE_BYTES) {
+        return { canceled: false, error: "Export payload exceeds maximum size limit." };
+      }
+    } else if (Buffer.byteLength(content, "utf8") > MAX_SAVE_BYTES) {
       return { canceled: false, error: "Export payload exceeds maximum size limit." };
     }
 
@@ -1284,13 +1298,15 @@ function registerIpcHandlers() {
               extensions: f.extensions.filter((e) => typeof e === "string").slice(0, 12),
             }))
         : [
-            { name: "JSON Backup", extensions: ["json"] },
+            { name: "Apple Numbers / Excel Workbook", extensions: ["xlsx"] },
             { name: "CSV Spreadsheet", extensions: ["csv"] },
+            { name: "ZIP Archive", extensions: ["zip"] },
+            { name: "JSON Backup", extensions: ["json"] },
             { name: "All Files", extensions: ["*"] },
           ];
 
     const result = await dialog.showSaveDialog(mainWindow, {
-      title: "Save ChronoX File",
+      title: "Save ChronoX Export",
       defaultPath: path.join(app.getPath("documents"), defaultName),
       filters,
     });
@@ -1300,7 +1316,11 @@ function registerIpcHandlers() {
     }
 
     try {
-      fs.writeFileSync(result.filePath, content, "utf8");
+      if (isBinary && rawBuffer) {
+        fs.writeFileSync(result.filePath, rawBuffer);
+      } else {
+        fs.writeFileSync(result.filePath, content, "utf8");
+      }
       return { canceled: false, filePath: result.filePath };
     } catch (err) {
       return { canceled: false, error: `Could not save file: ${err.message}` };
@@ -1413,38 +1433,50 @@ function registerIpcHandlers() {
     assertHudSender(event);
     const text = String(rawText || "").trim();
     if (!text) {
-      return { ok: false, error: "Type a quick expense, income, or impulse first." };
+      return { ok: false, error: "Type a quick expense, income, question, or command first." };
     }
     if (text.length > 500) {
-      return { ok: false, error: "Quick-add entry is too long (max 500 characters)." };
+      return { ok: false, error: "Entry is too long (max 500 characters)." };
     }
 
     try {
-      const res = await backendRequest("POST", "/api/v1/quick-add", { text });
+      let res = await backendRequest("POST", "/api/v1/ai/say", { text, auto_commit: true });
+      if (res.status === 404) {
+        res = await backendRequest("POST", "/api/v1/quick-add", { text });
+      }
       if (res.status === 401) {
         applySnapshotUpdate({ locked: true, dailySafe: null, dailySafeCents: null });
         showMainWindow();
         return {
           ok: false,
           locked: true,
-          error: "ChronoX Vault is locked — unlock the main window first.",
+          error: "ChronoX is locked — unlock the main window first.",
         };
       }
       if (res.status < 200 || res.status >= 300) {
-        const detail = (res.data && res.data.detail) || "Could not parse quick-add entry.";
+        const detail = (res.data && res.data.detail) || "Could not process entry.";
         return { ok: false, error: String(detail) };
       }
 
+      const data = res.data || {};
+      const intentKind = String(data.intent_kind || data.kind || "transaction");
+      const displayMsg = String(data.assistant_message || data.message || "Saved to ChronoX");
       const updatedSnap = await fetchLiveDashboardSnapshot();
+
       sendToMain("chronox:refresh", {
         source: "quick-capture-hud",
-        message: res.data && res.data.message ? String(res.data.message) : "Logged from Quick Capture",
+        message: displayMsg,
+        intentKind,
       });
 
       return {
         ok: true,
-        kind: (res.data && res.data.kind) || "transaction",
-        message: (res.data && res.data.message) || "Logged to ChronoX Finance",
+        kind: intentKind,
+        intentKind,
+        executed: Boolean(data.executed !== undefined ? data.executed : true),
+        requiresConfirmation: Boolean(data.requires_confirmation),
+        batchId: data.batch_id || null,
+        message: displayMsg,
         dailySafeCents: updatedSnap ? updatedSnap.dailySafeCents : liveSnapshot.dailySafeCents,
         safeToSpendCents: updatedSnap ? updatedSnap.safeToSpendCents : liveSnapshot.safeToSpendCents,
         daysUntilPayday: updatedSnap ? updatedSnap.daysUntilPayday : liveSnapshot.daysUntilPayday,

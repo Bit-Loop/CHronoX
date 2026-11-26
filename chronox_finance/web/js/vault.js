@@ -1,13 +1,14 @@
 /**
- * ChronoX Finance — Vault Gate, Onboarding, Command, Activity/Splits/Bills & Connectors Module
- * Handles mandatory envelope-encrypted launch lock, 1-time Recovery Key 4-word verify,
- * 3-track first-run onboarding, Command dashboard, 2-year ledger with Splits/Tags/Comments,
- * Plaid Hosted Link / SimpleFIN / IMAP Email Scanner, and Multi-Provider AI settings.
+ * ChronoX Finance — Security Lock, Onboarding, Overview, Activity, Exports, Local AI & Bank Sync Module
+ * Handles local passcode setup & recovery, first-run onboarding, Overview dashboard,
+ * 2-year ledger with Splits/Tags/Notes, Export Studio, Automagic Local AI detection,
+ * and 1-click Plaid / SimpleFIN bank connections.
  */
 
 import {
   $,
   HERO_RING_CIRCUMFERENCE,
+  PROVIDER_DISPLAY_NAMES,
   animateMoney,
   animatePercent,
   api,
@@ -17,10 +18,12 @@ import {
   closeOverlay,
   dispatchDashboardHooks,
   dollarsToCents,
+  downloadExportFile,
   el,
   fmtMoney,
   fmtShortDate,
   getDesktopBridge,
+  invokeSayHandler,
   isoDateOffset,
   jarIconKey,
   makeIcon,
@@ -30,6 +33,7 @@ import {
   pushTraySnapshot,
   refreshAll,
   registerTabHook,
+  renderEmptyState,
   setCsrfToken,
   setNodeIconText,
   setVaultGateHandler,
@@ -45,13 +49,17 @@ import {
 
 let _pendingRecoveryData = null;
 let _plaidPollTimer = null;
+let _plaidBackfillTimer = null;
+let _plaidBackfillTicks = 0;
+let _plaidPendingState = null;
+let _localClisData = null;
 let _onUnlockedCallback = null;
 let _activeSplitsDraft = [];
 let _activeTagsDraft = [];
 let _activeTxObj = null;
 
 /* ============================================================================
-   1. MANDATORY LAUNCH VAULT GATE (Setup -> 4-Word Verify -> Unlock -> Recover)
+   1. MANDATORY LAUNCH SECURITY GATE (Setup -> Recovery Verify -> Unlock -> Reset)
    ============================================================================ */
 
 function showVaultPane(paneName) {
@@ -67,21 +75,22 @@ function showVaultPane(paneName) {
   const title = $("vault-gate-title");
   if (title) {
     const titles = {
-      setup: "INITIALIZE ENCRYPTED VAULT",
-      verify: "RECORD ONE-TIME RECOVERY KEY",
-      unlock: "CHRONOX VAULT LOCKED",
-      recover: "RECOVER VAULT WITH RECOVERY KEY",
+      setup: "Create Master Passcode",
+      verify: "Save Your Backup Recovery Key",
+      unlock: "Unlock ChronoX",
+      recover: "Reset Master Passcode",
     };
-    title.textContent = titles[paneName] || "CHRONOX VAULT LOCKED";
+    title.textContent = titles[paneName] || "Unlock ChronoX";
   }
 }
 
 export function openVaultGate(mode = "locked", reason = "") {
   clearBootSkeletons();
   stopPlaidPolling();
+  stopPlaidBackfillPolling();
   const normalized = mode === "needs_setup" ? "setup" : mode === "recover" ? "recover" : "unlock";
   state.vaultStatus = mode === "needs_setup" ? "needs_setup" : "locked";
-  setVaultTitlebarState("locked", mode === "needs_setup" ? "VAULT SETUP" : "VAULT LOCKED");
+  setVaultTitlebarState("locked", mode === "needs_setup" ? "Setup" : "Locked");
   pushTraySnapshot();
 
   showVaultPane(normalized);
@@ -104,7 +113,7 @@ export function openVaultGate(mode = "locked", reason = "") {
 
 function closeVaultGate() {
   state.vaultStatus = "unlocked";
-  setVaultTitlebarState("active", "LOCAL VAULT ACTIVE");
+  setVaultTitlebarState("active", "Private Vault");
   closeOverlay($("vault-overlay"));
   pushTraySnapshot();
 }
@@ -218,8 +227,8 @@ async function lockVaultNow() {
   state.dashboard = null;
   state.transactions = [];
   state.connections = [];
-  openVaultGate("locked", "Vault locked. Enter your master password to resume.");
-  toast("Vault locked.");
+  openVaultGate("locked", "ChronoX is locked. Enter your passcode to continue.");
+  toast("ChronoX locked.");
 }
 
 /* ============================================================================
@@ -244,7 +253,7 @@ async function completeOnboarding(track = "skipped") {
 }
 
 /* ============================================================================
-   3. COMMAND DASHBOARD, JARS, IMPULSE DRAWER & 5-MIN RESET DRAWER
+   3. OVERVIEW DASHBOARD, MONEY JARS, IMPULSE PAUSE & WEEKLY CHECK-IN
    ============================================================================ */
 
 function mathLine(label, value, bold = false) {
@@ -262,15 +271,15 @@ export function renderCommandDashboard(dash) {
     dopamine_xp: 0,
     weekly_reset_streak: 0,
     impulse_money_saved_cents: 0,
-    level_title: "Operator",
+    level_title: "Steady",
     grace_days_available: 1,
     recent_wins: [],
   };
 
   const xpLv = $("xp-level");
   const xpSt = $("xp-streak");
-  if (xpLv) xpLv.textContent = `LV ${stats.level} · ${stats.dopamine_xp} XP`;
-  if (xpSt) xpSt.textContent = `${stats.weekly_reset_streak}W`;
+  if (xpLv) xpLv.textContent = `Level ${stats.level}`;
+  if (xpSt) xpSt.textContent = `${stats.weekly_reset_streak} wk streak`;
 
   if (dash.intelligence_mode) syncModeControls(dash.intelligence_mode);
   if (dash.active_ai_provider) {
@@ -310,7 +319,7 @@ export function renderCommandDashboard(dash) {
   const payDate = $("hero-payday-date");
   const payChip = $("payday-chip");
   if (payDate) payDate.textContent = fmtShortDate(s.next_payday_date);
-  if (payChip) payChip.textContent = `${s.days_until_payday ?? "--"}D UNTIL PAYDAY`;
+  if (payChip) payChip.textContent = `${s.days_until_payday ?? "--"}d until payday`;
 
   const liquid = Math.max(0, Number(s.total_liquid_cash_cents) || 0);
   const safeTotal = Math.max(0, Number(s.safe_to_spend_cents) || 0);
@@ -324,7 +333,7 @@ export function renderCommandDashboard(dash) {
   }
   animatePercent($("hero-ring-pct"), ratio * 100, "heroRingPct", 0);
   const ringLabel = $("hero-ring-label");
-  if (ringLabel) ringLabel.textContent = ratio >= 0.2 ? "FREE CASH" : ratio > 0 ? "TIGHT" : "SHIELDED";
+  if (ringLabel) ringLabel.textContent = ratio >= 0.2 ? "Available" : ratio > 0 ? "Tight" : "Protected";
 
   const mathBox = $("safe-math-breakdown");
   if (mathBox) {
@@ -332,11 +341,11 @@ export function renderCommandDashboard(dash) {
       mathLine("Liquid cash (checking + savings + cash)", fmtMoney(s.total_liquid_cash_cents)),
       mathLine("- Unpaid bills due before payday", `-${fmtMoney(s.unpaid_bills_until_payday_cents)}`),
       mathLine("- Credit card payoff reserve", `-${fmtMoney(s.credit_card_reserved_cents)}`),
-      mathLine("- Ring-fenced Safety & Invest jars", `-${fmtMoney(s.locked_jar_reserves_cents)}`),
-      mathLine("- Emergency overdraft buffer", `-${fmtMoney(s.emergency_buffer_cents)}`),
+      mathLine("- Protected Safety & Invest jars", `-${fmtMoney(s.locked_jar_reserves_cents)}`),
+      mathLine("- Safety cushion", `-${fmtMoney(s.emergency_buffer_cents)}`),
       mathLine("= Safe to Spend Until Payday", fmtMoney(s.safe_to_spend_cents), true),
       mathLine(
-        `/ ${s.days_until_payday || 1} days = Daily Safe Allowance`,
+        `/ ${s.days_until_payday || 1} days = Safe to Spend Today`,
         fmtMoney(s.daily_safe_to_spend_cents),
         true
       )
@@ -347,8 +356,8 @@ export function renderCommandDashboard(dash) {
   animateMoney($("hero-impulse-saved"), stats.impulse_money_saved_cents || 0, "heroImpulseSaved");
   const lvTitle = $("hero-level-title");
   const graceNote = $("hero-grace-note");
-  if (lvTitle) lvTitle.textContent = stats.level_title || "Operator";
-  if (graceNote) graceNote.textContent = `${stats.grace_days_available ?? 1} grace freeze ready`;
+  if (lvTitle) lvTitle.textContent = stats.level_title || "Steady";
+  if (graceNote) graceNote.textContent = `${stats.grace_days_available ?? 1} streak freeze ready`;
 
   const cs = dash.credit_summary || {};
   const gCount = (dash.goals || []).length;
@@ -356,11 +365,11 @@ export function renderCommandDashboard(dash) {
   if (pulse) {
     if (cs.total_debt_cents > 0 || cs.aggregate_utilization_pct > 0) {
       pulse.textContent =
-        `UTIL: ${Number(cs.aggregate_utilization_pct || 0).toFixed(1)}% · ` +
-        `DTI: ${Number(cs.dti_pct || 0).toFixed(1)}% · ` +
-        `DEBT: ${fmtMoney(cs.total_debt_cents || 0)} · ${gCount} ACTIVE GOAL(S)`;
+        `Utilization ${Number(cs.aggregate_utilization_pct || 0).toFixed(1)}% · ` +
+        `DTI ${Number(cs.dti_pct || 0).toFixed(1)}% · ` +
+        `Debt ${fmtMoney(cs.total_debt_cents || 0)} · ${gCount} ${gCount === 1 ? "goal" : "goals"}`;
     } else {
-      pulse.textContent = `ZERO TRACKED DEBT · ${gCount} ACTIVE GOAL(S) — OPEN CREDIT OR GOALS ANYTIME.`;
+      pulse.textContent = `No tracked debt · ${gCount} active ${gCount === 1 ? "goal" : "goals"} — manage cards or savings anytime.`;
     }
   }
 
@@ -373,7 +382,7 @@ export function renderCommandDashboard(dash) {
       rebalBanner.replaceChildren(
         el("strong", { class: "inline-icon-row" }, [
           makeIcon("shield", "ui-icon-sm"),
-          "ZERO-GUILT AUTO-REBALANCE READY",
+          "Suggested Jar Rebalance",
         ]),
         ...plans.map((p) =>
           el("div", { class: "rebal-row" }, [
@@ -405,7 +414,7 @@ export function renderCommandDashboard(dash) {
   populateSelectors(dash.jars || [], dash.accounts || []);
 
   clearBootSkeletons();
-  setVaultTitlebarState("active", "LOCAL VAULT ACTIVE");
+  setVaultTitlebarState("active", "Private Vault");
   if (!state.hydrated) {
     state.hydrated = true;
     choreographEntrance($("tab-today"));
@@ -424,9 +433,9 @@ export function renderJars(jars) {
       const pct = Math.min(100, Math.max(0, Number(j.pct_used) || 0));
       const healthClass = needsSetup ? "pill pill-soft" : `pill pill-${j.health || "calm"}`;
       const healthLabel = needsSetup
-        ? "SETUP · $0 FUNDED"
-        : { calm: "NOMINAL", watch: "WATCH PACE", rebalance: "REBALANCE" }[j.health] ||
-          String(j.health || "NOMINAL").toUpperCase();
+        ? "Not Funded"
+        : { calm: "On Track", watch: "Watch Pace", rebalance: "Rebalance" }[j.health] ||
+          "On Track";
       const isEditing = state.editingJarId === j.id;
       const fundedCents = Number(j.funded_cents ?? j.auto_allocated_cents ?? 0);
       const targetCents = Number(j.monthly_target_cents || 0);
@@ -447,11 +456,11 @@ export function renderJars(jars) {
             ]),
             el("label", { class: "checkbox-row details-spacer" }, [
               el("input", { type: "checkbox", name: "rollover_enabled", checked: j.rollover_enabled }),
-              el("span", { text: "Roll over unused surplus" }),
+              el("span", { text: "Roll over unused balance" }),
             ]),
             el("label", { class: "checkbox-row" }, [
               el("input", { type: "checkbox", name: "is_locked", checked: j.is_locked }),
-              el("span", { text: "Ring-fence (shield from Safe-to-Spend)" }),
+              el("span", { text: "Protect from Safe to Spend" }),
             ]),
             el("div", { class: "row-gap details-spacer" }, [
               el("button", { type: "submit", class: "btn btn-primary btn-xs", text: "Save Jar" }),
@@ -466,18 +475,18 @@ export function renderJars(jars) {
         : null;
 
       const metaLine = needsSetup
-        ? `Cash funded: ${fmtMoney(fundedCents)} · Target: ${fmtMoney(targetCents)}/mo (${Number(j.target_pct || 0).toFixed(0)}%)`
-        : `Spent ${fmtMoney(j.spent_cents)} / ${fmtMoney(fundedCents)} funded (${Number(j.target_pct || 0).toFixed(0)}%${targetCents > 0 ? ` · Target ${fmtMoney(targetCents)}/mo` : ""})`;
+        ? `Funded ${fmtMoney(fundedCents)} · Target ${fmtMoney(targetCents)}/mo (${Number(j.target_pct || 0).toFixed(0)}%)`
+        : `Spent ${fmtMoney(j.spent_cents)} of ${fmtMoney(fundedCents)} (${Number(j.target_pct || 0).toFixed(0)}%${targetCents > 0 ? ` · Target ${fmtMoney(targetCents)}/mo` : ""})`;
 
-      return el("div", { class: "jar-card", style: { borderTopColor: j.color || "var(--primary)" } }, [
+      return el("div", { class: "jar-card" }, [
         el("div", { class: "jar-top" }, [
           el("span", { class: "jar-name" }, [
             el("span", { class: "jar-icon-badge", style: { color: j.color || "var(--primary)" } }, [
               makeIcon(jarIconKey(j), "ui-icon-sm"),
             ]),
-            j.name,
+            el("span", { class: "jar-name-text", text: j.name }),
           ]),
-          el("div", { class: "row-gap" }, [
+          el("div", { class: "jar-top-actions" }, [
             el("span", { class: healthClass, text: healthLabel }),
             el(
               "button",
@@ -495,7 +504,7 @@ export function renderJars(jars) {
         el("div", {
           class: "jar-avail",
           text: fmtMoney(j.available_cents),
-          style: { color: j.available_cents < 0 ? "var(--crimson)" : needsSetup ? "var(--muted)" : j.color || "var(--text)" },
+          style: { color: j.available_cents < 0 ? "var(--crimson)" : needsSetup ? "var(--muted)" : "var(--text)" },
         }),
         el("div", { class: "progress-track" }, [
           el("div", {
@@ -513,13 +522,13 @@ export function renderJars(jars) {
         needsSetup && projectedCents > 0
           ? el("div", {
               class: "muted small",
-              text: `Projected allocation: ${fmtMoney(projectedCents)}/mo (pending cash deposit)`,
+              text: `Planned allocation: ${fmtMoney(projectedCents)}/mo once funded`,
             })
           : null,
         j.rollover_cents > 0
-          ? el("div", { class: "muted small", text: `+${fmtMoney(j.rollover_cents)} rolled over` })
+          ? el("div", { class: "muted small", text: `+${fmtMoney(j.rollover_cents)} carried over` })
           : null,
-        el("div", { class: "small muted", text: j.calm_note || "" }),
+        j.calm_note ? el("div", { class: "small muted", text: j.calm_note }) : null,
         editor,
       ]);
     })
@@ -535,20 +544,29 @@ function renderBillRadar(upcomingBills) {
   const radar = $("bill-radar-list");
   if (!radar) return;
   if (!bills14.length) {
-    radar.replaceChildren(el("p", { class: "muted small", text: "No bills due in the next 14 days." }));
+    radar.replaceChildren(
+      renderEmptyState({
+        icon: "calendar",
+        title: "No bills due in the next 14 days",
+        subtitle: "Add recurring bills in Activity or import statements so ChronoX reserves them automatically.",
+        actionLabel: "Manage Bills",
+        onAction: () => switchTab("activity"),
+        compact: true,
+      })
+    );
     return;
   }
   radar.replaceChildren(
     ...bills14.map((b) => {
       const dueLabel =
-        b.days_until_due <= 0 ? "DUE TODAY" : `IN ${b.days_until_due}D (${fmtShortDate(b.next_due_date)})`;
+        b.days_until_due <= 0 ? "Due today" : `In ${b.days_until_due}d (${fmtShortDate(b.next_due_date)})`;
       const rangeStr =
         b.amount_min_cents != null && b.amount_max_cents != null
           ? ` (${fmtMoney(b.amount_min_cents)}-${fmtMoney(b.amount_max_cents)})`
           : "";
       const pills = [el("span", { class: "pill pill-soft", text: dueLabel })];
       if (b.price_hike_cents > 0) {
-        pills.push(el("span", { class: "pill pill-watch", text: `+${fmtMoney(b.price_hike_cents)} HIKE` }));
+        pills.push(el("span", { class: "pill pill-watch", text: `+${fmtMoney(b.price_hike_cents)} hike` }));
       }
       return el("div", { class: "item-box" }, [
         el("div", { class: "item-row" }, [
@@ -570,7 +588,7 @@ function renderImpulses(impulses, stats) {
   if (!list) return;
   if (!impulses.length) {
     list.replaceChildren(
-      el("div", { class: "item-box muted small", text: "No items cooling right now. Park an impulse anytime." })
+      el("div", { class: "item-box muted small", text: "No parked purchases right now. Park an impulse above whenever you want a 48-hour pause." })
     );
     return;
   }
@@ -578,7 +596,7 @@ function renderImpulses(impulses, stats) {
     ...impulses.map((imp) => {
       const ready = imp.status === "ready";
       const badge = ready
-        ? el("span", { class: "pill pill-calm", text: "COOLDOWN COMPLETE" })
+        ? el("span", { class: "pill pill-calm", text: "Ready to Decide" })
         : el("span", { class: "pill pill-blue" }, [makeIcon("snowflake", "ui-icon-sm"), `${imp.hours_remaining}h left`]);
       return el("div", { class: "jar-card" }, [
         el("div", { class: "jar-top" }, [el("strong", { text: imp.item_name }), badge]),
@@ -587,7 +605,7 @@ function renderImpulses(impulses, stats) {
           class: "muted small",
           text: `${imp.work_hours_cost} work hrs · delays goal ~${imp.goal_delay_days}d`,
         }),
-        imp.reason ? el("div", { class: "small muted", text: `Trigger: ${imp.reason}` }) : null,
+        imp.reason ? el("div", { class: "small muted", text: `Note: ${imp.reason}` }) : null,
         el("div", { class: "row-gap wrap" }, [
           el(
             "button",
@@ -597,7 +615,7 @@ function renderImpulses(impulses, stats) {
               "data-impulse-decide": String(imp.id),
               "data-decision": "skip",
             },
-            [makeIcon("trophy", "ui-icon-sm"), "Skipped (+75 XP)"]
+            [makeIcon("trophy", "ui-icon-sm"), "Skip & Keep Cash"]
           ),
           el("button", {
             type: "button",
@@ -619,7 +637,7 @@ function renderDopamineWins(wins) {
       box.replaceChildren(
         el("p", {
           class: "muted small",
-          text: "Park an impulse, import statements, or complete a Weekly Reset to log momentum wins.",
+          text: "Connect your bank, park an impulse, or complete a Weekly Check-In to build momentum.",
         })
       );
       continue;
@@ -641,8 +659,8 @@ export async function loadWeeklyReset() {
     const pill = $("reset-status-pill");
     if (pill) {
       pill.className = data.already_completed_this_week ? "pill pill-calm" : "pill pill-watch";
-      if (data.already_completed_this_week) setNodeIconText(pill, "check", "DONE THIS WEEK");
-      else pill.textContent = "READY (~3 MIN)";
+      if (data.already_completed_this_week) setNodeIconText(pill, "check", "Done This Week");
+      else pill.textContent = "Ready (~3 min)";
     }
 
     const triage = $("reset-triage-list");
@@ -761,9 +779,29 @@ export function renderAccounts(accounts) {
   const box = $("accounts-list");
   if (!box) return;
   if (!accounts.length) {
-    box.replaceChildren(el("p", { class: "muted small", text: "No accounts yet. Connect Plaid/SimpleFIN, import a statement, or add manually below." }));
+    box.replaceChildren(
+      renderEmptyState({
+        icon: "landmark",
+        title: "No accounts connected yet",
+        subtitle: "Connect a bank in Settings, import a statement, or add an account below.",
+        actionLabel: "Connect Bank",
+        onAction: () => {
+          switchTab("settings");
+          const inp = $("set-plaid-client-id");
+          if (inp) inp.focus();
+        },
+        compact: true,
+      })
+    );
     return;
   }
+  const typeLabelMap = {
+    checking: "Checking",
+    savings: "Savings",
+    credit: "Credit Card",
+    cash: "Cash",
+    trading: "Brokerage",
+  };
   box.replaceChildren(
     ...accounts.map((a) => {
       const isReconciling = state.reconcilingAcctId === a.id;
@@ -774,7 +812,7 @@ export function renderAccounts(accounts) {
       const maskSuffix = a.mask ? ` ••••${a.mask}` : "";
       const availNote =
         a.available_cents != null && Number(a.available_cents) !== Number(a.balance_cents)
-          ? ` · Avail ${fmtAcctVal(a.available_cents)}`
+          ? ` · Available ${fmtAcctVal(a.available_cents)}`
           : "";
 
       const reconcileForm = isReconciling
@@ -804,11 +842,11 @@ export function renderAccounts(accounts) {
           el("div", {}, [
             el("div", { class: "row-gap wrap", style: { gap: "6px" } }, [
               el("strong", { text: `${a.name}${maskSuffix}` }),
-              nonUsd ? el("span", { class: "pill pill-watch", text: `${currency} · ISOLATED` }) : null,
+              nonUsd ? el("span", { class: "pill pill-watch", text: currency }) : null,
             ]),
             el("div", {
               class: "muted small",
-              text: `${String(a.account_type || "").toUpperCase()} · ${a.institution || "Local"}${availNote}`,
+              text: `${typeLabelMap[a.account_type] || String(a.account_type || "Account")} · ${a.institution || "Manual"}${availNote}`,
             }),
           ]),
           el("div", { class: "row-gap" }, [
@@ -816,7 +854,7 @@ export function renderAccounts(accounts) {
             el("button", {
               type: "button",
               class: "btn btn-ghost btn-xs",
-              text: "Reconcile",
+              text: "Adjust",
               "data-reconcile-toggle": String(a.id),
             }),
           ]),
@@ -895,18 +933,26 @@ function renderAllBills(bills) {
   );
 }
 
+function humanizeEventType(raw) {
+  const s = String(raw || "update").replace(/_/g, " ").trim();
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : "Update";
+}
+
 function renderAuditLog(events) {
   const box = $("audit-log-list");
   if (!box) return;
   if (!events.length) {
-    box.replaceChildren(el("p", { class: "muted small", text: "Auto-budget audit events will appear here." }));
+    box.replaceChildren(el("p", { class: "muted small", text: "Automatic budget and jar updates will appear here." }));
     return;
   }
   box.replaceChildren(
     ...events.map((e) =>
       el("div", { class: "item-box" }, [
         el("div", { class: "small", text: e.summary }),
-        el("span", { class: "muted small", text: `${e.event_type} · ${String(e.created_at || "").replace("T", " ").replace("Z", " UTC")}` }),
+        el("span", {
+          class: "muted small",
+          text: `${humanizeEventType(e.event_type)} · ${String(e.created_at || "").replace("T", " ").slice(0, 16)}`,
+        }),
       ])
     )
   );
@@ -986,7 +1032,23 @@ export function renderTransactionsTable(txs) {
 
   if (!txs.length) {
     tbody.replaceChildren(
-      el("tr", {}, [el("td", { colspan: "5", class: "muted small", text: "No matching transactions in selected window." })])
+      el("tr", {}, [
+        el("td", { colspan: "5" }, [
+          renderEmptyState({
+            icon: "receipt",
+            title: "No transactions in this period",
+            subtitle: "Connect a bank, import a statement above, or log an expense from the Overview command bar.",
+            actionLabel: "Import Statement",
+            onAction: () => {
+              const inp = $("csv-file-input");
+              if (inp) inp.focus();
+            },
+            secondaryLabel: "Connect Bank",
+            onSecondary: () => switchTab("settings"),
+            compact: true,
+          }),
+        ]),
+      ])
     );
     return;
   }
@@ -1159,13 +1221,13 @@ function renderSplitsDraft() {
   if (badge) {
     if (!_activeSplitsDraft.length) {
       badge.className = "pill pill-soft";
-      badge.textContent = `Parent: ${fmtMoney(parentCents)}`;
+      badge.textContent = `Total: ${fmtMoney(parentCents)}`;
     } else if (diff === 0) {
       badge.className = "pill pill-calm";
-      badge.textContent = "EXACT SUM MATCH";
+      badge.textContent = "Exact Match";
     } else {
       badge.className = "pill pill-watch";
-      badge.textContent = diff > 0 ? `${fmtMoney(diff)} REMAINING` : `${fmtMoney(Math.abs(diff))} OVER`;
+      badge.textContent = diff > 0 ? `${fmtMoney(diff)} remaining` : `${fmtMoney(Math.abs(diff))} over`;
     }
   }
 
@@ -1280,7 +1342,7 @@ function renderTxComments(comments) {
     ...comments.map((c) =>
       el("div", { class: "item-box" }, [
         el("div", { class: "item-row" }, [
-          el("span", { class: `pill ${c.author === "ai_coach" ? "pill-blue" : "pill-soft"}`, text: c.author === "ai_coach" ? "AI COACH" : "USER" }),
+          el("span", { class: `pill ${c.author === "ai_coach" ? "pill-blue" : "pill-soft"}`, text: c.author === "ai_coach" ? "AI Coach" : "You" }),
           el("span", { class: "muted small", text: String(c.created_at || "").replace("T", " ").slice(0, 16) }),
         ]),
         el("div", { class: "small", text: c.body }),
@@ -1304,7 +1366,7 @@ export async function loadEmailQueue() {
     const cmdAlert = $("command-email-alert");
     if (cmdAlert) {
       if (pending.length > 0) {
-        setNodeIconText(cmdAlert, "mail", `${pending.length} extracted email bill(s) awaiting review in Activity & Bills.`);
+        setNodeIconText(cmdAlert, "mail", `${pending.length} email bill reminder${pending.length === 1 ? "" : "s"} waiting for review in Activity.`);
         cmdAlert.classList.remove("hidden");
       } else {
         cmdAlert.classList.add("hidden");
@@ -1314,7 +1376,7 @@ export async function loadEmailQueue() {
     const box = $("email-queue-list");
     if (!box) return;
     if (!pending.length) {
-      box.replaceChildren(el("p", { class: "muted small", text: "No pending email bills. Configure optional Read-Only IMAP in Vault & Connectors." }));
+      box.replaceChildren(el("p", { class: "muted small", text: "No pending email bills. You can enable the optional Email Bill Scanner in Settings." }));
       return;
     }
     box.replaceChildren(
@@ -1340,13 +1402,366 @@ export async function loadEmailQueue() {
 }
 
 /* ============================================================================
-   5. VAULT & CONNECTORS SETTINGS (Plaid Hosted Link, SimpleFIN, IMAP, AI)
+   5. SETTINGS: BANK SYNC (Plaid / SimpleFIN), AUTOMAGIC LOCAL AI & EMAIL SCANNER
    ============================================================================ */
+
+const PLAID_POLL_MAX_ATTEMPTS = 300; // 15 minutes at 3s interval
+const PLAID_BACKFILL_MAX_TICKS = 15; // 5 minutes at 20s interval
 
 function stopPlaidPolling() {
   if (_plaidPollTimer) {
     clearInterval(_plaidPollTimer);
     _plaidPollTimer = null;
+  }
+}
+
+function stopPlaidBackfillPolling() {
+  if (_plaidBackfillTimer) {
+    clearInterval(_plaidBackfillTimer);
+    _plaidBackfillTimer = null;
+  }
+  _plaidBackfillTicks = 0;
+}
+
+function schedulePlaidBackfillRefresh(hasPendingBackfill) {
+  if (!hasPendingBackfill || state.vaultStatus !== "unlocked") {
+    stopPlaidBackfillPolling();
+    return;
+  }
+  if (_plaidBackfillTimer) return;
+  _plaidBackfillTicks = 0;
+  _plaidBackfillTimer = setInterval(async () => {
+    _plaidBackfillTicks += 1;
+    if (_plaidBackfillTicks > PLAID_BACKFILL_MAX_TICKS || state.vaultStatus !== "unlocked") {
+      stopPlaidBackfillPolling();
+      return;
+    }
+    try {
+      await loadConnections();
+      await refreshAll();
+    } catch (_err) {
+      // keep polling quietly until backfill completes or window expires
+    }
+  }, 20000);
+}
+
+async function openExternalUrl(url) {
+  if (!url) return { ok: false, error: "No sign-in URL returned." };
+  const desktop = getDesktopBridge();
+  if (desktop && typeof desktop.openExternal === "function") {
+    try {
+      const res = await desktop.openExternal(url);
+      if (res && res.ok === false) {
+        return { ok: false, error: res.error || "Could not open your system browser." };
+      }
+      return { ok: true, error: "" };
+    } catch (err) {
+      return { ok: false, error: (err && err.message) || "Could not open your system browser." };
+    }
+  }
+  const win = window.open(url, "_blank", "noopener,noreferrer");
+  if (!win) {
+    return { ok: false, error: "Your browser blocked the sign-in window. Click Open Bank Sign-In below." };
+  }
+  return { ok: true, error: "" };
+}
+
+function renderPlaidProgress({
+  tone = "info",
+  message = "",
+  hostedUrl = "",
+  showCheckBtn = false,
+  extraNote = "",
+  openError = "",
+} = {}) {
+  const stBox = $("plaid-link-status");
+  if (!stBox) return;
+  if (!message) {
+    stBox.classList.add("hidden");
+    stBox.replaceChildren();
+    return;
+  }
+  stBox.className = `plaid-progress-card${tone === "warn" ? " is-warn" : tone === "done" ? " is-done" : ""}`;
+  stBox.classList.remove("hidden");
+
+  const iconName = tone === "warn" ? "alert" : tone === "done" ? "check" : "landmark";
+  const children = [
+    el("div", { class: "item-row wrap" }, [
+      el("span", { class: "inline-icon-row small" }, [
+        makeIcon(iconName, "ui-icon-sm"),
+        el("strong", { text: message }),
+      ]),
+    ]),
+  ];
+
+  if (openError) {
+    children.push(el("div", { class: "small error-text", text: openError }));
+  }
+  if (extraNote) {
+    children.push(el("div", { class: "small muted", text: extraNote }));
+  }
+
+  const actions = [];
+  if (hostedUrl) {
+    const reopenBtn = el("button", {
+      type: "button",
+      class: "btn btn-soft btn-xs",
+      text: openError ? "Open Bank Sign-In" : "Re-open Bank Sign-In",
+    });
+    reopenBtn.addEventListener("click", async () => {
+      const res = await openExternalUrl(hostedUrl);
+      if (!res.ok) toast(res.error || "Could not open browser.", true);
+    });
+    actions.push(reopenBtn);
+
+    if (openError) {
+      actions.push(
+        el("a", {
+          href: hostedUrl,
+          target: "_blank",
+          rel: "noopener noreferrer",
+          class: "btn btn-ghost btn-xs",
+          text: "Direct Sign-In Link",
+        })
+      );
+    }
+  }
+  if (showCheckBtn) {
+    const checkBtn = el("button", {
+      type: "button",
+      class: "btn btn-primary btn-xs",
+      text: "Check & Sync Now",
+    });
+    checkBtn.addEventListener("click", () => checkPlaidHostedLinkNow(checkBtn, true));
+    actions.push(checkBtn);
+  }
+  if (actions.length) {
+    children.push(el("div", { class: "row-gap wrap" }, actions));
+  }
+  stBox.replaceChildren(...children);
+}
+
+async function checkPlaidHostedLinkNow(triggerBtn = null, manualClick = false) {
+  if (state.vaultStatus !== "unlocked") {
+    stopPlaidPolling();
+    return;
+  }
+  if (!_plaidPendingState) {
+    if (manualClick) {
+      _plaidPendingState = {
+        hostedUrl: "",
+        linkToken: null,
+        useHostedEndpoint: true,
+        attempts: 0,
+        transientErrors: 0,
+        checking: false,
+      };
+    } else {
+      return;
+    }
+  }
+  if (_plaidPendingState.checking) return;
+  _plaidPendingState.checking = true;
+
+  const runCheck = async () => {
+    const pending = _plaidPendingState;
+    if (!pending) return;
+    try {
+      if (pending.useHostedEndpoint) {
+        const res = await api("/api/v1/plaid/hosted-link/check", {
+          method: "POST",
+          body: JSON.stringify(pending.linkToken ? { link_token: pending.linkToken } : {}),
+        });
+        pending.transientErrors = 0;
+        const st = String((res && res.status) || "pending");
+        if (st === "completed") {
+          stopPlaidPolling();
+          _plaidPendingState = null;
+          const note =
+            (res && res.history_note) ||
+            (res && res.message) ||
+            `Bank connected${res && res.imported_count != null ? ` (${res.imported_count} transactions imported)` : ""}.`;
+          renderPlaidProgress({ tone: "done", message: note });
+          toast(note);
+          await loadPlaidConfig();
+          await loadConnections();
+          await refreshAll();
+          return;
+        }
+        if (st === "exited") {
+          stopPlaidPolling();
+          _plaidPendingState = null;
+          const exitMsg =
+            (res && res.error_message) || "Bank sign-in was closed before finishing. Click Connect Bank to try again.";
+          renderPlaidProgress({ tone: "warn", message: exitMsg });
+          toast(exitMsg, true);
+          return;
+        }
+        if (st === "none") {
+          stopPlaidPolling();
+          _plaidPendingState = null;
+          if (manualClick) {
+            renderPlaidProgress({
+              tone: "info",
+              message: "No pending bank sign-in session found.",
+              extraNote: "Click Connect Bank above to start a new sign-in.",
+            });
+          }
+          return;
+        }
+        if (manualClick) {
+          renderPlaidProgress({
+            tone: "info",
+            message: "Waiting for bank sign-in to complete in your browser...",
+            hostedUrl: pending.hostedUrl,
+            showCheckBtn: true,
+            extraNote: "Finish signing in with your bank in your browser, then return here — ChronoX syncs automatically.",
+          });
+        }
+        return;
+      }
+
+      // Legacy fallback path (/api/v1/plaid/poll-link -> /exchange -> /sync)
+      const poll = await api("/api/v1/plaid/poll-link", {
+        method: "POST",
+        body: JSON.stringify({ link_token: pending.linkToken }),
+      });
+      pending.transientErrors = 0;
+      if (!poll) return;
+      if (poll.status === "exited") {
+        stopPlaidPolling();
+        _plaidPendingState = null;
+        const exitMsg = poll.error_message || "Bank sign-in was closed before finishing.";
+        renderPlaidProgress({ tone: "warn", message: exitMsg });
+        toast(exitMsg, true);
+        return;
+      }
+      if (poll.public_token) {
+        stopPlaidPolling();
+        _plaidPendingState = null;
+        const exRes = await api("/api/v1/plaid/exchange", {
+          method: "POST",
+          body: JSON.stringify({
+            public_token: poll.public_token,
+            institution: poll.institution || "Connected Bank",
+          }),
+        });
+        const newConnId = exRes && (exRes.id || exRes.connection_id);
+        const syncRes = await api("/api/v1/plaid/sync", {
+          method: "POST",
+          body: JSON.stringify(newConnId ? { connection_id: newConnId } : {}),
+        });
+        const note =
+          (syncRes && syncRes.history_note) ||
+          "Bank connected and initial transaction sync complete.";
+        renderPlaidProgress({ tone: "done", message: note });
+        toast(note);
+        await loadPlaidConfig();
+        await loadConnections();
+        await refreshAll();
+      } else if (manualClick) {
+        renderPlaidProgress({
+          tone: "info",
+          message: "Waiting for bank sign-in to complete in your browser...",
+          hostedUrl: pending.hostedUrl,
+          showCheckBtn: true,
+        });
+      }
+    } catch (err) {
+      if (pending.useHostedEndpoint && err && err.status === 404 && pending.linkToken) {
+        pending.useHostedEndpoint = false;
+        return;
+      }
+      pending.transientErrors = (pending.transientErrors || 0) + 1;
+      const errMsg = (err && err.message) || "Unable to reach Plaid right now.";
+      renderPlaidProgress({
+        tone: "warn",
+        message: "Waiting for bank sign-in (retrying connection)...",
+        hostedUrl: pending.hostedUrl,
+        showCheckBtn: true,
+        extraNote: `Retry #${pending.transientErrors}: ${errMsg}`,
+      });
+      if (manualClick) toast(errMsg, true);
+    } finally {
+      if (_plaidPendingState) _plaidPendingState.checking = false;
+    }
+  };
+
+  if (triggerBtn) {
+    await withBusy(triggerBtn, runCheck);
+  } else {
+    await runCheck();
+  }
+}
+
+function startPlaidPolling() {
+  stopPlaidPolling();
+  if (!_plaidPendingState) return;
+  _plaidPollTimer = setInterval(async () => {
+    if (!_plaidPendingState || state.vaultStatus !== "unlocked") {
+      stopPlaidPolling();
+      return;
+    }
+    _plaidPendingState.attempts += 1;
+    if (_plaidPendingState.attempts > PLAID_POLL_MAX_ATTEMPTS) {
+      stopPlaidPolling();
+      renderPlaidProgress({
+        tone: "warn",
+        message: "Still waiting after 15 minutes — automatic check paused.",
+        hostedUrl: _plaidPendingState.hostedUrl,
+        showCheckBtn: true,
+        extraNote: "Once you complete bank sign-in in your browser, click Check & Sync Now.",
+      });
+      return;
+    }
+    await checkPlaidHostedLinkNow(null, false);
+  }, 3000);
+}
+
+export async function loadPlaidConfig() {
+  if (state.vaultStatus !== "unlocked") return null;
+  try {
+    const cfg = await api("/api/v1/plaid/config");
+    const pill = $("plaid-status-pill");
+    if (pill) {
+      const count = Number(cfg.connected_count || 0);
+      if (count > 0) {
+        pill.className = "pill pill-calm";
+        pill.textContent = `Connected (${count})`;
+      } else if (cfg.configured) {
+        pill.className = "pill pill-blue";
+        pill.textContent = "Ready to Connect";
+      } else {
+        pill.className = "pill pill-soft";
+        pill.textContent = "Not Connected";
+      }
+    }
+    const idInput = $("set-plaid-client-id");
+    if (idInput && !idInput.value && cfg.client_id_masked) {
+      idInput.placeholder = `Saved (${cfg.client_id_masked})`;
+    }
+    if (cfg.pending_link_active && !_plaidPollTimer) {
+      _plaidPendingState = {
+        hostedUrl: cfg.pending_hosted_link_url || "",
+        linkToken: null,
+        useHostedEndpoint: true,
+        attempts: 0,
+        transientErrors: 0,
+        checking: false,
+      };
+      renderPlaidProgress({
+        tone: "info",
+        message: "Bank sign-in in progress in your browser...",
+        hostedUrl: _plaidPendingState.hostedUrl,
+        showCheckBtn: true,
+        extraNote: "Finish signing in with your bank, then return here or click Check & Sync Now.",
+      });
+      startPlaidPolling();
+    }
+    return cfg;
+  } catch (_err) {
+    // Backwards compatible if GET /api/v1/plaid/config is unavailable
+    return null;
   }
 }
 
@@ -1356,9 +1771,21 @@ export async function loadConnections() {
     const conns = await api("/api/v1/connections");
     const list = Array.isArray(conns) ? conns : [];
     state.connections = list;
+    const hasPendingBackfill = list.some(
+      (c) => c.provider === "plaid" && c.backfill_status === "backfill_pending"
+    );
+    schedulePlaidBackfillRefresh(hasPendingBackfill);
+
     if (!box) return;
     if (!list.length) {
-      box.replaceChildren(el("p", { class: "muted small", text: "No bank or broker connections yet. Configure Plaid Hosted Link or SimpleFIN below." }));
+      box.replaceChildren(
+        renderEmptyState({
+          icon: "landmark",
+          title: "No banks connected yet",
+          subtitle: "Connect your bank below with Plaid or SimpleFIN, or import statements anytime in Activity.",
+          compact: true,
+        })
+      );
       return;
     }
     box.replaceChildren(
@@ -1372,20 +1799,22 @@ export async function loadConnections() {
             : "pill-danger";
         const statusLabel =
           c.status === "paused_locked"
-            ? "SYNC PAUSED: VAULT LOCKED"
+            ? "Paused (Locked)"
             : needsReauth
-            ? "RECONNECT REQUIRED"
-            : String(c.status || "active").replace(/_/g, " ").toUpperCase();
+            ? "Reconnect Needed"
+            : c.status === "active"
+            ? "Connected"
+            : humanizeEventType(c.status);
         const windowNote =
           c.imported_start_date && c.imported_end_date
-            ? ` · Window: ${c.imported_start_date} to ${c.imported_end_date}`
+            ? ` · History: ${c.imported_start_date} to ${c.imported_end_date}`
             : "";
         return el("div", { class: "item-box" }, [
           el("div", { class: "item-row wrap" }, [
             el("div", {}, [
               el("div", { class: "row-gap wrap", style: { gap: "6px" } }, [
-                el("strong", { text: `${c.institution || c.provider.toUpperCase()} (${c.provider})` }),
-                c.env && c.env !== "production" ? el("span", { class: "pill pill-watch", text: "TEST ENV" }) : null,
+                el("strong", { text: `${c.institution || humanizeEventType(c.provider)}` }),
+                el("span", { class: "pill pill-soft", text: humanizeEventType(c.provider) }),
               ]),
               el("div", {
                 class: "muted small",
@@ -1398,10 +1827,10 @@ export async function loadConnections() {
             el("div", { class: "row-gap wrap" }, [
               el("span", { class: `pill ${statusCls}`, text: statusLabel }),
               c.provider === "plaid" && c.backfill_status === "backfill_pending"
-                ? el("span", { class: "pill pill-watch", text: "BACKFILL PENDING" })
+                ? el("span", { class: "pill pill-watch", text: "Syncing Full History..." })
                 : null,
               c.needs_relink_for_730d
-                ? el("span", { class: "pill pill-watch", text: "RE-LINK FOR 730D HISTORY" })
+                ? el("span", { class: "pill pill-watch", text: "Reconnect for 24-Month History" })
                 : null,
               el("button", {
                 type: "button",
@@ -1428,6 +1857,173 @@ export async function loadConnections() {
   }
 }
 
+/* --- Automagic Local AI CLI Detection & 1-Click Switcher --- */
+
+function renderLocalAiClis(data) {
+  _localClisData = data;
+  const dot = $("local-cli-status-dot");
+  const statusText = $("local-cli-status-text");
+  const coachPill = $("coach-local-cli-pill");
+  const autoCb = $("set-local-cli-auto-detect");
+  const grid = $("local-cli-cards-grid");
+
+  const clis = Array.isArray(data && data.clis) ? data.clis : [];
+  const activeProv = (data && data.active_provider) || "none";
+  const activeLabel =
+    (data && data.active_provider_label) ||
+    PROVIDER_DISPLAY_NAMES[activeProv] ||
+    "Built-in Math";
+  const hasAi = Boolean(activeProv && activeProv !== "none" && activeProv !== "deterministic_local");
+
+  if (autoCb && data && data.auto_detect_enabled !== undefined) {
+    autoCb.checked = Boolean(data.auto_detect_enabled);
+  }
+
+  if (dot) {
+    dot.className = `status-dot-live${hasAi ? "" : " is-idle"}`;
+  }
+  if (statusText) {
+    const readyCount = clis.filter((c) => c.installed && c.auth_ready !== false).length;
+    if (hasAi) {
+      statusText.textContent = `AI Active · ${activeLabel}${
+        data && data.auto_detect_enabled ? " (Auto-Detected)" : ""
+      }`;
+    } else if (readyCount > 0) {
+      statusText.textContent = `${readyCount} local AI assistant${readyCount === 1 ? "" : "s"} detected — enable Auto-detect or click Use below`;
+    } else {
+      statusText.textContent =
+        "Built-in Math Active — Install Claude, OpenCode, Codex, or Antigravity for free local AI";
+    }
+  }
+
+  if (coachPill) {
+    if (hasAi) {
+      coachPill.textContent = `AI Active · ${activeLabel}`;
+      coachPill.className = "pill pill-calm";
+      coachPill.classList.remove("hidden");
+    } else {
+      coachPill.classList.add("hidden");
+    }
+  }
+
+  if (!grid) return;
+  if (!clis.length) {
+    grid.replaceChildren();
+    return;
+  }
+
+  grid.replaceChildren(
+    ...clis.map((cli) => {
+      const isActive = Boolean(cli.is_active || activeProv === cli.provider_id);
+      const authVerified = cli.installed && cli.auth_ready === true;
+      const needsSignIn = cli.installed && cli.auth_ready === false;
+      const badgeCls = isActive
+        ? "pill-calm"
+        : authVerified || (cli.installed && !needsSignIn)
+        ? "pill-blue"
+        : needsSignIn
+        ? "pill-watch"
+        : "pill-soft";
+      const badgeLabel = isActive
+        ? "Active"
+        : authVerified
+        ? "Ready"
+        : needsSignIn
+        ? "Sign-In Needed"
+        : cli.installed
+        ? "Installed"
+        : "Not Installed";
+
+      const useBtn = el("button", {
+        type: "button",
+        class: `btn ${isActive ? "btn-soft" : "btn-primary"} btn-xs`,
+        text: isActive ? "Selected" : "Use",
+        disabled: isActive || !cli.installed,
+      });
+      useBtn.addEventListener("click", () =>
+        withBusy(useBtn, async () => {
+          try {
+            const updated = await api("/api/v1/settings", {
+              method: "PATCH",
+              body: JSON.stringify({ ai_provider: cli.provider_id }),
+            });
+            state.settings = updated;
+            syncProviderControls(updated.ai_provider, updated.active_provider_resolved);
+            toast(`Switched AI assistant to ${cli.display_name}.`);
+            await loadLocalAiClis(false);
+            await refreshAll({ refreshAI: true });
+          } catch (err) {
+            toast(err.message || `Could not switch to ${cli.display_name}.`, true);
+          }
+        })
+      );
+
+      const testOut = el("div", { class: "small muted hidden" });
+      const testBtn = el("button", {
+        type: "button",
+        class: "btn btn-ghost btn-xs",
+        text: "Test",
+        disabled: !cli.installed,
+      });
+      testBtn.addEventListener("click", () =>
+        withBusy(testBtn, async () => {
+          testOut.classList.remove("hidden");
+          testOut.textContent = `Testing ${cli.display_name}...`;
+          try {
+            const res = await api(`/api/v1/ai/test?provider=${encodeURIComponent(cli.provider_id)}`, {
+              method: "POST",
+            });
+            const msg = res.detail || res.message || (res.ok ? "Connected." : "Test failed.");
+            const msNote = res.latency_ms ? ` (${res.latency_ms}ms)` : "";
+            setNodeIconText(testOut, res.ok ? "check" : "alert", `${msg}${msNote}`);
+            testOut.className = `small ${res.ok ? "muted" : "error-text"}`;
+          } catch (err) {
+            setNodeIconText(testOut, "alert", err.message || "Test failed.");
+            testOut.className = "small error-text";
+          }
+        })
+      );
+
+      return el("div", { class: `local-cli-card${isActive ? " is-active" : ""}` }, [
+        el("div", { class: "item-row" }, [
+          el("strong", { text: cli.display_name || cli.provider_id }),
+          el("span", { class: `pill ${badgeCls}`, text: badgeLabel }),
+        ]),
+        el("div", {
+          class: "muted small",
+          text:
+            cli.status_detail ||
+            (cli.version ? `Version ${cli.version}` : cli.installed ? "Detected on this device" : "Not detected on PATH"),
+        }),
+        el("div", { class: "row-gap wrap" }, [useBtn, testBtn]),
+        testOut,
+      ]);
+    })
+  );
+}
+
+export async function loadLocalAiClis(probe = false) {
+  if (state.vaultStatus !== "unlocked") return null;
+  try {
+    const data = await api(`/api/v1/ai/local-clis?probe=${probe ? "true" : "false"}`);
+    renderLocalAiClis(data);
+    if (probe) {
+      toast("Local AI assistant scan complete.");
+    }
+    return data;
+  } catch (err) {
+    if (err && err.status === 404) {
+      const statusText = $("local-cli-status-text");
+      if (statusText) statusText.textContent = "Built-in Math Active — configure an AI provider below if desired";
+      return null;
+    }
+    if (probe && err && err.status !== 401) {
+      toast(err.message || "Could not scan local AI assistants.", true);
+    }
+    return null;
+  }
+}
+
 export async function loadEmailConfig() {
   try {
     const cfg = await api("/api/v1/email/config");
@@ -1444,7 +2040,7 @@ export async function loadEmailConfig() {
     if (folder) folder.value = cfg.folder || "INBOX";
     if (badge) {
       badge.className = cfg.enabled ? "pill pill-calm" : "pill pill-soft";
-      badge.textContent = cfg.enabled ? "READ-ONLY ACTIVE" : "DISABLED";
+      badge.textContent = cfg.enabled ? "Active" : "Off";
     }
   } catch (_err) {
     // Ignore when locked
@@ -1504,6 +2100,11 @@ export async function loadSettings() {
       if (n) n.value = String(v ?? "");
     };
 
+    const autoCliCb = $("set-local-cli-auto-detect");
+    if (autoCliCb && s.local_cli_auto_detect !== undefined) {
+      autoCliCb.checked = Boolean(s.local_cli_auto_detect);
+    }
+
     setVal("set-opencode-url", s.opencode_base_url || "https://opencode.ai/zen/go/v1");
     setVal("set-opencode-proto", s.opencode_protocol || "auto");
     setVal("set-opencode-quota", s.opencode_max_daily_requests || 60);
@@ -1511,7 +2112,7 @@ export async function loadSettings() {
     if (ocBadge) {
       ocBadge.className = s.opencode_key_configured ? "pill pill-calm" : "pill pill-soft";
       ocBadge.textContent = s.opencode_key_configured
-        ? `${s.opencode_key_source === "env" ? "Env" : "Sealed"} · ${s.opencode_key_masked || "Set"}`
+        ? `${s.opencode_key_source === "env" ? "Env" : "Saved"} · ${s.opencode_key_masked || "Set"}`
         : "Not set";
     }
 
@@ -1520,7 +2121,7 @@ export async function loadSettings() {
     if (gemBadge) {
       gemBadge.className = s.gemini_api_key_set ? "pill pill-blue" : "pill pill-soft";
       gemBadge.textContent = s.gemini_api_key_set
-        ? `${s.gemini_key_source === "env" ? "Env" : "Sealed"} · ${s.gemini_key_masked || "Set"}`
+        ? `${s.gemini_key_source === "env" ? "Env" : "Saved"} · ${s.gemini_key_masked || "Set"}`
         : "Not set";
     }
 
@@ -1530,7 +2131,7 @@ export async function loadSettings() {
     if (cxBadge) {
       cxBadge.className = s.codex_key_configured ? "pill pill-calm" : "pill pill-soft";
       cxBadge.textContent = s.codex_key_configured
-        ? `${s.codex_key_source === "env" ? "Env" : "Sealed"} · ${s.codex_key_masked || "Set"}`
+        ? `${s.codex_key_source === "env" ? "Env" : "Saved"} · ${s.codex_key_masked || "Set"}`
         : "Not set";
     }
 
@@ -1556,7 +2157,9 @@ export async function loadSettings() {
     await Promise.all([
       fetchProviderModels("opencode_go", false, s.opencode_model),
       fetchProviderModels("gemini", false, s.gemini_model),
+      loadPlaidConfig(),
       loadConnections(),
+      loadLocalAiClis(false),
       loadEmailConfig(),
     ]);
   } catch (err) {
@@ -1576,6 +2179,7 @@ export function initVaultAndShell() {
     loadTransactions();
     loadEmailQueue();
   });
+  registerTabHook("coach", () => loadLocalAiClis(false));
   registerTabHook("settings", () => loadSettings());
 
   // --- Vault Setup Form ---
@@ -1587,12 +2191,12 @@ export function initVaultAndShell() {
       const conf = $("vault-setup-confirm").value;
       const errEl = $("vault-setup-error");
       if (pwd.length < 8) {
-        errEl.textContent = "Master password must be at least 8 characters.";
+        errEl.textContent = "Passcode must be at least 8 characters.";
         errEl.classList.remove("hidden");
         return;
       }
       if (pwd !== conf) {
-        errEl.textContent = "Passwords do not match.";
+        errEl.textContent = "Passcodes do not match.";
         errEl.classList.remove("hidden");
         return;
       }
@@ -1622,9 +2226,9 @@ export function initVaultAndShell() {
       if (!_pendingRecoveryData) return;
       try {
         await navigator.clipboard.writeText(_pendingRecoveryData.recoveryKey);
-        toast("Recovery key copied. Store it offline immediately.");
+        toast("Recovery key copied. Store it somewhere safe offline.");
       } catch (_err) {
-        toast("Select and copy the key text manually.", true);
+        toast("Select and copy the recovery key manually.", true);
       }
     });
   }
@@ -1642,7 +2246,7 @@ export function initVaultAndShell() {
         const expected = String(_pendingRecoveryData.tokens[idx] || "").trim().toUpperCase();
         const actual = String(inp.value || "").trim().toUpperCase();
         if (!actual || actual !== expected) {
-          errEl.textContent = `Group #${idx + 1} does not match your Recovery Key. Check your backup and retry.`;
+          errEl.textContent = `Group #${idx + 1} does not match your backup recovery key. Double-check and retry.`;
           errEl.classList.remove("hidden");
           inp.focus();
           return;
@@ -1652,7 +2256,7 @@ export function initVaultAndShell() {
       const needOnboard = !_pendingRecoveryData.onboardingCompleted;
       _pendingRecoveryData = null;
       closeVaultGate();
-      toast("Encrypted vault initialized and recovery key verified.");
+      toast("Passcode created and recovery key verified.");
       if (_onUnlockedCallback) await _onUnlockedCallback();
       if (needOnboard) openOnboarding();
     });
@@ -1701,7 +2305,7 @@ export function initVaultAndShell() {
       const newPwd = $("vault-recover-new-pwd").value;
       const confPwd = $("vault-recover-confirm-pwd").value;
       if (newPwd !== confPwd) {
-        errEl.textContent = "New passwords do not match.";
+        errEl.textContent = "New passcodes do not match.";
         errEl.classList.remove("hidden");
         return;
       }
@@ -1718,7 +2322,7 @@ export function initVaultAndShell() {
           errEl.classList.add("hidden");
           if (res && res.csrf_token) setCsrfToken(res.csrf_token);
           closeVaultGate();
-          toast("Vault recovered and DEK rewrapped with your new password.");
+          toast("Passcode reset and ChronoX unlocked.");
           if (_onUnlockedCallback) await _onUnlockedCallback();
         } catch (err) {
           errEl.textContent = err.message;
@@ -1734,14 +2338,14 @@ export function initVaultAndShell() {
   if (btnLockTop) btnLockTop.addEventListener("click", lockVaultNow);
   if (btnLockSet) btnLockSet.addEventListener("click", lockVaultNow);
 
-  // --- Change Master Password ---
+  // --- Change Master Passcode ---
   const vcpForm = $("vault-change-pwd-form");
   if (vcpForm) {
     vcpForm.addEventListener("submit", async (e) => {
       e.preventDefault();
       const newPwd = $("vcp-new").value;
       if (newPwd !== $("vcp-confirm").value) {
-        toast("New passwords do not match.", true);
+        toast("New passcodes do not match.", true);
         return;
       }
       await withBusy(vcpForm.querySelector("button[type=submit]"), async () => {
@@ -1754,7 +2358,7 @@ export function initVaultAndShell() {
             }),
           });
           vcpForm.reset();
-          toast("Master password updated (DEK rewrapped cleanly).");
+          toast("Master passcode updated.");
         } catch (err) {
           toast(err.message, true);
         }
@@ -1772,7 +2376,7 @@ export function initVaultAndShell() {
             method: "PATCH",
             body: JSON.stringify({ vault_auto_lock_minutes: mins }),
           });
-          toast(`Vault auto-lock timeout set to ${mins} minutes.`);
+          toast(`Auto-lock timeout set to ${mins} minutes.`);
         } catch (err) {
           toast(err.message, true);
         }
@@ -1807,7 +2411,7 @@ export function initVaultAndShell() {
   });
   bindClick("btn-reopen-onboarding", () => openOnboarding());
 
-  // --- Drawers (Impulse Vault, 5-Min Reset, Transaction Inspector) ---
+  // --- Drawers (Impulse Pause, Weekly Check-In, Transaction Inspector) ---
   bindClick("btn-open-impulse-drawer", () => openDrawer("impulse-drawer-overlay"));
   bindClick("btn-goals-open-impulse", () => openDrawer("impulse-drawer-overlay"));
   bindClick("btn-impulse-drawer-close", () => closeDrawer("impulse-drawer-overlay"));
@@ -1827,7 +2431,7 @@ export function initVaultAndShell() {
     }
   }
 
-  // --- Quick-Add & Auto-Sync ---
+  // --- Unified "Say or Log Anything" Command Bar & Quick Action Row ---
   const qaForm = $("quick-add-form");
   if (qaForm) {
     qaForm.addEventListener("submit", async (e) => {
@@ -1837,36 +2441,99 @@ export function initVaultAndShell() {
       if (!text) return;
       await withBusy(qaForm.querySelector("button[type=submit]"), async () => {
         try {
-          const res = await api("/api/v1/quick-add", {
-            method: "POST",
-            body: JSON.stringify({ text }),
-          });
+          await invokeSayHandler(text);
           input.value = "";
-          toast(res.message);
-          await refreshAll();
         } catch (err) {
-          toast(err.message, true);
+          toast((err && err.message) || "Could not process your request.", true);
         }
       });
     });
   }
 
-  document.querySelectorAll("[data-quick]").forEach((chip) => {
-    chip.addEventListener("click", () => {
-      const val = chip.dataset.quick;
-      const inp = $("quick-add-input");
-      if (!inp) return;
-      inp.value = val;
-      inp.focus();
-      if (!val.endsWith(" ")) $("quick-add-form").requestSubmit();
-    });
+  bindClick("btn-quick-park-impulse", () => openDrawer("impulse-drawer-overlay"));
+  bindClick("btn-quick-connect-bank", () => {
+    switchTab("settings");
+    const card = $("connectors-card");
+    if (card) card.scrollIntoView({ behavior: "smooth", block: "start" });
+    const inp = $("set-plaid-client-id");
+    if (inp) inp.focus();
   });
+
+  // --- Export Studio (Apple Numbers .xlsx, CSV, Full CSV Pack .zip) ---
+  const bindExportButton = (id, { url, filenamePrefix, ext, label }) => {
+    const node = $(id);
+    if (!node) return;
+    node.addEventListener("click", (e) => {
+      if (node.tagName === "A") e.preventDefault();
+      withBusy(node, async () => {
+        try {
+          await downloadExportFile({
+            url,
+            defaultFilename: `${filenamePrefix}-${isoDateOffset(0)}.${ext}`,
+            label,
+          });
+        } catch (err) {
+          toast((err && err.message) || `${label} failed.`, true);
+        }
+      });
+    });
+  };
+
+  const numbersExportOpts = {
+    url: "/api/v1/export/numbers?days=365&native=false",
+    filenamePrefix: "chronox-finance-report",
+    ext: "xlsx",
+    label: "Apple Numbers Workbook",
+  };
+  const csvExportOpts = {
+    url: "/api/v1/export/csv?pack=false",
+    filenamePrefix: "chronox-transactions",
+    ext: "csv",
+    label: "Transactions CSV",
+  };
+  const csvPackExportOpts = {
+    url: "/api/v1/export/csv?pack=true",
+    filenamePrefix: "chronox-export-pack",
+    ext: "zip",
+    label: "Full CSV Pack",
+  };
+
+  bindExportButton("btn-quick-export-numbers", numbersExportOpts);
+  bindExportButton("btn-analytics-export-numbers", numbersExportOpts);
+  bindExportButton("btn-activity-export-numbers", numbersExportOpts);
+  bindExportButton("btn-settings-export-numbers", numbersExportOpts);
+  bindExportButton("btn-settings-export-csv", csvExportOpts);
+  bindExportButton("btn-export-csv-link", csvExportOpts);
+  bindExportButton("btn-analytics-export-csv-pack", csvPackExportOpts);
+  bindExportButton("btn-activity-export-csv-pack", csvPackExportOpts);
+  bindExportButton("btn-settings-export-csv-pack", csvPackExportOpts);
+
+  // --- Automagic Local AI CLI Toggle & Re-Scan ---
+  const autoCliToggle = $("set-local-cli-auto-detect");
+  if (autoCliToggle) {
+    autoCliToggle.addEventListener("change", async () => {
+      try {
+        const updated = await api("/api/v1/settings", {
+          method: "PATCH",
+          body: JSON.stringify({ local_cli_auto_detect: autoCliToggle.checked }),
+        });
+        state.settings = updated;
+        syncProviderControls(updated.ai_provider, updated.active_provider_resolved);
+        toast(autoCliToggle.checked ? "Automatic local AI detection enabled." : "Automatic local AI detection paused.");
+        await loadLocalAiClis(false);
+        await refreshAll({ refreshAI: true });
+      } catch (err) {
+        toast(err.message || "Could not update local AI setting.", true);
+      }
+    });
+  }
+  bindClick("btn-rescan-local-clis", (e) => withBusy(e.currentTarget, () => loadLocalAiClis(true)));
 
   bindClick("btn-sync-now", (e) =>
     withBusy(e.currentTarget, async () => {
       try {
         const res = await api("/api/v1/budget/sync", { method: "POST" });
-        toast(`Auto-budget synced. Safe-to-Spend: ${fmtMoney(res.safe_to_spend_cents)}`);
+        toast(`Budget synced. Safe to Spend: ${fmtMoney(res.safe_to_spend_cents)}`);
         await refreshAll();
       } catch (err) {
         toast(err.message, true);
@@ -1874,7 +2541,7 @@ export function initVaultAndShell() {
     })
   );
 
-  // --- Impulse & Weekly Reset Actions ---
+  // --- Impulse & Weekly Check-In Actions ---
   const impForm = $("impulse-form");
   if (impForm) {
     impForm.addEventListener("submit", async (e) => {
@@ -1892,7 +2559,7 @@ export function initVaultAndShell() {
           });
           impForm.reset();
           triggerCelebrate(impForm, true);
-          toast("Parked in Impulse Vault (+15 XP).");
+          toast("Purchase parked for cooling-off pause.");
           await refreshAll();
         } catch (err) {
           toast(err.message, true);
@@ -1909,7 +2576,7 @@ export function initVaultAndShell() {
           body: JSON.stringify({ apply_rebalances: true }),
         });
         triggerCelebrate(e.currentTarget, true);
-        toast("Weekly Money Reset complete (+100 XP & streak protected).");
+        toast("Weekly Check-In complete — streak protected.");
         await refreshAll();
         await loadWeeklyReset();
       } catch (err) {
@@ -2099,7 +2766,7 @@ export function initVaultAndShell() {
         const diff = (Number(_activeTxObj.amount_cents) || 0) - _activeSplitsDraft.reduce((a, s) => a + s.amount_cents, 0);
         if (badge) {
           badge.className = diff === 0 ? "pill pill-calm" : "pill pill-watch";
-          badge.textContent = diff === 0 ? "EXACT SUM MATCH" : diff > 0 ? `${fmtMoney(diff)} REMAINING` : `${fmtMoney(Math.abs(diff))} OVER`;
+          badge.textContent = diff === 0 ? "Exact Match" : diff > 0 ? `${fmtMoney(diff)} remaining` : `${fmtMoney(Math.abs(diff))} over`;
         }
       } else if (field === "memo") {
         _activeSplitsDraft[idx].memo = e.target.value;
@@ -2242,7 +2909,16 @@ export function initVaultAndShell() {
     });
   }
 
-  // --- Plaid Hosted Link (BYOK) + SimpleFIN + IMAP Email Scanner ---
+  // --- Bulletproof 1-Click Plaid Bank Sync + SimpleFIN + Email Scanner ---
+  const onWindowReturnCheckPlaid = () => {
+    if (document.visibilityState === "hidden") return;
+    if (_plaidPendingState && state.vaultStatus === "unlocked") {
+      checkPlaidHostedLinkNow(null, false);
+    }
+  };
+  window.addEventListener("focus", onWindowReturnCheckPlaid);
+  document.addEventListener("visibilitychange", onWindowReturnCheckPlaid);
+
   const plaidCfgForm = $("plaid-config-form");
   if (plaidCfgForm) {
     plaidCfgForm.addEventListener("submit", async (e) => {
@@ -2258,12 +2934,8 @@ export function initVaultAndShell() {
             }),
           });
           $("set-plaid-secret").value = "";
-          const pill = $("plaid-status-pill");
-          if (pill) {
-            pill.className = "pill pill-calm";
-            pill.textContent = "CREDENTIALS SEALED";
-          }
-          toast("Plaid BYOK credentials sealed in vault.");
+          toast("Plaid credentials saved privately on your device.");
+          await loadPlaidConfig();
         } catch (err) {
           toast(err.message, true);
         }
@@ -2273,104 +2945,79 @@ export function initVaultAndShell() {
 
   bindClick("btn-plaid-connect", (e) =>
     withBusy(e.currentTarget, async () => {
-      const stBox = $("plaid-link-status");
+      const clientId = ($("set-plaid-client-id") && $("set-plaid-client-id").value.trim()) || "";
+      const secret = ($("set-plaid-secret") && $("set-plaid-secret").value.trim()) || "";
       try {
-        const lt = await api("/api/v1/plaid/link-token", {
-          method: "POST",
-          body: JSON.stringify({
+        let lt = null;
+        let useHostedEndpoint = true;
+        try {
+          const payload = {
             products: ["transactions"],
             optional_products: ["liabilities", "investments"],
             days_requested: 730,
-          }),
-        });
-        const hostedUrl = lt.hosted_link_url;
-        if (hostedUrl) {
-          const desktop = getDesktopBridge();
-          if (desktop && typeof desktop.openExternal === "function") {
-            await desktop.openExternal(hostedUrl);
-          } else {
-            window.open(hostedUrl, "_blank", "noopener,noreferrer");
-          }
-        }
-        if (stBox) {
-          stBox.textContent = "Hosted Link opened in system browser — waiting for bank completion (up to 730d requested)...";
-          stBox.className = "notice-bar details-spacer";
-          stBox.classList.remove("hidden");
-        }
-        stopPlaidPolling();
-        let attempts = 0;
-        _plaidPollTimer = setInterval(async () => {
-          attempts += 1;
-          if (attempts > 60 || state.vaultStatus !== "unlocked") {
-            stopPlaidPolling();
-            return;
-          }
-          let poll = null;
-          try {
-            poll = await api("/api/v1/plaid/poll-link", {
+          };
+          if (clientId) payload.client_id = clientId;
+          if (secret) payload.secret = secret;
+          lt = await api("/api/v1/plaid/hosted-link", {
+            method: "POST",
+            body: JSON.stringify(payload),
+          });
+        } catch (hostedErr) {
+          if (hostedErr && hostedErr.status === 404) {
+            useHostedEndpoint = false;
+            if (clientId && secret) {
+              await api("/api/v1/plaid/config", {
+                method: "POST",
+                body: JSON.stringify({ client_id: clientId, secret, env: "production" }),
+              });
+            }
+            lt = await api("/api/v1/plaid/link-token", {
               method: "POST",
-              body: JSON.stringify({ link_token: lt.link_token }),
+              body: JSON.stringify({
+                products: ["transactions"],
+                optional_products: ["liabilities", "investments"],
+                days_requested: 730,
+              }),
             });
-          } catch (_pollErr) {
-            return;
+          } else {
+            throw hostedErr;
           }
-          if (!poll) return;
-          if (poll.status === "exited") {
-            stopPlaidPolling();
-            const exitMsg = poll.error_message || "Plaid Hosted Link closed before linking completed.";
-            if (stBox) {
-              stBox.textContent = exitMsg;
-              stBox.className = "notice-bar notice-warn details-spacer";
-              stBox.classList.remove("hidden");
-            }
-            toast(exitMsg, true);
-            return;
-          }
-          if (poll.public_token) {
-            stopPlaidPolling();
-            try {
-              const exRes = await api("/api/v1/plaid/exchange", {
-                method: "POST",
-                body: JSON.stringify({
-                  public_token: poll.public_token,
-                  institution: poll.institution || "Plaid Institution",
-                }),
-              });
-              const newConnId = exRes && (exRes.id || exRes.connection_id);
-              const syncRes = await api("/api/v1/plaid/sync", {
-                method: "POST",
-                body: JSON.stringify(newConnId ? { connection_id: newConnId } : {}),
-              });
-              const note =
-                (syncRes && syncRes.history_note) ||
-                "Plaid bank linked & initial transaction sync complete.";
-              if (stBox) {
-                stBox.textContent = note;
-                stBox.className = "notice-bar details-spacer";
-                stBox.classList.remove("hidden");
-              }
-              toast(note);
-              await loadConnections();
-              await refreshAll();
-            } catch (syncErr) {
-              const msg = (syncErr && syncErr.message) || "Plaid link or initial sync failed.";
-              if (stBox) {
-                stBox.textContent = msg;
-                stBox.className = "notice-bar notice-warn details-spacer";
-                stBox.classList.remove("hidden");
-              }
-              toast(msg, true);
-              await loadConnections();
-            }
-          }
-        }, 3000);
-      } catch (err) {
-        if (stBox) {
-          stBox.textContent = err.message;
-          stBox.className = "notice-bar notice-warn details-spacer";
-          stBox.classList.remove("hidden");
         }
-        toast(err.message, true);
+
+        if ($("set-plaid-secret")) $("set-plaid-secret").value = "";
+        await loadPlaidConfig();
+
+        const hostedUrl = (lt && lt.hosted_link_url) || "";
+        const openRes = hostedUrl
+          ? await openExternalUrl(hostedUrl)
+          : { ok: false, error: "Plaid did not return a hosted sign-in link." };
+
+        _plaidPendingState = {
+          hostedUrl,
+          linkToken: (lt && lt.link_token) || null,
+          useHostedEndpoint,
+          attempts: 0,
+          transientErrors: 0,
+          checking: false,
+        };
+
+        renderPlaidProgress({
+          tone: openRes.ok ? "info" : "warn",
+          message: openRes.ok
+            ? "Bank sign-in opened in your browser — waiting for completion..."
+            : "Finish bank sign-in using the link below",
+          hostedUrl,
+          showCheckBtn: true,
+          openError: openRes.ok ? "" : openRes.error,
+          extraNote:
+            "Complete sign-in with your bank (up to 24 months of history requested). When you return here, ChronoX syncs automatically.",
+        });
+
+        startPlaidPolling();
+      } catch (err) {
+        const msg = (err && err.message) || "Could not start Plaid bank connection.";
+        renderPlaidProgress({ tone: "warn", message: msg });
+        toast(msg, true);
       }
     })
   );
@@ -2392,10 +3039,10 @@ export function initVaultAndShell() {
           $("set-simplefin-token").value = "";
           const syncRes = await api("/api/v1/simplefin/sync", { method: "POST" });
           if (stBox) {
-            stBox.textContent = `SimpleFIN claimed & synced (${syncRes.imported_count || 0} new tx).`;
+            stBox.textContent = `SimpleFIN connected and synced (${syncRes.imported_count || 0} new transactions).`;
             stBox.classList.remove("hidden");
           }
-          toast("SimpleFIN Bridge connected & synced.");
+          toast("SimpleFIN Bridge connected and synced.");
           await loadConnections();
           await refreshAll();
         } catch (err) {
@@ -2409,7 +3056,10 @@ export function initVaultAndShell() {
     });
   }
 
-  bindClick("btn-refresh-connections", () => loadConnections());
+  bindClick("btn-refresh-connections", () => {
+    loadPlaidConfig();
+    loadConnections();
+  });
 
   // --- Email Scanner Config & Scan ---
   const emailCfgForm = $("email-config-form");
@@ -2429,7 +3079,7 @@ export function initVaultAndShell() {
           if (pwd) body.app_password = pwd;
           await api("/api/v1/email/config", { method: "POST", body: JSON.stringify(body) });
           $("email-password").value = "";
-          toast("Read-only IMAP scanner settings saved.");
+          toast("Email bill scanner settings saved.");
           await loadEmailConfig();
         } catch (err) {
           toast(err.message, true);
@@ -2442,7 +3092,7 @@ export function initVaultAndShell() {
     withBusy(e.currentTarget, async () => {
       try {
         const res = await api("/api/v1/email/scan", { method: "POST" });
-        toast(`Email scan complete: ${res.queued_count || 0} item(s) added to review queue.`);
+        toast(`Inbox scan complete: ${res.queued_count || 0} reminder(s) added for review.`);
         await loadEmailQueue();
       } catch (err) {
         toast(err.message, true);
@@ -2451,7 +3101,12 @@ export function initVaultAndShell() {
   bindClick("btn-email-scan-now", runEmailScan);
   bindClick("btn-email-test-scan", runEmailScan);
 
-  // --- Multi-Provider AI Settings Forms ---
+  const formatAiTestReply = (res) => {
+    const msg = (res && (res.detail || res.message)) || (res && res.ok ? "Connection verified." : "Connection failed.");
+    return res && res.latency_ms ? `${msg} (${res.latency_ms}ms)` : msg;
+  };
+
+  // --- Advanced Cloud AI Settings Forms ---
   const ocForm = $("opencode-settings-form");
   if (ocForm) {
     ocForm.addEventListener("submit", async (e) => {
@@ -2468,7 +3123,7 @@ export function initVaultAndShell() {
         try {
           await api("/api/v1/settings", { method: "PATCH", body: JSON.stringify(body) });
           $("set-opencode-key").value = "";
-          toast("OpenCode Go settings sealed in vault.");
+          toast("OpenCode Cloud settings saved.");
           await loadSettings();
         } catch (err) {
           toast(err.message, true);
@@ -2479,7 +3134,7 @@ export function initVaultAndShell() {
   bindClick("btn-clear-opencode-key", (e) =>
     withBusy(e.currentTarget, async () => {
       await api("/api/v1/settings", { method: "PATCH", body: JSON.stringify({ clear_opencode_key: true }) });
-      toast("Cleared OpenCode Go key.");
+      toast("Cleared OpenCode Cloud key.");
       await loadSettings();
     })
   );
@@ -2487,11 +3142,11 @@ export function initVaultAndShell() {
   bindClick("btn-test-opencode", (e) =>
     withBusy(e.currentTarget, async () => {
       const out = $("opencode-test-result");
-      out.textContent = "Testing OpenCode Go...";
+      out.textContent = "Testing OpenCode Cloud...";
       out.classList.remove("hidden");
       try {
         const res = await api("/api/v1/ai/test?provider=opencode_go", { method: "POST" });
-        setNodeIconText(out, res.ok ? "check" : "alert", res.message);
+        setNodeIconText(out, res.ok ? "check" : "alert", formatAiTestReply(res));
       } catch (err) {
         setNodeIconText(out, "alert", err.message);
       }
@@ -2512,7 +3167,7 @@ export function initVaultAndShell() {
         try {
           await api("/api/v1/settings", { method: "PATCH", body: JSON.stringify(body) });
           $("set-gemini-key").value = "";
-          toast("Google Gemini settings sealed in vault.");
+          toast("Google Gemini settings saved.");
           await loadSettings();
         } catch (err) {
           toast(err.message, true);
@@ -2535,7 +3190,7 @@ export function initVaultAndShell() {
       out.classList.remove("hidden");
       try {
         const res = await api("/api/v1/ai/test?provider=gemini", { method: "POST" });
-        setNodeIconText(out, res.ok ? "check" : "alert", res.message);
+        setNodeIconText(out, res.ok ? "check" : "alert", formatAiTestReply(res));
       } catch (err) {
         setNodeIconText(out, "alert", err.message);
       }
@@ -2556,7 +3211,7 @@ export function initVaultAndShell() {
         try {
           await api("/api/v1/settings", { method: "PATCH", body: JSON.stringify(body) });
           $("set-codex-key").value = "";
-          toast("OpenAI / Codex settings sealed in vault.");
+          toast("OpenAI settings saved.");
           await loadSettings();
         } catch (err) {
           toast(err.message, true);
@@ -2567,18 +3222,18 @@ export function initVaultAndShell() {
   bindClick("btn-clear-codex-key", (e) =>
     withBusy(e.currentTarget, async () => {
       await api("/api/v1/settings", { method: "PATCH", body: JSON.stringify({ clear_codex_key: true }) });
-      toast("Cleared OpenAI / Codex key.");
+      toast("Cleared OpenAI key.");
       await loadSettings();
     })
   );
   bindClick("btn-test-codex", (e) =>
     withBusy(e.currentTarget, async () => {
       const out = $("codex-test-result");
-      out.textContent = "Testing OpenAI / Codex...";
+      out.textContent = "Testing OpenAI...";
       out.classList.remove("hidden");
       try {
         const res = await api("/api/v1/ai/test?provider=openai_codex", { method: "POST" });
-        setNodeIconText(out, res.ok ? "check" : "alert", res.message);
+        setNodeIconText(out, res.ok ? "check" : "alert", formatAiTestReply(res));
       } catch (err) {
         setNodeIconText(out, "alert", err.message);
       }
@@ -2601,7 +3256,7 @@ export function initVaultAndShell() {
         try {
           await api("/api/v1/settings", { method: "PATCH", body: JSON.stringify(body) });
           $("set-wrapper-key").value = "";
-          toast("Chat-Wrapper & Codex CLI settings saved.");
+          toast("Custom Gateway settings saved.");
           await loadSettings();
         } catch (err) {
           toast(err.message, true);
@@ -2612,18 +3267,18 @@ export function initVaultAndShell() {
   bindClick("btn-test-wrapper", (e) =>
     withBusy(e.currentTarget, async () => {
       const out = $("wrapper-test-result");
-      out.textContent = "Testing Chat-Wrapper...";
+      out.textContent = "Testing Custom Gateway...";
       out.classList.remove("hidden");
       try {
         const res = await api("/api/v1/ai/test?provider=chat_wrapper", { method: "POST" });
-        setNodeIconText(out, res.ok ? "check" : "alert", res.message);
+        setNodeIconText(out, res.ok ? "check" : "alert", formatAiTestReply(res));
       } catch (err) {
         setNodeIconText(out, "alert", err.message);
       }
     })
   );
 
-  // --- ADHD Profile & Backup Restore ---
+  // --- Budget Preferences & Backup Restore ---
   const profForm = $("profile-settings-form");
   if (profForm) {
     profForm.addEventListener("submit", async (e) => {
@@ -2639,7 +3294,7 @@ export function initVaultAndShell() {
           };
           if ($("set-next-payday").value) body.next_payday_date = $("set-next-payday").value;
           await api("/api/v1/settings", { method: "PATCH", body: JSON.stringify(body) });
-          toast("ADHD profile updated.");
+          toast("Budget preferences saved.");
           await refreshAll();
         } catch (err) {
           toast(err.message, true);
@@ -2686,7 +3341,7 @@ export function initVaultAndShell() {
               await api("/api/v1/backup/import", { method: "POST", body: importFd });
               previewBox.classList.add("hidden");
               previewBox.replaceChildren();
-              toast("JSON backup restored.");
+              toast("Backup restored.");
               await refreshAll({ refreshAI: true });
             } catch (impErr) {
               toast(impErr.message, true);
@@ -2705,7 +3360,7 @@ export function initVaultAndShell() {
             }),
             el("div", {
               class: "small muted",
-              text: "Warning: Restoring this backup replaces your current local ledger tables (sealed API credentials stay untouched).",
+              text: "Warning: Restoring this backup replaces your current accounts and transactions (your saved bank and AI credentials stay untouched).",
             }),
             el("div", { class: "row-gap" }, [confirmBtn, cancelBtn]),
           ])

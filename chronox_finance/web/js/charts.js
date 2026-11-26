@@ -1,5 +1,5 @@
 /**
- * ChronoX Finance — Clean-Room MoneyStill Analytics Dashboard (ES Module)
+ * ChronoX Finance — Cash Flow, Category Spending & Monthly Trend Charts (ES Module)
  * Pure zero-CDN SVG visualizations & interactive Pointer Events:
  * 1. Unified Period Selector (30D | 90D | 1Y | 2Y | Single-Month Drilldown)
  * 2. Top 3 KPI Strip (Savings Rate %, Avg Monthly Surplus, Top 5 Expenses with inline bars)
@@ -13,6 +13,8 @@ import {
   el,
   svgEl,
   makeIcon,
+  renderEmptyState,
+  switchTab,
   api,
   state,
   toast,
@@ -55,7 +57,12 @@ const chartState = {
 function truncateLabel(text, maxChars = 22) {
   const s = String(text ?? "").trim();
   if (s.length <= maxChars) return s;
-  return `${s.slice(0, Math.max(1, maxChars - 1))}...`;
+  const slice = s.slice(0, Math.max(1, maxChars - 1));
+  const lastSpace = slice.lastIndexOf(" ");
+  if (lastSpace >= Math.floor(maxChars * 0.5)) {
+    return `${slice.slice(0, lastSpace)}...`;
+  }
+  return `${slice}...`;
 }
 
 function fmtMonthShort(ym) {
@@ -318,27 +325,30 @@ function renderCashflowSankey(data) {
 
   if (legendHost) {
     const pills = [
-      el("span", { class: "pill pill-calm", text: "INCOME" }),
-      el("span", { class: "pill pill-watch", text: "EXPENSES" }),
+      el("span", { class: "pill pill-calm", text: "Income" }),
+      el("span", { class: "pill pill-watch", text: "Expenses" }),
     ];
-    if (hasDeficitGap) pills.push(el("span", { class: "pill pill-danger", text: "UNFUNDED GAP" }));
-    if (hasVerifiedSavings) pills.push(el("span", { class: "pill pill-blue", text: "SAVINGS & INVEST" }));
-    if (hasUnallocatedSurplus) pills.push(el("span", { class: "pill pill-soft", text: "UNALLOCATED SURPLUS" }));
+    if (hasDeficitGap) pills.push(el("span", { class: "pill pill-danger", text: "Unfunded Gap" }));
+    if (hasVerifiedSavings) pills.push(el("span", { class: "pill pill-blue", text: "Savings & Invest" }));
+    if (hasUnallocatedSurplus) pills.push(el("span", { class: "pill pill-soft", text: "Unallocated Surplus" }));
     legendHost.replaceChildren(...pills);
   }
 
   const defaultMetaText =
-    "Hover or focus any ribbon or node to isolate a single dollar flow (<1s trace).";
+    "Hover or select any bar or ribbon to trace where your money goes.";
   if (meta) meta.textContent = defaultMetaText;
 
   if (!rawNodes.length || !rawLinks.length) {
     wrap.replaceChildren(
-      el("div", { class: "item-box muted small", style: { margin: "12px" } }, [
-        el("span", { class: "inline-icon-row" }, [
-          makeIcon("chart", "ui-icon-sm"),
-          "Log or import income and expense transactions to render the 3-column Cashflow Sankey.",
-        ]),
-      ])
+      renderEmptyState({
+        icon: "chart",
+        title: "No cash flow data yet",
+        subtitle: "Connect a bank account or import a statement to see how your income flows into spending and savings.",
+        actionLabel: "Connect Bank",
+        onAction: () => switchTab("settings"),
+        secondaryLabel: "Import Statement",
+        onSecondary: () => switchTab("activity"),
+      })
     );
     return;
   }
@@ -349,9 +359,14 @@ function renderCashflowSankey(data) {
 
   if (!col1.length || (!col0.length && !col2.length)) {
     wrap.replaceChildren(
-      el("div", { class: "item-box muted small", style: { margin: "12px" } }, [
-        "Insufficient flow data in this period for Sankey rendering.",
-      ])
+      renderEmptyState({
+        icon: "chart",
+        title: "Not enough activity in this period",
+        subtitle: "Add income and expenses or switch to a wider time range above.",
+        actionLabel: "Import Statement",
+        onAction: () => switchTab("activity"),
+        compact: true,
+      })
     );
     return;
   }
@@ -852,7 +867,14 @@ function renderExpenseDonut(data) {
 
   if (!items.length) {
     wrap.replaceChildren(
-      el("div", { class: "muted small", text: "No categorized spending in this period." })
+      renderEmptyState({
+        icon: "pie",
+        title: "No categorized spending yet",
+        subtitle: "Your spending breakdown by category will appear here once transactions are logged or imported.",
+        actionLabel: "Import Statement",
+        onAction: () => switchTab("activity"),
+        compact: true,
+      })
     );
     legend.replaceChildren();
     return;
@@ -965,9 +987,9 @@ function renderExpenseDonut(data) {
         el("span", { class: "row-gap", style: { gap: "7px", minWidth: "0" } }, [
           el("span", { class: "legend-swatch", style: { backgroundColor: color } }),
           el("span", {
-            style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: "600" },
+            style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: "600", minWidth: "0" },
             title: it.label,
-            text: truncateLabel(it.label, 16),
+            text: truncateLabel(it.label, 22),
           }),
         ]),
         el("span", {
@@ -1017,9 +1039,16 @@ function renderTrendChart(data) {
   const pts = Array.isArray(data.monthly_trends) ? data.monthly_trends : [];
   if (!pts.length) {
     wrap.replaceChildren(
-      el("div", { class: "muted small", style: { padding: "14px" }, text: "No monthly trend points in this range yet." })
+      renderEmptyState({
+        icon: "trend",
+        title: "No monthly trend yet",
+        subtitle: "Connect a bank or import statements to track monthly income, spending, and savings over time.",
+        actionLabel: "Connect Bank",
+        onAction: () => switchTab("settings"),
+        compact: true,
+      })
     );
-    scrubBar.replaceChildren(el("span", { class: "muted small", text: "Waiting for monthly ledger data." }));
+    scrubBar.replaceChildren(el("span", { class: "muted small", text: "Monthly breakdown appears here once you have activity." }));
     return;
   }
 

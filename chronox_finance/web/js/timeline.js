@@ -15,6 +15,8 @@ import {
   el,
   svgEl,
   makeIcon,
+  renderEmptyState,
+  switchTab,
   api,
   state,
   toast,
@@ -241,13 +243,31 @@ export async function loadTimelineData() {
   }
 }
 
+function truncateWordBoundary(raw, maxLen = 18) {
+  const s = String(raw || "").trim();
+  if (s.length <= maxLen) return s;
+  const cut = s.slice(0, Math.max(1, maxLen - 1));
+  const lastSpace = cut.lastIndexOf(" ");
+  if (lastSpace >= Math.floor(maxLen * 0.45)) {
+    return `${cut.slice(0, lastSpace)}...`;
+  }
+  return `${cut}...`;
+}
+
 function renderTimelineEmpty(msg) {
   const wrap = $("timeline-svg-wrap");
   if (wrap) {
     wrap.replaceChildren(
-      el("div", { class: "item-box muted small", style: { margin: "12px" } }, [
-        el("span", { class: "inline-icon-row" }, [makeIcon("activity", "ui-icon-sm"), String(msg)]),
-      ])
+      renderEmptyState({
+        icon: "activity",
+        title: "No balance forecast yet",
+        subtitle: String(msg || "Connect a bank account or import transactions to project your upcoming balance."),
+        actionLabel: "Connect Bank",
+        onAction: () => switchTab("settings"),
+        secondaryLabel: "Import Statement",
+        onSecondary: () => switchTab("activity"),
+        compact: true,
+      })
     );
   }
 }
@@ -564,7 +584,7 @@ function renderCashflowTimeline(sim) {
         "font-size": "9.5",
         "font-weight": "700",
         "text-anchor": "end",
-        text: `SAFE-RUNWAY FLOOR ${fmtMoneyCompact(floorCents)}`,
+        text: `SAFETY CUSHION ${fmtMoneyCompact(floorCents)}`,
       })
     );
   }
@@ -774,7 +794,7 @@ function renderCashflowTimeline(sim) {
       "stroke-width": "1.6",
     });
 
-    const shortName = String(gs.goal_name || `Goal ${gs.goal_id}`).slice(0, 14);
+    const shortName = truncateWordBoundary(gs.goal_name || `Goal ${gs.goal_id}`, 18);
     const lblText = svgEl("text", {
       x: initialX.toFixed(1),
       y: labelY.toFixed(1),
@@ -1157,12 +1177,12 @@ function renderOptimalAllocations(steps, totalAnnualBenefitCents) {
   if (totalAnnualBenefitCents > 0) {
     cards.push(
       el("div", { class: "alloc-card", style: { borderLeftColor: "var(--cyan)" } }, [
-        el("span", { class: "pill pill-blue", text: "TOTAL QUANT IMPACT" }),
-        el("strong", { text: "Combined Annualized Value" }),
+        el("span", { class: "pill pill-blue", text: "Estimated Annual Value" }),
+        el("strong", { text: "Combined Annual Savings" }),
         el("div", { class: "alloc-amt", style: { color: "var(--cyan)" }, text: `+${fmtMoney(totalAnnualBenefitCents)}/yr` }),
         el("div", {
           class: "small muted",
-          text: "Combined interest avoided, promo cliff protection & yield across this priority waterfall.",
+          text: "Combined interest avoided, promo deadline protection, and savings yield.",
         }),
       ])
     );

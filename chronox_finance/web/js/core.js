@@ -10,36 +10,36 @@ export const HERO_RING_CIRCUMFERENCE = 2 * Math.PI * 54;
 export const CRED_RING_CIRCUMFERENCE = 2 * Math.PI * 35;
 
 export const TAB_TITLES = {
-  today: "Command",
-  analytics: "Analytics & Forecast",
-  portfolio: "Portfolio",
-  credit: "Credit & Debt",
-  goals: "Goals & Rules",
-  activity: "Activity & Bills",
-  coach: "AI Coach",
-  settings: "Vault & Connectors",
+  today: "Overview",
+  analytics: "Cash Flow",
+  activity: "Activity",
+  portfolio: "Investments",
+  credit: "Credit",
+  goals: "Goals",
+  coach: "Coach",
+  settings: "Settings",
 };
 
 export const VALID_TABS = new Set(Object.keys(TAB_TITLES));
 
 export const MODE_DESCRIPTIONS = {
   deterministic_only:
-    "Pure institutional quant math — zero external AI calls, instant 100% deterministic guidance.",
+    "Built-in financial math only — works completely offline with instant, predictable calculations.",
   hybrid:
-    "Combines exact optimal quant math with stateless prompt-cached AI synthesis and strict mathematical validation.",
+    "Combines exact built-in financial math with AI explanations verified against your real balances.",
   ai_standalone:
-    "Direct AI financial advisor with PII-redacted live snapshots and RSD-safe tone filtering.",
+    "Direct AI financial coaching grounded in your live account balances and spending.",
 };
 
 export const BUCKET_LABELS = {
-  autopay_protection: "Autopay Shield",
-  promo_apr_cliff: "0% Promo Cliff",
+  autopay_protection: "Autopay Protection",
+  promo_apr_cliff: "0% Promo Deadline",
   high_apr_debt: "High-APR Debt",
-  azeo_fico_cliff: "AZEO Score Tier",
-  azeo_score_unlock: "AZEO Score Tier",
-  emergency_buffer: "Liquidity Buffer",
-  tracked_goal: "Tracked Goal",
-  invest_vault: "Invest Guardrail",
+  azeo_fico_cliff: "Credit Utilization Tier",
+  azeo_score_unlock: "Credit Utilization Tier",
+  emergency_buffer: "Safety Cushion",
+  tracked_goal: "Savings Goal",
+  invest_vault: "Safe to Invest",
   low_apr_debt: "Low-APR Debt",
   safety_reserve: "Safety Reserve",
 };
@@ -85,8 +85,39 @@ const _dashboardHooks = new Set();
 const _commandProviders = new Set();
 let _vaultGateHandler = null;
 let _refreshAllImpl = null;
+let _sayHandler = null;
+let _oneTapHandler = null;
 
 export const $ = (id) => document.getElementById(id);
+
+export function registerSayHandler(fn) {
+  _sayHandler = typeof fn === "function" ? fn : null;
+}
+
+export async function invokeSayHandler(text) {
+  if (_sayHandler) {
+    return _sayHandler(text);
+  }
+  const res = await api("/api/v1/quick-add", {
+    method: "POST",
+    body: JSON.stringify({ text }),
+  });
+  toast(res.message || "Saved.");
+  await refreshAll();
+  return res;
+}
+
+export function registerOneTapHandler(fn) {
+  _oneTapHandler = typeof fn === "function" ? fn : null;
+}
+
+export async function invokeOneTapHandler(prefetchedPlan = null) {
+  if (_oneTapHandler) {
+    return _oneTapHandler(prefetchedPlan);
+  }
+  toast("One-Tap Optimize is loading — try again in a moment.", true);
+  return null;
+}
 
 export function registerTabHook(tabName, fn) {
   if (typeof fn !== "function") return;
@@ -188,7 +219,7 @@ export function fmtMoneyCompact(cents) {
 }
 
 /**
- * Format 10^-8 fixed-point unit prices (handles both equities like $185.20 and sub-cent crypto like $0.00002415).
+ * Format fixed-point unit prices (handles both equities like $185.20 and sub-cent crypto like $0.00002415).
  */
 export function fmtE8Price(priceE8) {
   const raw = Number(priceE8) || 0;
@@ -212,7 +243,7 @@ export function fmtE8Price(priceE8) {
 }
 
 /**
- * Format 10^-8 fixed-point quantities (fractional shares or satoshis).
+ * Format fixed-point quantities (fractional shares or crypto units).
  */
 export function fmtE8Qty(qtyE8) {
   const raw = Number(qtyE8) || 0;
@@ -669,6 +700,156 @@ export function setNodeIconText(node, iconName, text) {
   node.replaceChildren(makeIcon(iconName, "ui-icon-sm"), document.createTextNode(String(text ?? "")));
 }
 
+/**
+ * Shared spacious empty-state card immune to chart SVG sizing rules.
+ */
+export function renderEmptyState({
+  icon = "info",
+  title = "Nothing here yet",
+  subtitle = "",
+  actionLabel = "",
+  onAction = null,
+  secondaryLabel = "",
+  onSecondary = null,
+  compact = false,
+} = {}) {
+  const actionButtons = [];
+  if (actionLabel && typeof onAction === "function") {
+    const primaryBtn = el("button", { type: "button", class: "btn btn-primary btn-sm", text: actionLabel });
+    primaryBtn.addEventListener("click", (ev) => onAction(ev));
+    actionButtons.push(primaryBtn);
+  }
+  if (secondaryLabel && typeof onSecondary === "function") {
+    const secBtn = el("button", { type: "button", class: "btn btn-soft btn-sm", text: secondaryLabel });
+    secBtn.addEventListener("click", (ev) => onSecondary(ev));
+    actionButtons.push(secBtn);
+  }
+
+  return el("div", { class: `empty-state${compact ? " empty-state-compact" : ""}` }, [
+    el("div", { class: "empty-state-icon", "aria-hidden": "true" }, [makeIcon(icon, "ui-icon-lg")]),
+    el("p", { class: "empty-state-title", text: title }),
+    subtitle ? el("p", { class: "empty-state-subtitle", text: subtitle }) : null,
+    actionButtons.length ? el("div", { class: "empty-state-actions" }, actionButtons) : null,
+  ]);
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  const parts = [];
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize)));
+  }
+  return btoa(parts.join(""));
+}
+
+function parseFilenameFromHeader(disposition, fallback) {
+  if (!disposition) return fallback;
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match && utf8Match[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1].trim().replace(/^["']|["']$/g, ""));
+    } catch (_e) {
+      // fall through
+    }
+  }
+  const plainMatch = disposition.match(/filename=([^;]+)/i);
+  if (plainMatch && plainMatch[1]) {
+    return plainMatch[1].trim().replace(/^["']|["']$/g, "") || fallback;
+  }
+  return fallback;
+}
+
+/**
+ * Authenticated export download helper supporting both Browser Blob downloads
+ * and native Electron Save dialogs (UTF-8 text & binary .xlsx/.zip files).
+ */
+export async function downloadExportFile({
+  url,
+  defaultFilename = "chronox-export.xlsx",
+  filters = null,
+  label = "Export",
+} = {}) {
+  if (!url) return false;
+  const resp = await fetch(url, { credentials: "same-origin" });
+  if (resp.status === 401) {
+    state.vaultStatus = "locked";
+    triggerVaultGate("locked", "Please unlock ChronoX before exporting.");
+    throw new Error("ChronoX is locked — unlock first to export.");
+  }
+  if (!resp.ok) {
+    let errMsg = `Export failed (HTTP ${resp.status})`;
+    try {
+      const errData = await resp.json();
+      if (errData && (errData.detail || errData.message)) {
+        errMsg = String(errData.detail || errData.message);
+      }
+    } catch (_e) {
+      // ignore non-json error body
+    }
+    throw new Error(errMsg);
+  }
+
+  const filename = parseFilenameFromHeader(resp.headers.get("content-disposition"), defaultFilename);
+  const lowerName = filename.toLowerCase();
+  const isBinary =
+    lowerName.endsWith(".xlsx") ||
+    lowerName.endsWith(".zip") ||
+    lowerName.endsWith(".numbers") ||
+    lowerName.endsWith(".pdf");
+
+  const desktop = getDesktopBridge();
+  if (desktop && typeof desktop.saveFileDialog === "function") {
+    const dialogFilters =
+      filters ||
+      (lowerName.endsWith(".xlsx")
+        ? [{ name: "Apple Numbers / Excel Workbook", extensions: ["xlsx"] }]
+        : lowerName.endsWith(".zip")
+        ? [{ name: "CSV Export Pack (ZIP)", extensions: ["zip"] }]
+        : lowerName.endsWith(".csv")
+        ? [{ name: "CSV Spreadsheet", extensions: ["csv"] }]
+        : [{ name: "All Files", extensions: ["*"] }]);
+
+    let savePayload;
+    if (isBinary) {
+      const buf = await resp.arrayBuffer();
+      savePayload = {
+        defaultName: filename,
+        isBinary: true,
+        contentBase64: arrayBufferToBase64(buf),
+        filters: dialogFilters,
+      };
+    } else {
+      const txt = await resp.text();
+      savePayload = {
+        defaultName: filename,
+        content: txt,
+        filters: dialogFilters,
+      };
+    }
+    const res = await desktop.saveFileDialog(savePayload);
+    if (res && !res.canceled) {
+      if (res.error) throw new Error(res.error);
+      toast(`Saved ${label}${res.filePath ? ` to ${res.filePath}` : "."}`);
+      return true;
+    }
+    return false;
+  }
+
+  const blob = await resp.blob();
+  const objUrl = URL.createObjectURL(blob);
+  try {
+    const a = el("a", { href: objUrl, download: filename, style: { display: "none" } });
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(objUrl), 2500);
+  }
+  toast(`Downloaded ${label} (${filename}).`);
+  return true;
+}
+
 export function renderFormattedText(raw) {
   const frag = document.createDocumentFragment();
   const str = String(raw ?? "")
@@ -1064,12 +1245,29 @@ export function syncModeControls(mode) {
 
 const VALID_PROVIDERS = new Set([
   "auto",
+  "claude_cli",
+  "opencode_cli",
+  "codex_cli",
+  "agy_cli",
   "opencode_go",
   "gemini",
   "openai_codex",
   "chat_wrapper",
-  "codex_cli",
 ]);
+
+export const PROVIDER_DISPLAY_NAMES = {
+  auto: "Auto",
+  claude_cli: "Claude (Local)",
+  opencode_cli: "OpenCode (Local)",
+  codex_cli: "Codex (Local)",
+  agy_cli: "Antigravity (Local)",
+  opencode_go: "OpenCode Cloud",
+  gemini: "Google Gemini",
+  openai_codex: "OpenAI",
+  chat_wrapper: "Custom Gateway",
+  deterministic_local: "Built-in Math",
+  none: "Built-in Math",
+};
 
 export function syncProviderControls(provider, activeResolved) {
   const normalized = VALID_PROVIDERS.has(provider) ? provider : "auto";
@@ -1082,13 +1280,16 @@ export function syncProviderControls(provider, activeResolved) {
   const badge = $("active-provider-badge");
   if (!badge) return;
   const map = {
-    opencode_go: ["pill-calm", "Active: OpenCode Go"],
+    claude_cli: ["pill-calm", "Active: Claude (Local)"],
+    opencode_cli: ["pill-calm", "Active: OpenCode (Local)"],
+    codex_cli: ["pill-calm", "Active: Codex (Local)"],
+    agy_cli: ["pill-blue", "Active: Antigravity (Local)"],
+    opencode_go: ["pill-calm", "Active: OpenCode Cloud"],
     gemini: ["pill-blue", "Active: Google Gemini"],
-    openai_codex: ["pill-calm", "Active: OpenAI / Codex"],
-    chat_wrapper: ["pill-blue", "Active: Chat-Wrapper"],
-    codex_cli: ["pill-watch", "Active: Codex CLI"],
+    openai_codex: ["pill-calm", "Active: OpenAI"],
+    chat_wrapper: ["pill-blue", "Active: Custom Gateway"],
   };
-  const [cls, label] = map[activeResolved] || ["pill-soft", "Active: Local Quant Math"];
+  const [cls, label] = map[activeResolved] || ["pill-soft", "Active: Built-in Math"];
   badge.className = `pill ${cls}`;
   badge.textContent = label;
 }
@@ -1101,27 +1302,30 @@ export function formatProvenance(res) {
   const cachedNote = res && res.cached ? " · cached" : "";
 
   const labelMap = {
+    claude_cli: "Claude (Local)",
+    opencode_cli: "OpenCode (Local)",
+    codex_cli: "Codex (Local)",
+    agy_cli: "Antigravity (Local)",
     gemini: "Google Gemini",
-    opencode_go: "OpenCode Go",
-    openai_codex: "OpenAI / Codex",
-    chat_wrapper: "Chat-Wrapper",
-    codex_cli: "Codex CLI",
+    opencode_go: "OpenCode Cloud",
+    openai_codex: "OpenAI",
+    chat_wrapper: "Custom Gateway",
   };
   const providerLabel = labelMap[provider] || labelMap[source] || null;
 
   if (mode === "deterministic_only" || !providerLabel) {
     return {
       icon: "calculator",
-      text: `Quant Math (Local)${cachedNote}`,
+      text: `Built-in Math${cachedNote}`,
       cls: "pill-soft",
     };
   }
-  const modeTag = mode === "ai_standalone" ? "AI Only" : "Hybrid Verified";
+  const modeTag = mode === "ai_standalone" ? "AI Direct" : "Verified AI";
   const modelShort = model ? ` (${model})` : "";
   return {
     icon: mode === "ai_standalone" ? "sparkles" : "zap",
     text: `${modeTag} · ${providerLabel}${modelShort}${cachedNote}`,
-    cls: provider === "gemini" || provider === "chat_wrapper" ? "pill-blue" : "pill-calm",
+    cls: provider === "gemini" || provider === "chat_wrapper" || provider === "agy_cli" ? "pill-blue" : "pill-calm",
   };
 }
 
@@ -1136,11 +1340,11 @@ export async function setIntelligenceMode(mode) {
     syncProviderControls(updated.ai_provider, updated.active_provider_resolved);
     const label =
       mode === "deterministic_only"
-        ? "Quant Math Only (zero external calls)"
+        ? "Built-in Math (Offline)"
         : mode === "ai_standalone"
-        ? "AI Only (Standalone)"
-        : "Hybrid (Quant Math + Verified AI)";
-    toast(`Intelligence Mode: ${label}`);
+        ? "AI Direct"
+        : "Auto (Math + AI)";
+    toast(`Smart Mode: ${label}`);
     pushTraySnapshot();
     await refreshAll({ refreshAI: true });
   } catch (err) {
@@ -1156,7 +1360,8 @@ export async function setPreferredProvider(provider) {
     });
     state.settings = updated;
     syncProviderControls(updated.ai_provider, updated.active_provider_resolved);
-    toast(`AI Provider set to ${provider.replace(/_/g, " ").toUpperCase()}`);
+    const friendly = PROVIDER_DISPLAY_NAMES[provider] || provider.replace(/_/g, " ");
+    toast(`AI Provider set to ${friendly}`);
     await refreshAll({ refreshAI: true });
   } catch (err) {
     toast(err.message, true);
@@ -1832,90 +2037,124 @@ function getBaseCommands() {
   const desktop = getDesktopBridge();
   const commands = [
     {
+      id: "run-onetap",
+      icon: "sparkles",
+      title: "Run One-Tap Financial Optimization",
+      sub: "AI + statistical cashflow check, tail-risk cushion, and 1-click plan",
+      keywords: "one tap optimize plan cvar cushion ai quant",
+      run: () => invokeOneTapHandler(),
+    },
+    {
+      id: "export-numbers",
+      icon: "download",
+      title: "Export Apple Numbers Workbook (.xlsx)",
+      sub: "Multi-sheet graphical financial workbook ready for Apple Numbers & Excel",
+      keywords: "export apple numbers excel xlsx workbook report",
+      run: () =>
+        downloadExportFile({
+          url: "/api/v1/export/numbers?days=365&native=false",
+          defaultFilename: `chronox-finance-${isoDateOffset(0)}.xlsx`,
+          label: "Apple Numbers Workbook",
+        }).catch((err) => toast(err.message, true)),
+    },
+    {
+      id: "export-csv-pack",
+      icon: "download",
+      title: "Export Full CSV Pack (.zip)",
+      sub: "Complete financial tables in clean CSV format",
+      keywords: "export csv zip spreadsheet backup",
+      run: () =>
+        downloadExportFile({
+          url: "/api/v1/export/csv?pack=true",
+          defaultFilename: `chronox-csv-pack-${isoDateOffset(0)}.zip`,
+          label: "Full CSV Pack",
+        }).catch((err) => toast(err.message, true)),
+    },
+    {
       id: "nav-today",
       icon: "activity",
-      title: "Command — Safe-to-Spend & Jars",
-      sub: "Daily tactical readout, Invest Firewall, 5 Jars & Bill Radar",
-      keywords: "command today home dashboard safe spend jars",
+      title: "Overview — Safe to Spend & Jars",
+      sub: "Daily allowance, Safe to Invest, Money Jars & Upcoming Bills",
+      keywords: "overview command today home dashboard safe spend jars",
       run: () => switchTab("today"),
     },
     {
       id: "nav-analytics",
       icon: "chart",
-      title: "Analytics & Forecast Timeline",
-      sub: "MoneyStill Sankey, Expense Donut, 2Y Trend & Draggable Cashflow Forecast",
-      keywords: "analytics sankey donut trend timeline scenario forecast net worth",
+      title: "Cash Flow & Balance Forecast",
+      sub: "Where your money goes, spending by category, monthly trends & forecast",
+      keywords: "cash flow analytics sankey donut trend timeline forecast net worth",
       run: () => switchTab("analytics"),
+    },
+    {
+      id: "nav-activity",
+      icon: "receipt",
+      title: "Activity — Transactions, Accounts & Bills",
+      sub: "Searchable history, statement imports, splits, notes & recurring bills",
+      keywords: "activity transactions bills splits tags comments import csv pdf email",
+      run: () => switchTab("activity"),
     },
     {
       id: "nav-portfolio",
       icon: "briefcase",
-      title: "Portfolio — Stocks & Crypto",
-      sub: "Holdings, Live Quotes, Coinbase/Schwab/Robinhood/Plaid Connectors",
-      keywords: "portfolio stocks crypto holdings coinbase schwab robinhood net worth",
+      title: "Investments — Stocks & Crypto",
+      sub: "Holdings, live prices & view-only brokerage connections",
+      keywords: "investments portfolio stocks crypto holdings coinbase schwab robinhood",
       run: () => switchTab("portfolio"),
     },
     {
       id: "nav-credit",
       icon: "card",
-      title: "Credit & Debt Analysis",
-      sub: "Bureau Scores, Factor Breakdown, Chase 5/24, AZEO & Payoff Strategies",
-      keywords: "credit debt fico vantage 5/24 azeo utilization bureau",
+      title: "Credit & Debt",
+      sub: "Credit score factors, best time to pay cards & debt payoff plans",
+      keywords: "credit debt fico vantage utilization bureau payoff",
       run: () => switchTab("credit"),
     },
     {
       id: "nav-goals",
       icon: "target",
-      title: "Goals & Automation Rules",
-      sub: "Drag-to-reorder goals, $1,000 Purchase Optimizer & Firefly Rule Builder",
-      keywords: "goals rules firefly automation drag swipe optimizer 1000",
+      title: "Goals & Auto-Categorize Rules",
+      sub: "Savings goals priority order, purchase planner & sorting rules",
+      keywords: "goals rules automation drag swipe purchase planner",
       run: () => switchTab("goals"),
-    },
-    {
-      id: "nav-activity",
-      icon: "receipt",
-      title: "Activity, Accounts, Splits & Bills",
-      sub: "2-Year Ledger, Statement Import, Splits/Tags/Comments & Email Bill Queue",
-      keywords: "activity transactions bills splits tags comments import csv pdf email",
-      run: () => switchTab("activity"),
     },
     {
       id: "nav-coach",
       icon: "cpu",
-      title: "AI Coach & Agentic Command Console",
-      sub: "Natural-language Plan -> Diff -> Execute -> Undo + Suggestions",
-      keywords: "ai coach agentic plan execute undo chat",
+      title: "AI Financial Coach",
+      sub: "Ask questions, review proposed updates & personalized tips",
+      keywords: "ai coach assistant plan execute undo chat",
       run: () => switchTab("coach"),
     },
     {
       id: "nav-settings",
       icon: "sliders",
-      title: "Vault & Connectors Settings",
-      sub: "Master Password, Plaid Hosted Link, SimpleFIN, IMAP Email & AI Providers",
-      keywords: "settings vault plaid simplefin imap email codex gemini opencode password",
+      title: "Settings — Banks, AI & Exports",
+      sub: "Connect Plaid or SimpleFIN, local AI assistants, passcode & exports",
+      keywords: "settings banks plaid simplefin email ai local cli password export",
       run: () => switchTab("settings"),
     },
     {
       id: "open-impulse",
       icon: "snowflake",
-      title: "Open Impulse Cooling-Off Drawer",
-      sub: "Park cravings for 48h and claim Dopamine Wins",
+      title: "Open Impulse Pause Vault",
+      sub: "Park unplanned purchases for 48 hours before deciding",
       keywords: "impulse vault park cool urge drawer",
       run: () => openDrawer("impulse-drawer-overlay"),
     },
     {
       id: "open-reset",
       icon: "zap",
-      title: "Open 5-Minute Weekly Reset Drawer",
-      sub: "1-tap triage, subscription check & streak protection",
-      keywords: "weekly reset triage streak drawer",
+      title: "Open Weekly Money Check-In",
+      sub: "5-minute categorization, subscription check & auto-rebalance",
+      keywords: "weekly check-in reset triage streak drawer",
       run: () => openDrawer("reset-drawer-overlay"),
     },
     {
       id: "open-ai-usage",
       icon: "pie",
-      title: "Inspect AI Token & Cache Savings Modal",
-      sub: "Requests, prompt cache hit %, exact $ saved & quota guard",
+      title: "View AI Usage & Savings",
+      sub: "Monthly requests, cache savings & daily limit",
       keywords: "ai usage tokens cache cost savings quota",
       run: () => {
         const btn = $("btn-ai-usage");
@@ -1925,9 +2164,9 @@ function getBaseCommands() {
     {
       id: "lock-vault",
       icon: "lock",
-      title: "Lock Vault Immediately",
-      sub: "Clear session & require master password on next access",
-      keywords: "lock vault logout security password",
+      title: "Lock ChronoX Now",
+      sub: "Require your passcode on next access",
+      keywords: "lock logout security passcode password",
       run: () => {
         const btn = $("btn-lock-vault");
         if (btn) btn.click();
@@ -1936,31 +2175,31 @@ function getBaseCommands() {
     {
       id: "mode-quant",
       icon: "calculator",
-      title: "Intelligence Mode -> Quant Math Only",
-      sub: "100% deterministic local math, zero external AI calls",
-      keywords: "mode quant math deterministic offline local",
+      title: "Smart Mode -> Built-in Math",
+      sub: "100% offline calculations without calling external AI",
+      keywords: "mode math offline local",
       run: () => setIntelligenceMode("deterministic_only"),
     },
     {
       id: "mode-hybrid",
       icon: "zap",
-      title: "Intelligence Mode -> Hybrid Verified AI",
-      sub: "Optimal quant math grounded + verified AI synthesis",
-      keywords: "mode hybrid verified ai",
+      title: "Smart Mode -> Auto (Recommended)",
+      sub: "Exact built-in math paired with verified AI explanations",
+      keywords: "mode auto hybrid verified ai",
       run: () => setIntelligenceMode("hybrid"),
     },
     {
       id: "mode-standalone",
       icon: "sparkles",
-      title: "Intelligence Mode -> AI Only",
-      sub: "Direct AI advisor with RSD-safe tone filtering",
-      keywords: "mode standalone ai only llm",
+      title: "Smart Mode -> AI Direct",
+      sub: "Direct AI coaching grounded in your balances",
+      keywords: "mode standalone ai direct",
       run: () => setIntelligenceMode("ai_standalone"),
     },
     {
       id: "toggle-theme",
       icon: curTheme === "dark" ? "sun" : "moon",
-      title: curTheme === "dark" ? "Switch to Light Steel Theme" : "Switch to Dark Industrial Theme",
+      title: curTheme === "dark" ? "Switch to Light Theme" : "Switch to Dark Theme",
       sub: "Toggle high-contrast display theme",
       keywords: "theme dark light mode appearance",
       run: () => toggleTheme(),
@@ -1968,12 +2207,12 @@ function getBaseCommands() {
     {
       id: "sync-now",
       icon: "refresh",
-      title: "Run Auto-Budget Sync Now",
-      sub: "Recalculate 5 Jars, Bills Shield & Safe-to-Spend",
+      title: "Recalculate Budget Now",
+      sub: "Refresh Money Jars, Upcoming Bills & Safe to Spend",
       keywords: "sync refresh recalculate budget",
       run: async () => {
         const res = await api("/api/v1/budget/sync", { method: "POST" });
-        toast(`Auto-budget synced. Safe-to-Spend: ${fmtMoney(res.safe_to_spend_cents)}`);
+        toast(`Budget synced. Safe to Spend: ${fmtMoney(res.safe_to_spend_cents)}`);
         await refreshAll();
       },
     },
@@ -1993,8 +2232,8 @@ function getBaseCommands() {
       {
         id: "desktop-hud",
         icon: "zap",
-        title: "Open Quick Capture HUD",
-        sub: "Summon floating global expense & impulse capture bar",
+        title: "Open Quick Capture",
+        sub: "Summon floating quick capture bar",
         keywords: "hud quick capture desktop floating shortcut",
         run: () => {
           if (typeof desktop.toggleQuickCapture === "function") desktop.toggleQuickCapture();
@@ -2003,17 +2242,17 @@ function getBaseCommands() {
       {
         id: "desktop-logs",
         icon: "terminal",
-        title: "View Backend Sidecar Logs",
-        sub: "Inspect sanitized local Python diagnostics",
-        keywords: "logs diagnostics debug backend sidecar desktop",
+        title: "View App Diagnostics",
+        sub: "Inspect sanitized local diagnostic output",
+        keywords: "logs diagnostics debug desktop",
         run: () => openBackendLogsModal(),
       },
       {
         id: "desktop-data-dir",
         icon: "folder",
-        title: "Open Local Vault Data Folder",
-        sub: "Reveal SQLite ledger & encrypted secrets directory",
-        keywords: "folder data vault sqlite directory",
+        title: "Open Local Data Folder",
+        sub: "Reveal your private ChronoX data folder on this device",
+        keywords: "folder data directory",
         run: () => {
           if (typeof desktop.openDataDir === "function") desktop.openDataDir();
         },
@@ -2034,20 +2273,16 @@ function renderPaletteResults() {
   const base = getBaseCommands();
 
   const items = [];
-  if (query && /\d/.test(query)) {
+  if (query && (/\d/.test(query) || query.split(/\s+/).length >= 3 || query.endsWith("?"))) {
     items.push({
       id: "quick-add-dynamic",
-      icon: "zap",
-      title: `Quick-Log: "${query}"`,
-      sub: "Instant natural-language expense, income, or impulse entry",
+      icon: "sparkles",
+      title: `Say or Log: "${query}"`,
+      sub: "Log an expense, move savings, ask a question, or trigger an export",
       run: async () => {
         try {
-          const res = await api("/api/v1/quick-add", {
-            method: "POST",
-            body: JSON.stringify({ text: query }),
-          });
-          toast(res.message);
-          await refreshAll();
+          switchTab("today");
+          await invokeSayHandler(query);
         } catch (err) {
           toast(err.message, true);
         }
@@ -2073,7 +2308,7 @@ function renderPaletteResults() {
     list.replaceChildren(
       el("div", {
         class: "muted small",
-        text: "No matching command. Try 'coffee 6.50', 'analytics', 'portfolio', or 'lock'.",
+        text: 'No matching command. Try typing a sentence like "I spent $12 on lunch" or "one-tap".',
         style: { padding: "14px" },
       })
     );
@@ -2216,6 +2451,11 @@ export function initCommandPalette() {
       }
       if (state.paletteOpen) {
         closePalette();
+        return;
+      }
+      const oneTapOverlay = $("onetap-overlay");
+      if (oneTapOverlay && !oneTapOverlay.classList.contains("hidden")) {
+        closeOverlay(oneTapOverlay);
         return;
       }
       const aiOverlay = $("ai-usage-overlay");

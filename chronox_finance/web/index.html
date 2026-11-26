@@ -3,17 +3,17 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ChronoX Finance — Industrial Personal Finance Command</title>
+  <title>ChronoX — Personal Finance, Simplified</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='2' fill='%23080a0d'/%3E%3Crect x='2' y='2' width='28' height='28' rx='1' fill='none' stroke='%232b3542' stroke-width='1.5'/%3E%3Ccircle cx='16' cy='16' r='9.5' fill='none' stroke='%2310b981' stroke-width='2.4' stroke-dasharray='46 14'/%3E%3Cpath d='M16 10v6l4.2 2.4' fill='none' stroke='%2306b6d4' stroke-width='2.4' stroke-linecap='square'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
-  <!-- First-Party Native Desktop Titlebar (progressive enhancement: revealed only in Electron) -->
+  <!-- First-Party Native Desktop Titlebar (revealed only in Electron) -->
   <div id="desktop-titlebar" class="desktop-titlebar hidden" role="region" aria-label="Application titlebar">
     <div class="titlebar-left">
-      <div class="vault-status-pill" title="ChronoX local SQLite ledger and encrypted secrets status">
+      <div class="vault-status-pill" title="ChronoX private local workspace status">
         <span id="titlebar-vault-dot" class="vault-dot is-locked" aria-hidden="true"></span>
-        <span id="titlebar-vault-label">VAULT LOCKED</span>
+        <span id="titlebar-vault-label">Locked</span>
       </div>
     </div>
     <div class="titlebar-center">
@@ -21,16 +21,16 @@
         <circle cx="14" cy="14" r="10.5" stroke="currentColor" stroke-width="2.5" stroke-dasharray="50 15" />
         <path d="M14 8.5V14L18 16.5" stroke="currentColor" stroke-width="2.5" stroke-linecap="square" />
       </svg>
-      <span class="titlebar-app-name">CHRONOX FINANCE</span>
+      <span class="titlebar-app-name">ChronoX</span>
       <span class="titlebar-sep" aria-hidden="true">/</span>
-      <span id="titlebar-view-subtitle" class="titlebar-subtitle">Command</span>
+      <span id="titlebar-view-subtitle" class="titlebar-subtitle">Overview</span>
     </div>
     <div class="titlebar-right">
-      <button id="btn-desktop-hud" type="button" class="titlebar-hud-btn" title="Open Quick Capture HUD" aria-label="Open Quick Capture HUD">
+      <button id="btn-desktop-hud" type="button" class="titlebar-hud-btn" title="Open Quick Capture" aria-label="Open Quick Capture">
         <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true">
           <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
         </svg>
-        <span class="titlebar-hud-label">QUICK CAPTURE</span>
+        <span class="titlebar-hud-label">Quick Capture</span>
         <kbd id="desktop-hud-kbd" class="titlebar-kbd">Ctrl+Shift+Space</kbd>
       </button>
       <div id="desktop-win-controls" class="win-controls hidden" role="group" aria-label="Window controls">
@@ -59,7 +59,7 @@
   </div>
 
   <!-- ======================================================================= -->
-  <!-- MANDATORY LAUNCH VAULT GATE (Setup + Recovery Key + Unlock + Recover)   -->
+  <!-- PRIVATE LOCAL LOCK (Setup + Recovery Key + Unlock + Reset Password)     -->
   <!-- ======================================================================= -->
   <div id="vault-overlay" class="overlay vault-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="vault-gate-title">
     <div class="vault-card modal-card">
@@ -72,89 +72,89 @@
           </svg>
         </div>
         <div>
-          <span class="eyebrow">LOCAL ENVELOPE-ENCRYPTED VAULT</span>
-          <h2 id="vault-gate-title">CHRONOX VAULT LOCKED</h2>
+          <span class="eyebrow">Private Local Lock</span>
+          <h2 id="vault-gate-title">Unlock ChronoX</h2>
         </div>
       </div>
 
-      <!-- Mode A: First-Run Vault Setup -->
+      <!-- Mode A: First-Run Passcode Setup -->
       <section id="vault-pane-setup" class="vault-pane hidden">
         <p class="muted small">
-          Create your master vault password. ChronoX seals bank tokens, broker credentials, and AI keys with AES-256-GCM envelope encryption (PBKDF2 600k). The local SQLite ledger is stored in your user profile with <code>0600</code> permissions.
+          Create a passcode to protect your connected accounts and financial data. Everything stays private on your device.
         </p>
         <form id="vault-setup-form" class="stack-sm">
           <label class="field">
-            <span>Master Vault Password (minimum 8 characters)</span>
-            <input id="vault-setup-pwd" type="password" minlength="8" autocomplete="new-password" placeholder="Enter strong master password" required />
+            <span>Master Passcode (minimum 8 characters)</span>
+            <input id="vault-setup-pwd" type="password" minlength="8" autocomplete="new-password" placeholder="Choose a strong passcode" required />
           </label>
           <label class="field">
-            <span>Confirm Master Password</span>
-            <input id="vault-setup-confirm" type="password" minlength="8" autocomplete="new-password" placeholder="Re-enter master password" required />
+            <span>Confirm Passcode</span>
+            <input id="vault-setup-confirm" type="password" minlength="8" autocomplete="new-password" placeholder="Re-enter your passcode" required />
           </label>
-          <button type="submit" class="btn btn-primary btn-block">Initialize Encrypted Vault</button>
+          <button type="submit" class="btn btn-primary btn-block">Create Master Passcode</button>
           <p id="vault-setup-error" class="error-text hidden" role="alert"></p>
         </form>
       </section>
 
-      <!-- Mode B: One-Time Recovery Key Reveal & Mandatory 4-Word Verify -->
+      <!-- Mode B: One-Time Backup Recovery Key Reveal & Confirmation -->
       <section id="vault-pane-recovery-verify" class="vault-pane hidden">
         <div class="notice-bar notice-warn">
-          <strong>RECORD YOUR RECOVERY KEY NOW — SHOWN ONCE ONLY.</strong>
-          If you forget your master password, this key is the ONLY way to unwrap your encrypted secrets.
+          <strong>Save your backup recovery key now — shown once only.</strong>
+          If you forget your passcode, this key is the only way to regain access to your connected accounts.
         </div>
-        <div id="vault-recovery-key-box" class="recovery-key-grid" tabindex="0" aria-label="One-time vault recovery key"></div>
+        <div id="vault-recovery-key-box" class="recovery-key-grid" tabindex="0" aria-label="One-time backup recovery key"></div>
         <div class="row-gap wrap">
-          <button id="btn-copy-recovery-key" type="button" class="btn btn-soft btn-sm">Copy Recovery Key</button>
-          <span class="muted small">Store offline in a password manager or printed backup.</span>
+          <button id="btn-copy-recovery-key" type="button" class="btn btn-soft btn-sm">Copy Backup Key</button>
+          <span class="muted small">Save offline in a password manager or printed note.</span>
         </div>
         <hr class="divider" />
         <form id="vault-recovery-verify-form" class="stack-sm">
-          <span class="eyebrow">MANDATORY 4-WORD CONFIRMATION CHECK</span>
-          <p id="vault-verify-prompt" class="muted small">Type the 4 requested words/segments below to confirm you saved your key:</p>
+          <span class="eyebrow">Quick Backup Confirmation</span>
+          <p id="vault-verify-prompt" class="muted small">Enter the 4 requested segments below to confirm you saved your backup key:</p>
           <div id="vault-verify-inputs" class="verify-grid"></div>
-          <button type="submit" class="btn btn-primary btn-block">Verify Recovery Key &amp; Enter Command Center</button>
+          <button type="submit" class="btn btn-primary btn-block">Verify Backup Key &amp; Open ChronoX</button>
           <p id="vault-verify-error" class="error-text hidden" role="alert"></p>
         </form>
       </section>
 
-      <!-- Mode C: Standard Vault Unlock -->
+      <!-- Mode C: Standard Unlock -->
       <section id="vault-pane-unlock" class="vault-pane hidden">
         <p id="vault-unlock-subtitle" class="muted small">
-          Enter your master vault password to unwrap local credentials and open ChronoX Finance.
+          Enter your passcode to unlock ChronoX. Everything stays private on your device.
         </p>
         <form id="vault-unlock-form" class="stack-sm">
           <label class="field">
-            <span>Master Vault Password</span>
-            <input id="vault-unlock-pwd" type="password" autocomplete="current-password" placeholder="Enter master password" required />
+            <span>Master Passcode</span>
+            <input id="vault-unlock-pwd" type="password" autocomplete="current-password" placeholder="Enter your passcode" required />
           </label>
-          <button type="submit" class="btn btn-primary btn-block">Unlock Vault</button>
+          <button type="submit" class="btn btn-primary btn-block">Unlock ChronoX</button>
           <p id="vault-unlock-error" class="error-text hidden" role="alert"></p>
         </form>
         <div class="vault-footer-links">
-          <button id="btn-vault-show-recover" type="button" class="btn btn-ghost btn-xs">Forgot password? Unlock with Recovery Key</button>
+          <button id="btn-vault-show-recover" type="button" class="btn btn-ghost btn-xs">Forgot passcode? Use Backup Recovery Key</button>
         </div>
       </section>
 
-      <!-- Mode D: Recovery Key Reset -->
+      <!-- Mode D: Recovery Key Password Reset -->
       <section id="vault-pane-recover" class="vault-pane hidden">
         <p class="muted small">
-          Paste your 24-word or 8-group Base32 Recovery Key to unwrap the vault DEK and set a new master password.
+          Paste your saved Backup Recovery Key below to reset your passcode and unlock ChronoX.
         </p>
         <form id="vault-recover-form" class="stack-sm">
           <label class="field">
-            <span>Recovery Key</span>
-            <textarea id="vault-recover-key" rows="3" placeholder="Paste full 24-word or base32 recovery key..." required></textarea>
+            <span>Backup Recovery Key</span>
+            <textarea id="vault-recover-key" rows="3" placeholder="Paste your saved recovery key..." required></textarea>
           </label>
           <label class="field">
-            <span>New Master Password (8+ chars)</span>
-            <input id="vault-recover-new-pwd" type="password" minlength="8" autocomplete="new-password" placeholder="Choose new master password" required />
+            <span>New Passcode (8+ characters)</span>
+            <input id="vault-recover-new-pwd" type="password" minlength="8" autocomplete="new-password" placeholder="Choose a new passcode" required />
           </label>
           <label class="field">
-            <span>Confirm New Password</span>
-            <input id="vault-recover-confirm-pwd" type="password" minlength="8" autocomplete="new-password" placeholder="Confirm new master password" required />
+            <span>Confirm New Passcode</span>
+            <input id="vault-recover-confirm-pwd" type="password" minlength="8" autocomplete="new-password" placeholder="Re-enter your new passcode" required />
           </label>
           <div class="row-gap">
-            <button type="submit" class="btn btn-primary grow">Recover &amp; Rewrap Vault</button>
+            <button type="submit" class="btn btn-primary grow">Reset Passcode &amp; Unlock</button>
             <button id="btn-vault-back-unlock" type="button" class="btn btn-ghost">Back</button>
           </div>
           <p id="vault-recover-error" class="error-text hidden" role="alert"></p>
@@ -164,72 +164,96 @@
   </div>
 
   <!-- ======================================================================= -->
-  <!-- DISMISSIBLE 3-TRACK FIRST-RUN ONBOARDING MODAL                          -->
+  <!-- DISMISSIBLE FIRST-RUN ACCOUNT CONNECTION MODAL                          -->
   <!-- ======================================================================= -->
   <div id="onboarding-overlay" class="overlay modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="onboarding-title">
     <div class="modal-card modal-wide">
       <div class="modal-head">
         <div>
-          <span class="eyebrow">FIRST-RUN DATA INGESTION</span>
-          <h2 id="onboarding-title">Connect Your Financial Data (Optional — Dismissible Anytime)</h2>
+          <span class="eyebrow">Get Started</span>
+          <h2 id="onboarding-title">Connect Your Accounts</h2>
         </div>
-        <button id="btn-onboarding-skip" type="button" class="btn btn-ghost btn-sm">Skip to Command Center</button>
+        <button id="btn-onboarding-skip" type="button" class="btn btn-ghost btn-sm">Skip for Now</button>
       </div>
       <div class="modal-body stack-md">
         <p class="muted small">
-          Choose how you want to bring balances and up to 2 years (730 days) of transaction history into your local ChronoX ledger. You can switch or combine methods anytime in <strong>Vault &amp; Connectors</strong>.
+          Bring your balances and up to 24 months of history into ChronoX automatically, or start by uploading bank statements. You can add or change accounts anytime in <strong>Settings</strong>.
         </p>
         <div class="three-col">
           <article class="track-card">
             <div class="track-head">
-              <span class="pill pill-calm">TRACK 01 · LIVE API</span>
-              <h3>Plaid Hosted Link (BYOK)</h3>
+              <span class="pill pill-calm">Automatic Sync</span>
+              <h3>Connect Your Bank (Plaid)</h3>
             </div>
             <p class="muted small">
-              Bring your own Plaid <code>client_id</code> &amp; <code>secret</code>. Connects live banks, cards, liabilities &amp; investments via Hosted Link in your system browser with 730-day history.
+              Sign in securely in your browser to sync checking, savings, credit cards, and investments with up to 24 months of history.
             </p>
-            <button id="btn-onboard-plaid" type="button" class="btn btn-primary btn-sm">Configure Plaid Link</button>
+            <button id="btn-onboard-plaid" type="button" class="btn btn-primary btn-sm">Connect Your Bank</button>
           </article>
 
           <article class="track-card">
             <div class="track-head">
-              <span class="pill pill-blue">TRACK 02 · BRIDGE</span>
-              <h3>SimpleFIN Bridge</h3>
+              <span class="pill pill-soft">Zero Cloud</span>
+              <h3>Import Statements (CSV / PDF)</h3>
             </div>
             <p class="muted small">
-              Low-cost privacy bridge ($1.50/mo direct to SimpleFIN). Paste a Base64 Setup Token to claim an encrypted access URL and pull up to 730 days of accounts &amp; transactions.
+              Upload CSV, PDF, OFX, or QIF statements from Navy Federal, Chase, Amex, BofA, or Capital One — or enter expenses directly.
             </p>
-            <button id="btn-onboard-simplefin" type="button" class="btn btn-soft btn-sm">Paste SimpleFIN Token</button>
+            <button id="btn-onboard-local" type="button" class="btn btn-soft btn-sm">Import Statements</button>
           </article>
 
           <article class="track-card">
             <div class="track-head">
-              <span class="pill pill-soft">TRACK 03 · ZERO 3RD-PARTY</span>
-              <h3>Local NFCU / CSV / PDF</h3>
+              <span class="pill pill-blue">Privacy Bridge</span>
+              <h3>SimpleFIN Sync</h3>
             </div>
             <p class="muted small">
-              Zero cloud aggregators. Upload Navy Federal CSV/PDF, Chase/Amex/OFX/QIF statements, enable the Desktop Auto-Import Drop Folder, or start entering transactions manually.
+              Connect via SimpleFIN ($1.50/mo direct to SimpleFIN) by pasting a one-time setup token to sync accounts and up to 24 months of activity.
             </p>
-            <button id="btn-onboard-local" type="button" class="btn btn-soft btn-sm">Open Statement Importer</button>
+            <button id="btn-onboard-simplefin" type="button" class="btn btn-soft btn-sm">Connect SimpleFIN</button>
           </article>
         </div>
       </div>
       <div class="modal-foot">
-        <span class="muted small">100% local SQLite ledger · AES-256-GCM sealed credentials · Zero telemetry</span>
-        <button id="btn-onboarding-done" type="button" class="btn btn-primary btn-sm">Continue to Dashboard</button>
+        <span class="muted small">Private and stored on your device · No ads or tracking</span>
+        <button id="btn-onboarding-done" type="button" class="btn btn-primary btn-sm">Continue to Overview</button>
       </div>
     </div>
   </div>
 
   <!-- ======================================================================= -->
-  <!-- AI USAGE, TOKEN CACHE & COST SAVINGS MODAL (Populated by web/js/ai.js)  -->
+  <!-- ONE-TAP OPTIMIZATION MODAL (AI + Statistical Quant Plan & Undo)         -->
+  <!-- ======================================================================= -->
+  <div id="onetap-overlay" class="overlay modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="onetap-title">
+    <div id="onetap-dialog" class="modal-card modal-wide">
+      <div class="modal-head">
+        <div>
+          <span class="eyebrow">AI &amp; Statistical Optimization</span>
+          <h2 id="onetap-title">One-Tap Financial Plan</h2>
+        </div>
+        <div class="row-gap wrap">
+          <div id="onetap-horizon-switcher" class="segmented segmented-sm" role="group" aria-label="Optimization horizon">
+            <button type="button" class="seg-btn active" data-onetap-horizon="30" aria-pressed="true">30D</button>
+            <button type="button" class="seg-btn" data-onetap-horizon="60" aria-pressed="false">60D</button>
+            <button type="button" class="seg-btn" data-onetap-horizon="90" aria-pressed="false">90D</button>
+          </div>
+          <button id="btn-onetap-close" type="button" class="kbd-btn" aria-label="Close One-Tap modal">ESC</button>
+        </div>
+      </div>
+      <div id="onetap-body" class="modal-body stack-md"></div>
+      <div id="onetap-footer" class="modal-foot"></div>
+    </div>
+  </div>
+
+  <!-- ======================================================================= -->
+  <!-- AI USAGE & SAVINGS MODAL (Populated by web/js/ai.js)                    -->
   <!-- ======================================================================= -->
   <div id="ai-usage-overlay" class="overlay modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="ai-usage-title">
     <div id="ai-usage-dialog" class="modal-card modal-wide">
       <div class="modal-head">
         <div>
-          <span class="eyebrow">TELEMETRY &amp; PROMPT CACHE EFFICIENCY</span>
-          <h2 id="ai-usage-title">AI Usage, Cache Hit Rate &amp; Exact Savings</h2>
+          <span class="eyebrow">AI Assistant Activity</span>
+          <h2 id="ai-usage-title">AI Usage &amp; Cost Savings</h2>
         </div>
         <button id="btn-ai-usage-close" type="button" class="kbd-btn" aria-label="Close AI usage modal">ESC</button>
       </div>
@@ -248,7 +272,7 @@
     <div class="drawer-panel">
       <div class="modal-head">
         <div>
-          <span class="eyebrow">TRANSACTION INSPECTOR</span>
+          <span class="eyebrow">Transaction Inspector</span>
           <h2 id="tx-detail-title">Transaction Details</h2>
         </div>
         <button id="btn-tx-detail-close" type="button" class="kbd-btn" aria-label="Close transaction inspector">ESC</button>
@@ -256,13 +280,13 @@
       <div class="modal-body stack-md">
         <div id="tx-detail-header" class="item-box"></div>
 
-        <!-- Exact-Sum Split Editor -->
+        <!-- Split Editor -->
         <section class="stack-sm">
           <div class="section-head">
-            <h3>Exact-Sum Splits</h3>
+            <h3>Split Transaction</h3>
             <span id="tx-splits-balance-badge" class="pill pill-soft">Exact match required</span>
           </div>
-          <p class="muted small">Split across multiple jars or goals. Sum of splits must equal parent amount exactly (parent bank row stays immutable for dedup).</p>
+          <p class="muted small">Divide this transaction across multiple spending jars or goals while keeping your original bank record intact.</p>
           <div id="tx-splits-rows" class="stack-xs"></div>
           <div class="row-gap wrap">
             <button id="btn-tx-split-add-row" type="button" class="btn btn-ghost btn-xs">+ Add Split Line</button>
@@ -273,25 +297,25 @@
 
         <hr class="divider" />
 
-        <!-- Multi-Tags -->
+        <!-- Tags -->
         <section class="stack-sm">
-          <h3>Multi-Tags</h3>
+          <h3>Tags</h3>
           <div id="tx-tags-list" class="chip-row"></div>
           <form id="tx-tag-add-form" class="row-gap">
-            <input id="tx-tag-input" class="grow" type="text" placeholder="Add tag (e.g. tax-deductible, work-reimburse)..." maxlength="40" />
+            <input id="tx-tag-input" class="grow" type="text" placeholder="Add tag (e.g. tax-deductible, travel)..." maxlength="40" />
             <button type="submit" class="btn btn-soft btn-sm">Add Tag</button>
           </form>
         </section>
 
         <hr class="divider" />
 
-        <!-- Timestamped User / AI Comments -->
+        <!-- Notes -->
         <section class="stack-sm">
-          <h3>Audit Comments</h3>
+          <h3>Notes</h3>
           <div id="tx-comments-list" class="stack-xs"></div>
           <form id="tx-comment-form" class="row-gap">
-            <input id="tx-comment-input" class="grow" type="text" placeholder="Add note or context for yourself or AI Coach..." maxlength="500" required />
-            <button type="submit" class="btn btn-primary btn-sm">Post</button>
+            <input id="tx-comment-input" class="grow" type="text" placeholder="Add a note for yourself or AI Coach..." maxlength="500" required />
+            <button type="submit" class="btn btn-primary btn-sm">Save Note</button>
           </form>
         </section>
       </div>
@@ -299,32 +323,32 @@
   </div>
 
   <!-- ======================================================================= -->
-  <!-- IMPULSE COOLING-OFF VAULT DRAWER (Docked from Command & Goals)          -->
+  <!-- IMPULSE PAUSE DRAWER                                                    -->
   <!-- ======================================================================= -->
   <div id="impulse-drawer-overlay" class="overlay drawer-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="impulse-drawer-title">
     <div class="drawer-panel drawer-wide">
       <div class="modal-head">
         <div>
-          <span class="eyebrow">ADHD IMPULSE COOLING-OFF SHIELD</span>
-          <h2 id="impulse-drawer-title">Impulse Cooling-Off Vault</h2>
+          <span class="eyebrow">Cooling-Off Pause</span>
+          <h2 id="impulse-drawer-title">Impulse Pause Vault</h2>
         </div>
         <button id="btn-impulse-drawer-close" type="button" class="kbd-btn" aria-label="Close impulse drawer">ESC</button>
       </div>
       <div class="modal-body stack-md">
         <p class="muted small">
-          Park cravings for 48 hours instead of fighting impulse pressure. If the urge fades, claim your Dopamine Win and sweep 50% to goals.
+          Park unplanned purchases for 48 hours before deciding. If you skip it later, sweep half straight into your savings goals.
         </p>
         <form id="impulse-form" class="form-grid">
-          <input id="imp-name" type="text" placeholder="Item you are tempted to buy" required />
+          <input id="imp-name" type="text" placeholder="Item you are considering" required />
           <input id="imp-price" type="number" step="0.01" min="0.50" placeholder="Price ($)" required />
           <select id="imp-hours">
             <option value="24">24h cooldown</option>
             <option value="48" selected>48h cooldown (recommended)</option>
             <option value="72">72h cooldown</option>
-            <option value="168">7-day shield</option>
+            <option value="168">7-day pause</option>
           </select>
-          <input id="imp-reason" type="text" placeholder="Trigger / note (optional)" />
-          <button type="submit" class="btn btn-primary">Park It (+15 XP)</button>
+          <input id="imp-reason" type="text" placeholder="Why you want it (optional)" />
+          <button type="submit" class="btn btn-primary">Park Purchase</button>
         </form>
         <div class="section-head">
           <h3>Parked Items</h3>
@@ -333,8 +357,8 @@
         <div id="impulse-list" class="jars-grid"></div>
         <hr class="divider" />
         <div class="section-head">
-          <h3>Recent Dopamine Wins</h3>
-          <span class="muted small">Every pause, skip &amp; weekly reset counts</span>
+          <h3>Recent Wins</h3>
+          <span class="muted small">Every pause, skip, and weekly check-in counts</span>
         </div>
         <div id="dopamine-wins-list" class="stack-xs"></div>
       </div>
@@ -342,43 +366,43 @@
   </div>
 
   <!-- ======================================================================= -->
-  <!-- 5-MINUTE WEEKLY MONEY RESET DRAWER (Docked from Command)                -->
+  <!-- WEEKLY CHECK-IN DRAWER                                                  -->
   <!-- ======================================================================= -->
   <div id="reset-drawer-overlay" class="overlay drawer-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="reset-drawer-title">
     <div class="drawer-panel drawer-wide">
       <div class="modal-head">
         <div class="row-gap wrap">
           <div>
-            <span class="eyebrow">WEEKLY MAINTENANCE PROTOCOL</span>
-            <h2 id="reset-drawer-title">5-Minute Weekly Money Reset</h2>
+            <span class="eyebrow">5-Minute Routine</span>
+            <h2 id="reset-drawer-title">Weekly Money Check-In</h2>
           </div>
           <span id="reset-status-pill" class="pill pill-soft">Ready</span>
         </div>
-        <button id="btn-reset-drawer-close" type="button" class="kbd-btn" aria-label="Close weekly reset drawer">ESC</button>
+        <button id="btn-reset-drawer-close" type="button" class="kbd-btn" aria-label="Close weekly check-in drawer">ESC</button>
       </div>
       <div class="modal-body stack-md">
         <div class="reset-steps">
           <div class="reset-step">
-            <h3>01 / Quick 1-Tap Triage</h3>
-            <p class="muted small">Assign a jar once and ChronoX remembers the merchant automatically.</p>
+            <h3>1. Quick Categorization</h3>
+            <p class="muted small">Pick a jar once and ChronoX remembers that merchant automatically.</p>
             <div id="reset-triage-list" class="stack-sm"></div>
           </div>
           <div class="reset-step">
-            <h3>02 / Subscription &amp; Price-Hike Check</h3>
-            <p class="muted small">Flag or archive creeping recurring bills.</p>
+            <h3>2. Subscriptions &amp; Price Hikes</h3>
+            <p class="muted small">Flag or archive recurring bills you no longer want.</p>
             <div id="reset-subs-list" class="stack-sm"></div>
           </div>
           <div class="reset-step">
-            <h3>03 / Matured Impulse Vault Claims</h3>
-            <p class="muted small">Claim cash kept when cravings cooled down.</p>
+            <h3>3. Ready Impulse Claims</h3>
+            <p class="muted small">Claim cash saved from impulses that cooled off.</p>
             <div id="reset-impulses-list" class="stack-sm"></div>
           </div>
           <div class="reset-step">
-            <h3>04 / Zero-Guilt Auto-Rebalance &amp; Lock Week</h3>
+            <h3>4. Auto-Rebalance &amp; Finish</h3>
             <div id="reset-rebalance-list" class="stack-sm"></div>
             <div class="reset-cta">
               <button id="btn-complete-reset" type="button" class="btn btn-primary btn-lg">
-                Complete Weekly Reset (+100 XP &amp; Protect Streak)
+                Complete Weekly Check-In
               </button>
             </div>
           </div>
@@ -402,8 +426,8 @@
           type="text"
           autocomplete="off"
           spellcheck="false"
-          placeholder='Jump to tab, switch AI mode, lock vault, or type "coffee 6.50"...'
-          aria-label="Search commands or quick-add expense"
+          placeholder='Jump anywhere, run One-Tap Optimize, or say "I spent $12 on lunch"...'
+          aria-label="Search commands or say anything"
         />
         <button id="cmd-palette-close" type="button" class="kbd-btn" aria-label="Close command palette">ESC</button>
       </div>
@@ -412,24 +436,24 @@
         <span><kbd>UP</kbd><kbd>DN</kbd> navigate</span>
         <span><kbd>ENTER</kbd> run</span>
         <span><kbd>ESC</kbd> close</span>
-        <span class="palette-hint-right">Quick-log: <code>coffee 6.50</code></span>
+        <span class="palette-hint-right">Say anything or jump to any section</span>
       </div>
     </div>
   </div>
 
-  <!-- Backend Diagnostics Log Viewer Modal (Desktop Mode) -->
+  <!-- App Diagnostics Log Viewer Modal (Desktop Mode) -->
   <div id="desktop-logs-overlay" class="overlay modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="desktop-logs-title">
     <div id="desktop-logs-dialog" class="modal-card modal-wide">
       <div class="modal-head">
         <div class="row-gap wrap">
-          <h2 id="desktop-logs-title" class="h-title">Backend Sidecar Diagnostics</h2>
-          <span id="desktop-logs-meta" class="pill pill-calm">Local sidecar</span>
+          <h2 id="desktop-logs-title" class="h-title">App Diagnostics</h2>
+          <span id="desktop-logs-meta" class="pill pill-calm">Local Engine</span>
         </div>
-        <button id="btn-desktop-logs-close" type="button" class="kbd-btn" aria-label="Close backend diagnostics">ESC</button>
+        <button id="btn-desktop-logs-close" type="button" class="kbd-btn" aria-label="Close app diagnostics">ESC</button>
       </div>
       <div class="modal-body">
-        <div id="desktop-logs-path" class="logs-meta-bar muted small">Sanitized local Python sidecar output (secrets redacted).</div>
-        <pre id="desktop-logs-pre" class="logs-console" tabindex="0">Loading backend logs...</pre>
+        <div id="desktop-logs-path" class="logs-meta-bar muted small">Sanitized local diagnostic output (private keys redacted).</div>
+        <pre id="desktop-logs-pre" class="logs-console" tabindex="0">Loading diagnostic logs...</pre>
       </div>
       <div class="modal-foot">
         <button id="btn-desktop-logs-refresh" type="button" class="btn btn-ghost btn-sm">Refresh</button>
@@ -443,7 +467,7 @@
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="false"></div>
 
   <div class="app-shell">
-    <!-- Top Header -->
+    <!-- Clean Top Header -->
     <header class="topbar">
       <div class="brand">
         <div class="brand-mark" aria-hidden="true">
@@ -454,8 +478,8 @@
           </svg>
         </div>
         <div>
-          <h1>CHRONOX FINANCE</h1>
-          <span class="brand-sub">INDUSTRIAL PERSONAL FINANCE &amp; QUANT COMMAND</span>
+          <h1>ChronoX</h1>
+          <span class="brand-sub">Personal Finance</span>
         </div>
       </div>
 
@@ -465,31 +489,19 @@
             <circle cx="11" cy="11" r="7" />
             <line x1="21" y1="21" x2="16.65" y2="16.65" />
           </svg>
-          <span class="cmd-trigger-label">COMMAND</span>
+          <span class="cmd-trigger-label">Command</span>
           <kbd class="cmd-kbd">Ctrl+K</kbd>
         </button>
 
-        <button id="btn-ai-usage" class="btn btn-ghost btn-sm ai-usage-trigger" type="button" title="Inspect AI Token Usage, Cache Hit % &amp; Exact Savings">
-          <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="square" aria-hidden="true">
-            <rect x="4" y="4" width="16" height="16" />
-            <rect x="9" y="9" width="6" height="6" />
-          </svg>
-          <span id="ai-usage-badge-text">AI: 0 req · 0% cache</span>
-        </button>
-
-        <div id="xp-pill" class="pill pill-xp" title="ADHD Momentum Progress">
-          <span id="xp-level">LV 1</span> · <span id="xp-streak">0W</span>
-        </div>
-
-        <button id="btn-sync-now" class="btn btn-ghost btn-sm" type="button" title="Recalculate Auto-Budget">
+        <button id="btn-sync-now" class="btn btn-ghost btn-sm" type="button" title="Recalculate Budget">
           <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="square" aria-hidden="true">
             <path d="M21 12a9 9 0 1 1-2.64-6.36" />
             <polyline points="21 3 21 9 15 9" />
           </svg>
-          SYNC
+          Sync
         </button>
 
-        <button id="btn-theme-toggle" class="icon-btn" type="button" title="Toggle Dark Industrial / Light Steel theme" aria-label="Toggle color theme" aria-pressed="false">
+        <button id="btn-theme-toggle" class="icon-btn" type="button" title="Switch Dark / Light theme" aria-label="Toggle color theme" aria-pressed="false">
           <svg id="theme-icon-sun" class="hidden" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true">
             <circle cx="12" cy="12" r="4" />
             <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
@@ -499,24 +511,24 @@
           </svg>
         </button>
 
-        <button id="btn-lock-vault" class="btn btn-ghost btn-sm" type="button" title="Lock Vault Immediately">
+        <button id="btn-lock-vault" class="btn btn-ghost btn-sm" type="button" title="Lock ChronoX Immediately">
           <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="square" aria-hidden="true">
             <rect x="4" y="11" width="16" height="10" />
             <path d="M8 11V7a4 4 0 0 1 8 0v4" />
           </svg>
-          LOCK
+          Lock
         </button>
       </div>
     </header>
 
-    <!-- 8-Tab Industrial Navigation Rail -->
+    <!-- Crisp 8-Tab Navigation Rail (Zero overflow at 960px-1440px+) -->
     <nav id="main-tabbar" class="tabbar" role="tablist" aria-label="Main sections">
       <div id="tab-indicator" class="tab-indicator" aria-hidden="true"></div>
       <button id="tab-btn-today" class="tab active" data-tab="today" role="tab" aria-selected="true" aria-controls="tab-today">
         <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="square" aria-hidden="true">
           <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
         </svg>
-        Command
+        Overview
       </button>
       <button id="tab-btn-analytics" class="tab" data-tab="analytics" role="tab" aria-selected="false" aria-controls="tab-analytics">
         <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="square" aria-hidden="true">
@@ -524,29 +536,7 @@
           <line x1="12" y1="20" x2="12" y2="4" />
           <line x1="6" y1="20" x2="6" y2="14" />
         </svg>
-        Analytics &amp; Forecast
-      </button>
-      <button id="tab-btn-portfolio" class="tab" data-tab="portfolio" role="tab" aria-selected="false" aria-controls="tab-portfolio">
-        <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="square" aria-hidden="true">
-          <polyline points="22 7 13.5 15.5 8.5 10.5 2 17" />
-          <polyline points="16 7 22 7 22 13" />
-        </svg>
-        Portfolio
-      </button>
-      <button id="tab-btn-credit" class="tab" data-tab="credit" role="tab" aria-selected="false" aria-controls="tab-credit">
-        <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="square" aria-hidden="true">
-          <rect x="2" y="5" width="20" height="14" />
-          <line x1="2" y1="10" x2="22" y2="10" />
-        </svg>
-        Credit &amp; Debt <span id="badge-credit" class="tab-badge hidden">0</span>
-      </button>
-      <button id="tab-btn-goals" class="tab" data-tab="goals" role="tab" aria-selected="false" aria-controls="tab-goals">
-        <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="square" aria-hidden="true">
-          <circle cx="12" cy="12" r="9" />
-          <circle cx="12" cy="12" r="5" />
-          <circle cx="12" cy="12" r="1.5" />
-        </svg>
-        Goals &amp; Rules
+        Cash Flow
       </button>
       <button id="tab-btn-activity" class="tab" data-tab="activity" role="tab" aria-selected="false" aria-controls="tab-activity">
         <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="square" aria-hidden="true">
@@ -554,56 +544,86 @@
           <line x1="8" y1="8" x2="16" y2="8" />
           <line x1="8" y1="12" x2="16" y2="12" />
         </svg>
-        Activity &amp; Bills <span id="badge-triage" class="tab-badge hidden">0</span>
+        Activity <span id="badge-triage" class="tab-badge hidden">0</span>
+      </button>
+      <button id="tab-btn-portfolio" class="tab" data-tab="portfolio" role="tab" aria-selected="false" aria-controls="tab-portfolio">
+        <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="square" aria-hidden="true">
+          <polyline points="22 7 13.5 15.5 8.5 10.5 2 17" />
+          <polyline points="16 7 22 7 22 13" />
+        </svg>
+        Investments
+      </button>
+      <button id="tab-btn-credit" class="tab" data-tab="credit" role="tab" aria-selected="false" aria-controls="tab-credit">
+        <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="square" aria-hidden="true">
+          <rect x="2" y="5" width="20" height="14" />
+          <line x1="2" y1="10" x2="22" y2="10" />
+        </svg>
+        Credit <span id="badge-credit" class="tab-badge hidden">0</span>
+      </button>
+      <button id="tab-btn-goals" class="tab" data-tab="goals" role="tab" aria-selected="false" aria-controls="tab-goals">
+        <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="square" aria-hidden="true">
+          <circle cx="12" cy="12" r="9" />
+          <circle cx="12" cy="12" r="5" />
+          <circle cx="12" cy="12" r="1.5" />
+        </svg>
+        Goals
       </button>
       <button id="tab-btn-coach" class="tab" data-tab="coach" role="tab" aria-selected="false" aria-controls="tab-coach">
         <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="square" aria-hidden="true">
           <rect x="4" y="4" width="16" height="16" />
           <rect x="9" y="9" width="6" height="6" />
         </svg>
-        AI Coach
+        Coach
       </button>
       <button id="tab-btn-settings" class="tab" data-tab="settings" role="tab" aria-selected="false" aria-controls="tab-settings">
         <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="square" aria-hidden="true">
-          <rect x="4" y="11" width="16" height="10" />
-          <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+          <line x1="4" y1="6" x2="20" y2="6" />
+          <circle cx="9" cy="6" r="2" />
+          <line x1="4" y1="12" x2="20" y2="12" />
+          <circle cx="15" cy="12" r="2" />
+          <line x1="4" y1="18" x2="20" y2="18" />
+          <circle cx="10" cy="18" r="2" />
         </svg>
-        Vault &amp; Connectors
+        Settings
       </button>
     </nav>
 
     <!-- =================================================================== -->
-    <!-- TAB 1: COMMAND (today)                                              -->
+    <!-- TAB 1: OVERVIEW (today)                                             -->
     <!-- =================================================================== -->
     <main id="tab-today" class="tab-panel active" role="tabpanel" aria-labelledby="tab-btn-today">
-      <!-- Zero-Friction Quick-Add Bar -->
+      <!-- Unified "Say or Log Anything" Command Bar -->
       <section class="card quick-add-card">
         <form id="quick-add-form" class="quick-add-row">
           <input
             id="quick-add-input"
             type="text"
-            placeholder='Quick-log: "coffee 6.50", "paycheck +2450", or "impulse 189 keyboard"  (press /)'
+            placeholder='Say or log anything: "I spent $5.75 on coffee because early flight", "put $100 in savings", "Can I afford a $400 monitor?"  (/)'
             autocomplete="off"
             required
           />
-          <button type="submit" class="btn btn-primary">LOG ENTRY</button>
+          <button type="submit" class="btn btn-primary">Send</button>
         </form>
-        <div class="chip-row" aria-label="One-tap quick entries">
-          <span class="chip-label">ONE-TAP:</span>
-          <button type="button" class="chip" data-quick="coffee 6.50">Coffee $6.50</button>
-          <button type="button" class="chip" data-quick="groceries 65">Groceries $65</button>
-          <button type="button" class="chip" data-quick="gas 45">Gas $45</button>
-          <button type="button" class="chip" data-quick="paycheck +2400">Paycheck +$2400</button>
-          <button type="button" class="chip chip-cool" data-quick="impulse 120 ">Park Impulse</button>
+        <div class="chip-row" aria-label="Quick actions">
+          <button id="btn-overview-onetap" type="button" class="btn btn-primary btn-sm">
+            <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true">
+              <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z" />
+            </svg>
+            One-Tap Optimize
+          </button>
+          <button id="btn-quick-park-impulse" type="button" class="btn btn-soft btn-sm">Park Impulse</button>
+          <button id="btn-quick-connect-bank" type="button" class="btn btn-soft btn-sm">Connect Bank</button>
+          <button id="btn-quick-export-numbers" type="button" class="btn btn-ghost btn-sm">Export Report</button>
         </div>
+        <div id="command-say-response" class="say-response-card hidden" aria-live="polite"></div>
       </section>
 
-      <!-- Hero Tactical Readout + Firewall & Drawer Dock -->
+      <!-- Hero Safe-to-Spend & Protection Summary -->
       <section class="hero-grid">
         <div class="card hero-card">
           <div class="hero-top">
-            <span class="eyebrow">SAFE TO SPEND TODAY</span>
-            <span id="payday-chip" class="pill pill-calm">NEXT PAYDAY --D</span>
+            <span class="eyebrow">Safe to Spend Today</span>
+            <span id="payday-chip" class="pill pill-calm">Next payday --d</span>
           </div>
           <div class="hero-body">
             <div class="hero-ring-wrap" role="img" aria-label="Safe to Spend cushion gauge">
@@ -622,19 +642,19 @@
               </svg>
               <div class="ring-center">
                 <span id="hero-ring-pct" class="ring-value">0%</span>
-                <span id="hero-ring-label" class="ring-caption">CUSHION</span>
+                <span id="hero-ring-label" class="ring-caption">Cushion</span>
               </div>
             </div>
             <div class="hero-copy">
               <div id="hero-daily-safe" class="hero-number">$0.00</div>
               <p class="hero-sub">
                 <strong id="hero-total-safe" class="num-inline">$0.00</strong> safe until <span id="hero-payday-date">--</span>
-                <span class="muted">· Bills, cards &amp; buffer shielded.</span>
+                <span class="muted">· Bills, cards &amp; safety cushion protected.</span>
               </p>
             </div>
           </div>
           <details class="math-drawer">
-            <summary>INSPECT EXACT SAFE-TO-SPEND FORMULA</summary>
+            <summary>How Safe to Spend is calculated</summary>
             <div id="safe-math-breakdown" class="math-grid"></div>
           </details>
         </div>
@@ -642,68 +662,73 @@
         <div class="card side-hero-card">
           <div class="mini-block">
             <div class="item-row">
-              <span class="eyebrow">SAFE-TO-INVEST FIREWALL</span>
-              <button type="button" class="btn btn-ghost btn-xs" data-goto-tab="portfolio">PORTFOLIO →</button>
+              <span class="eyebrow">Safe to Invest</span>
+              <button type="button" class="btn btn-ghost btn-xs" data-goto-tab="portfolio">Investments →</button>
             </div>
             <div id="hero-safe-invest" class="metric-md">$0.00</div>
-            <p class="muted small">Hard cap available after bills, cards &amp; liquidity shield are 100% protected.</p>
+            <p class="muted small">Available to invest after bills, credit cards, and your safety cushion are covered.</p>
           </div>
           <hr class="divider" />
           <div class="mini-block">
             <div class="item-row">
-              <span class="eyebrow">CREDIT &amp; GOAL TELEMETRY</span>
+              <span class="eyebrow">Credit &amp; Goals</span>
               <div class="row-gap">
-                <button type="button" class="btn btn-ghost btn-xs" data-goto-tab="credit">CREDIT →</button>
-                <button type="button" class="btn btn-ghost btn-xs" data-goto-tab="goals">GOALS →</button>
+                <button type="button" class="btn btn-ghost btn-xs" data-goto-tab="credit">Credit →</button>
+                <button type="button" class="btn btn-ghost btn-xs" data-goto-tab="goals">Goals →</button>
               </div>
             </div>
-            <div id="hero-credit-pulse" class="small muted">Add credit lines or import a bureau report in Credit &amp; Debt.</div>
+            <div id="hero-credit-pulse" class="small muted">Add credit cards or savings goals to track your progress here.</div>
           </div>
           <hr class="divider" />
           <div class="mini-block">
-            <span class="eyebrow">ADHD PROTOCOLS &amp; DRAWERS</span>
+            <div class="item-row">
+              <span class="eyebrow">Impulse Pause &amp; Check-In</span>
+              <span id="xp-pill" class="pill pill-xp" title="Weekly check-in streak">
+                <span id="xp-level">Level 1</span> · <span id="xp-streak">0 wk streak</span>
+              </span>
+            </div>
             <div class="win-row">
               <div>
                 <div id="hero-impulse-saved" class="metric-sm">$0.00</div>
-                <span class="muted small">kept from skipped impulses</span>
+                <span class="muted small">saved from skipped impulses</span>
               </div>
               <div class="win-badge-col">
-                <div id="hero-level-title" class="pill pill-soft">Operator</div>
-                <div id="hero-grace-note" class="muted small">1 grace freeze ready</div>
+                <div id="hero-level-title" class="pill pill-soft">Steady</div>
+                <div id="hero-grace-note" class="muted small">1 streak freeze ready</div>
               </div>
             </div>
             <div class="row-gap wrap drawer-launch-row">
               <button id="btn-open-impulse-drawer" type="button" class="btn btn-soft btn-xs">
-                Impulse Vault <span id="badge-impulse" class="tab-badge hidden">0</span>
+                Impulse Pause <span id="badge-impulse" class="tab-badge hidden">0</span>
               </button>
               <button id="btn-open-reset-drawer" type="button" class="btn btn-soft btn-xs">
-                5-Min Reset <span id="badge-reset-triage" class="tab-badge hidden">0</span>
+                Weekly Check-In <span id="badge-reset-triage" class="tab-badge hidden">0</span>
               </button>
-              <button type="button" class="btn btn-ghost btn-xs" data-goto-tab="analytics">Forecast Timeline →</button>
+              <button type="button" class="btn btn-ghost btn-xs" data-goto-tab="analytics">Balance Forecast →</button>
             </div>
           </div>
         </div>
       </section>
 
-      <!-- Zero-Guilt Auto-Rebalance Banner -->
+      <!-- Auto-Rebalance Suggestion Banner -->
       <section id="rebalance-banner" class="card calm-banner hidden"></section>
 
-      <!-- 5 Money Jars -->
+      <!-- 5 Spending Jars -->
       <section class="section-block">
         <div class="section-head">
-          <h2>5 MONEY JARS</h2>
-          <span class="muted small">Self-updating automatically from income, bills &amp; historical velocity</span>
+          <h2>Money Jars</h2>
+          <span class="muted small">Updated automatically from your income, bills, and spending pace</span>
         </div>
         <div id="jars-grid" class="jars-grid"></div>
       </section>
 
-      <!-- Command Bottom Grid: 14-Day Bill Radar + Tactical Alerts -->
+      <!-- Overview Bottom Grid: Upcoming Bills + Highlights -->
       <section id="command-bottom-grid" class="two-col section-block">
         <div class="card">
           <div class="section-head">
             <div>
-              <h2>14-DAY BILL RADAR</h2>
-              <span class="muted small">Upcoming obligations shielded from Safe-to-Spend</span>
+              <h2>Upcoming Bills (14 Days)</h2>
+              <span class="muted small">Reserved automatically before calculating Safe to Spend</span>
             </div>
             <span id="bills-total-pill" class="pill pill-blue">$0.00 due</span>
           </div>
@@ -713,10 +738,10 @@
         <div class="card">
           <div class="section-head">
             <div>
-              <h2>COMMAND BRIEFING</h2>
-              <span class="muted small">Quick access to analytics, email bill queue &amp; AI coach</span>
+              <h2>Highlights &amp; Next Steps</h2>
+              <span class="muted small">Recent wins, email bill reminders, and AI Coach</span>
             </div>
-            <button type="button" class="btn btn-primary btn-xs" data-goto-tab="coach">OPEN AI COACH →</button>
+            <button type="button" class="btn btn-primary btn-xs" data-goto-tab="coach">Open Coach →</button>
           </div>
           <div id="command-email-alert" class="notice-bar hidden"></div>
           <div id="command-recent-wins" class="stack-xs"></div>
@@ -725,18 +750,18 @@
     </main>
 
     <!-- =================================================================== -->
-    <!-- TAB 2: ANALYTICS & FORECAST (analytics — charts.js + timeline.js)   -->
+    <!-- TAB 2: CASH FLOW (analytics — charts.js + timeline.js)              -->
     <!-- =================================================================== -->
     <main id="tab-analytics" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-analytics">
-      <!-- Unified Period / Zoom Control Bar -->
+      <!-- Period & Export Bar -->
       <section id="analytics-toolbar" class="card toolbar-card">
         <div class="section-head">
           <div>
-            <span class="eyebrow">MONEYSTILL CASHFLOW TELEMETRY</span>
-            <h2>Analytics &amp; Cashflow Forecast</h2>
+            <span class="eyebrow">Cash Flow &amp; Forecast</span>
+            <h2>Cash Flow</h2>
           </div>
           <div class="row-gap wrap">
-            <div id="analytics-period-switcher" class="segmented segmented-sm" role="group" aria-label="Analytics time period">
+            <div id="analytics-period-switcher" class="segmented segmented-sm" role="group" aria-label="Cash flow time period">
               <button type="button" class="seg-btn" data-analytics-period="30d" aria-pressed="false">30D</button>
               <button type="button" class="seg-btn" data-analytics-period="90d" aria-pressed="false">90D</button>
               <button type="button" class="seg-btn active" data-analytics-period="1y" aria-pressed="true">1Y</button>
@@ -744,6 +769,8 @@
             </div>
             <span id="analytics-month-chip" class="pill pill-blue hidden"></span>
             <button id="btn-analytics-clear-month" type="button" class="btn btn-ghost btn-xs hidden">Clear Month</button>
+            <button id="btn-analytics-export-numbers" type="button" class="btn btn-soft btn-sm">Export Apple Numbers (.xlsx)</button>
+            <button id="btn-analytics-export-csv-pack" type="button" class="btn btn-ghost btn-sm">Export CSV Pack (.zip)</button>
             <button id="btn-analytics-refresh" type="button" class="btn btn-ghost btn-sm">Refresh</button>
           </div>
         </div>
@@ -752,24 +779,24 @@
       <!-- Top 3-KPI Strip (Savings Rate %, Avg Monthly Surplus, Top 5 Expenses) -->
       <section id="analytics-kpi-strip" class="three-col section-block"></section>
 
-      <!-- Full-Width 3-Column Cashflow Sankey -->
+      <!-- Full-Width Cash Flow Diagram -->
       <section id="analytics-sankey-card" class="card section-block">
         <div class="section-head">
           <div>
-            <h3>3-COLUMN CASHFLOW SANKEY</h3>
-            <span id="analytics-sankey-meta" class="muted small">Income Sources -&gt; Cashflow Hub -&gt; Category Outflows, Verified Transfers &amp; Unallocated Surplus</span>
+            <h3>Where Your Money Goes</h3>
+            <span id="analytics-sankey-meta" class="muted small">Income Sources → Cash Flow Hub → Spending Categories, Transfers &amp; Remaining Surplus</span>
           </div>
           <div id="analytics-sankey-legend" class="row-gap wrap"></div>
         </div>
-        <div id="analytics-sankey-wrap" class="svg-stage svg-stage-sankey" aria-label="Cashflow Sankey flow diagram"></div>
+        <div id="analytics-sankey-wrap" class="svg-stage svg-stage-sankey" aria-label="Cash flow diagram"></div>
       </section>
 
-      <!-- Bottom Split: Segmented Expense Donut + Annual/2Y Trend Chart -->
+      <!-- Bottom Split: Spending by Category Donut + Monthly Trend Chart -->
       <section id="analytics-charts-grid" class="two-col section-block">
         <div id="analytics-donut-card" class="card">
           <div class="section-head">
-            <h3>EXPENSE DISTRIBUTION</h3>
-            <span class="muted small">Shared Sankey palette</span>
+            <h3>Spending by Category</h3>
+            <span class="muted small">Hover or tap a slice to inspect</span>
           </div>
           <div id="analytics-donut-wrap" class="svg-stage svg-stage-donut"></div>
           <div id="analytics-donut-legend" class="donut-legend-grid"></div>
@@ -778,8 +805,8 @@
         <div id="analytics-trend-card" class="card">
           <div class="section-head">
             <div>
-              <h3>INCOME / EXPENSE / SURPLUS TREND</h3>
-              <span class="muted small">Hover to scrub · Click any month to filter</span>
+              <h3>Monthly Income &amp; Spending Trend</h3>
+              <span class="muted small">Hover to inspect · Click any month to filter</span>
             </div>
           </div>
           <div id="analytics-trend-scrub" class="quant-scrub-bar"></div>
@@ -787,17 +814,17 @@
         </div>
       </section>
 
-      <!-- Interactive Draggable Cashflow, Net Worth & Scenario Timeline (timeline.js) -->
+      <!-- Interactive Balance Forecast & Net Worth Timeline -->
       <section id="analytics-timeline-card" class="card section-block">
         <div class="section-head">
           <div>
-            <span class="eyebrow">DIRECT MANIPULATION PROJECTION</span>
-            <h3>Cashflow, Net Worth &amp; Scenario Forecast</h3>
-            <p class="muted small">Drag goal markers horizontally along the X-axis to bend the projected balance curve in real time against your Safe-Runway floor.</p>
+            <span class="eyebrow">Interactive Projection</span>
+            <h3>Balance Forecast &amp; Net Worth</h3>
+            <p class="muted small">Drag goal markers left or right to see how changing target dates affects your future balance.</p>
           </div>
           <div id="timeline-controls" class="row-gap wrap">
             <div id="timeline-mode-switcher" class="segmented segmented-sm" role="group" aria-label="Timeline mode">
-              <button type="button" class="seg-btn active" data-timeline-mode="cashflow" aria-pressed="true">Cashflow</button>
+              <button type="button" class="seg-btn active" data-timeline-mode="cashflow" aria-pressed="true">Cash Flow</button>
               <button type="button" class="seg-btn" data-timeline-mode="net_worth" aria-pressed="false">Net Worth</button>
             </div>
             <div id="timeline-zoom-switcher" class="segmented segmented-sm" role="group" aria-label="Timeline zoom">
@@ -811,59 +838,59 @@
 
         <div class="row-gap wrap timeline-scenario-bar">
           <label class="field-inline">
-            <span class="eyebrow">SCENARIO:</span>
+            <span class="eyebrow">Plan:</span>
             <select id="timeline-scenario-select" aria-label="Active forecast scenario">
-              <option value="">Live Baseline (No Overrides)</option>
+              <option value="">Current Baseline</option>
             </select>
           </label>
-          <button id="btn-timeline-new-scenario" type="button" class="btn btn-soft btn-xs">+ New Scenario</button>
-          <button id="btn-timeline-delete-scenario" type="button" class="btn btn-ghost btn-xs hidden">Delete Scenario</button>
+          <button id="btn-timeline-new-scenario" type="button" class="btn btn-soft btn-xs">+ New Plan</button>
+          <button id="btn-timeline-delete-scenario" type="button" class="btn btn-ghost btn-xs hidden">Delete Plan</button>
         </div>
 
         <div id="timeline-scenario-editor" class="inline-editor hidden">
           <form id="timeline-scenario-form" class="form-grid-compact">
-            <input id="ts-name" type="text" placeholder="Scenario name (e.g. Raise +$500/mo)" required />
-            <input id="ts-monthly-delta" type="number" step="10" placeholder="Monthly delta ($; +/-)" value="0" />
-            <input id="ts-oneoff-delta" type="number" step="10" placeholder="One-off expense/windfall ($)" value="0" />
-            <input id="ts-oneoff-date" type="date" title="One-off event date" />
-            <button type="submit" class="btn btn-primary btn-sm">Save Scenario</button>
+            <input id="ts-name" type="text" placeholder="Plan name (e.g. Raise +$500/mo)" required />
+            <input id="ts-monthly-delta" type="number" step="10" placeholder="Monthly change ($; +/-)" value="0" />
+            <input id="ts-oneoff-delta" type="number" step="10" placeholder="One-time expense or bonus ($)" value="0" />
+            <input id="ts-oneoff-date" type="date" title="One-time event date" />
+            <button type="submit" class="btn btn-primary btn-sm">Save Plan</button>
             <button id="btn-timeline-cancel-scenario" type="button" class="btn btn-ghost btn-sm">Cancel</button>
           </form>
         </div>
 
         <div id="timeline-delta-strip" class="quant-kpi-strip">
           <div class="quant-kpi">
-            <span class="eyebrow">SCENARIO DELTA</span>
+            <span class="eyebrow">Plan Difference</span>
             <div id="timeline-delta-readout" class="quant-kpi-val">$0.00</div>
-            <span id="timeline-delta-pct" class="muted small">vs Live Baseline</span>
+            <span id="timeline-delta-pct" class="muted small">vs Current Baseline</span>
           </div>
           <div class="quant-kpi">
-            <span class="eyebrow">PROJECTED NADIR</span>
+            <span class="eyebrow">Lowest Balance</span>
             <div id="timeline-nadir-readout" class="quant-kpi-val">$0.00</div>
             <span id="timeline-nadir-date" class="muted small">--</span>
           </div>
           <div class="quant-kpi">
-            <span class="eyebrow">SAFE-RUNWAY FLOOR</span>
+            <span class="eyebrow">Safety Cushion</span>
             <div id="timeline-floor-readout" class="quant-kpi-val">$0.00</div>
-            <span class="muted small">Emergency buffer threshold</span>
+            <span class="muted small">Emergency buffer target</span>
           </div>
           <div class="quant-kpi">
-            <span class="eyebrow">END HORIZON VALUE</span>
+            <span class="eyebrow">Projected End Balance</span>
             <div id="timeline-ending-readout" class="quant-kpi-val">$0.00</div>
             <span id="timeline-ending-meta" class="muted small">--</span>
           </div>
         </div>
 
         <div id="timeline-scrub-bar" class="quant-scrub-bar" aria-live="polite">
-          <span class="muted small">Hover timeline to inspect or drag any diamond goal marker to project target date shifts.</span>
+          <span class="muted small">Hover chart to inspect dates or drag any goal marker to adjust its target date.</span>
         </div>
 
-        <div id="timeline-svg-wrap" class="svg-stage svg-stage-timeline" aria-label="Interactive cashflow and scenario forecast chart"></div>
+        <div id="timeline-svg-wrap" class="svg-stage svg-stage-timeline" aria-label="Interactive balance forecast chart"></div>
 
         <div class="quant-alloc-section">
           <div class="section-head">
-            <h4>MARGINAL-ROI SURPLUS ALLOCATION</h4>
-            <span class="muted small">Ranked by guaranteed APR &amp; score tier impact</span>
+            <h4>Smartest Next Moves</h4>
+            <span class="muted small">Ranked by guaranteed interest saved and financial safety</span>
           </div>
           <div id="timeline-alloc-grid" class="alloc-grid"></div>
         </div>
@@ -871,41 +898,41 @@
     </main>
 
     <!-- =================================================================== -->
-    <!-- TAB 3: PORTFOLIO (portfolio — portfolio.js)                         -->
+    <!-- TAB 3: INVESTMENTS (portfolio — portfolio.js)                       -->
     <!-- =================================================================== -->
     <main id="tab-portfolio" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-portfolio">
-      <!-- Schwab 7-day Refresh Countdown Banner (hidden unless expiring/active) -->
+      <!-- Schwab 7-day Refresh Countdown Banner -->
       <section id="portfolio-schwab-banner" class="card calm-banner hidden"></section>
 
       <!-- Top 4 Portfolio KPI Tiles -->
       <section id="portfolio-kpi-strip" class="stat-strip">
         <div class="card stat-tile">
-          <span class="eyebrow">TOTAL INVESTMENTS</span>
+          <span class="eyebrow">Total Investments</span>
           <div id="port-total-value" class="metric-md">$0.00</div>
-          <span class="muted small">Exact integer-cent valuation</span>
+          <span class="muted small">Stocks, ETFs, crypto &amp; cash</span>
         </div>
         <div class="card stat-tile">
-          <span class="eyebrow">COST BASIS</span>
+          <span class="eyebrow">Cost Basis</span>
           <div id="port-cost-basis" class="metric-md">$0.00</div>
           <span id="port-holdings-count" class="muted small">0 holdings</span>
         </div>
         <div class="card stat-tile">
-          <span class="eyebrow">UNREALIZED P&amp;L</span>
+          <span class="eyebrow">Total Gain / Loss</span>
           <div id="port-unrealized-pnl" class="metric-md">$0.00</div>
           <span id="port-unrealized-pct" class="pill pill-soft">0.00%</span>
         </div>
         <div class="card stat-tile">
-          <span class="eyebrow">LIVE MARKET QUOTES</span>
+          <span class="eyebrow">Market Prices</span>
           <div id="port-last-sync" class="metric-sm">Manual / Cached</div>
-          <button id="btn-port-refresh-quotes" type="button" class="btn btn-primary btn-xs">Refresh Live Quotes</button>
+          <button id="btn-port-refresh-quotes" type="button" class="btn btn-primary btn-xs">Refresh Prices</button>
         </div>
       </section>
 
       <!-- Allocation Bar -->
       <section id="portfolio-alloc-card" class="card section-block">
         <div class="section-head">
-          <h2>ASSET-CLASS ALLOCATION</h2>
-          <span class="muted small">Equities · ETFs · Crypto · Cash (strictly read-only — zero order execution)</span>
+          <h2>Asset Allocation</h2>
+          <span class="muted small">Equities, ETFs, Crypto &amp; Cash — view-only tracking</span>
         </div>
         <div id="port-allocation-wrap" class="stack-sm"></div>
       </section>
@@ -914,8 +941,8 @@
       <section id="portfolio-holdings-card" class="card section-block">
         <div class="section-head">
           <div>
-            <h2>HOLDINGS LEDGER</h2>
-            <span class="muted small">10^-8 precision quantities &amp; sub-cent crypto prices</span>
+            <h2>Holdings</h2>
+            <span class="muted small">Track stocks, ETFs, fractional shares, and crypto in one view</span>
           </div>
           <div class="row-gap wrap">
             <button id="btn-port-add-holding-toggle" type="button" class="btn btn-primary btn-sm">+ Add Holding</button>
@@ -924,7 +951,7 @@
         </div>
 
         <form id="port-add-holding-form" class="form-grid-compact inline-editor hidden">
-          <input id="ph-symbol" type="text" placeholder="Symbol (e.g. VOO, BTC, SHIB)" required />
+          <input id="ph-symbol" type="text" placeholder="Symbol (e.g. VOO, BTC, AAPL)" required />
           <select id="ph-asset-class">
             <option value="equity">Equity</option>
             <option value="etf">ETF</option>
@@ -945,22 +972,22 @@
         <div id="port-holdings-wrap" class="table-wrap"></div>
       </section>
 
-      <!-- Direct Read-Only Broker & Exchange Connectors -->
+      <!-- View-Only Broker & Crypto Connections -->
       <section id="portfolio-brokers-card" class="card section-block">
         <div class="section-head">
           <div>
-            <h2>READ-ONLY BROKER &amp; EXCHANGE ADAPTERS</h2>
-            <span class="muted small">Trade &amp; transfer API permissions are actively checked and REFUSED on connect.</span>
+            <h2>Connect Brokerages &amp; Crypto</h2>
+            <span class="muted small">View-only access — ChronoX can never place trades or move funds.</span>
           </div>
         </div>
         <div id="port-brokers-grid" class="four-col"></div>
       </section>
 
-      <!-- Broker Connect Modal (controlled by portfolio.js) -->
+      <!-- Broker Connect Modal -->
       <div id="portfolio-broker-modal" class="overlay modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="port-broker-modal-title">
         <div class="modal-card">
           <div class="modal-head">
-            <h2 id="port-broker-modal-title">Connect Read-Only Broker</h2>
+            <h2 id="port-broker-modal-title">Connect View-Only Brokerage</h2>
             <button id="btn-port-broker-modal-close" type="button" class="kbd-btn" aria-label="Close broker modal">ESC</button>
           </div>
           <div id="port-broker-modal-body" class="modal-body stack-sm"></div>
@@ -993,37 +1020,37 @@
             </div>
           </div>
           <div class="stat-tile-body">
-            <span class="eyebrow">AGGREGATE UTILIZATION</span>
+            <span class="eyebrow">Credit Utilization</span>
             <span id="cred-agg-tier" class="pill pill-soft">No cards yet</span>
           </div>
         </div>
 
         <div class="card stat-tile">
-          <span class="eyebrow">IMPORTED BUREAU SCORE</span>
+          <span class="eyebrow">Credit Score</span>
           <div id="cred-bureau-score" class="metric-md">--</div>
-          <span id="cred-bureau-meta" class="muted small">Import actual score below (never fabricated)</span>
+          <span id="cred-bureau-meta" class="muted small">Record your latest bureau score below</span>
         </div>
 
         <div class="card stat-tile">
-          <span class="eyebrow">DEBT-TO-INCOME (DTI)</span>
+          <span class="eyebrow">Debt-to-Income</span>
           <div id="cred-dti" class="metric-md">0.0%</div>
           <span id="cred-dti-tier" class="pill pill-soft">Healthy</span>
         </div>
 
         <div class="card stat-tile">
-          <span class="eyebrow">TOTAL DEBT &amp; INTEREST BURN</span>
+          <span class="eyebrow">Total Debt &amp; Interest</span>
           <div id="cred-total-debt" class="metric-md">$0.00</div>
           <span id="cred-interest-burn" class="muted small">$0.00/mo interest</span>
         </div>
       </section>
 
-      <!-- Credit Factor Analysis + Chase 5/24 Velocity & Drop-Offs -->
+      <!-- Score Factors + New Accounts & Drop-Offs -->
       <section id="credit-analysis-grid" class="two-col section-block">
         <div id="credit-factors-card" class="card">
           <div class="section-head">
             <div>
-              <h2>CREDIT FACTOR ANALYSIS</h2>
-              <span class="muted small">FICO 8 / VantageScore 3.0 factor breakdown &amp; utilization tiers (never a fabricated bureau score)</span>
+              <h2>Score Factors</h2>
+              <span class="muted small">How your balances, payment habits, and account age affect credit scoring models</span>
             </div>
           </div>
           <div id="credit-factors-wrap" class="stack-sm"></div>
@@ -1032,30 +1059,30 @@
         <div id="credit-velocity-card" class="card">
           <div class="section-head">
             <div>
-              <h2>CHASE 5/24 &amp; DROP-OFF TIMELINE</h2>
-              <span class="muted small">All issuers counted · Inquiries 24m · Derogatories 7y/10y</span>
+              <h2>Recent Applications &amp; Drop-Off Dates</h2>
+              <span class="muted small">Cards opened in the last 24 months, hard inquiries, and negative marks</span>
             </div>
             <label class="checkbox-row small">
               <input id="credit-524-au-toggle" type="checkbox" checked />
-              <span>Include AU Cards</span>
+              <span>Include Authorized User Cards</span>
             </label>
           </div>
           <div id="credit-524-wrap" class="stack-sm"></div>
           <hr class="divider" />
-          <h3>Hard Inquiries (24-Month Drop-Off)</h3>
+          <h3>Hard Inquiries (24-Month Window)</h3>
           <div id="credit-inquiries-list" class="stack-xs"></div>
           <hr class="divider" />
-          <h3>Derogatory Marks</h3>
+          <h3>Negative Marks</h3>
           <div id="credit-derogatories-list" class="stack-xs"></div>
         </div>
       </section>
 
-      <!-- Official Bureau Credit Report Importer (Structured Primary + PDF Best-Effort with Mandatory Review) -->
+      <!-- Credit Report & Score Entry -->
       <section id="credit-report-import-card" class="card section-block">
         <div class="section-head">
           <div>
-            <h2>OFFICIAL CREDIT REPORT &amp; BUREAU DATA</h2>
-            <span class="muted small">Enter actual Experian/Equifax/TransUnion bureau scores directly, or upload an AnnualCreditReport PDF for mandatory review.</span>
+            <h2>Credit Scores &amp; Reports</h2>
+            <span class="muted small">Log a score from Experian, Equifax, or TransUnion, or upload an AnnualCreditReport PDF to review before saving.</span>
           </div>
         </div>
         <div class="two-col">
@@ -1069,21 +1096,21 @@
               <option value="fico8">FICO Score 8</option>
               <option value="vantage3">VantageScore 3.0</option>
             </select>
-            <input id="cr-score" type="number" min="300" max="850" placeholder="Actual Bureau Score (300-850)" required />
+            <input id="cr-score" type="number" min="300" max="850" placeholder="Actual Score (300-850)" required />
             <input id="cr-pulled-date" type="date" required />
-            <button type="submit" class="btn btn-primary btn-sm">Record Bureau Score</button>
+            <button type="submit" class="btn btn-primary btn-sm">Save Score</button>
           </form>
 
           <form id="credit-pdf-upload-form" class="row-gap wrap">
             <input id="cr-pdf-file" type="file" accept=".pdf,application/pdf" class="grow" />
-            <button type="submit" class="btn btn-soft btn-sm">Parse AnnualCreditReport PDF (Review First)</button>
+            <button type="submit" class="btn btn-soft btn-sm">Review Credit Report PDF</button>
           </form>
         </div>
         <div id="credit-pdf-review-box" class="inline-editor hidden"></div>
 
-        <details class="math-drawer details-spacer">
-          <summary>+ LOG HARD INQUIRY OR DEROGATORY ITEM</summary>
-          <div class="two-col details-body">
+        <details class="advanced-disclosure">
+          <summary>Log a Hard Inquiry or Negative Mark</summary>
+          <div class="two-col advanced-disclosure-body">
             <form id="credit-inquiry-form" class="form-grid-compact">
               <input id="ci-lender" type="text" placeholder="Lender (e.g. Chase, Amex)" required />
               <select id="ci-bureau">
@@ -1104,20 +1131,19 @@
               </select>
               <input id="cd-date" type="date" required />
               <input id="cd-note" type="text" placeholder="Account / memo" />
-              <button type="submit" class="btn btn-soft btn-sm">Add Derogatory</button>
+              <button type="submit" class="btn btn-soft btn-sm">Add Mark</button>
             </form>
           </div>
         </details>
       </section>
 
-      <!-- Optional BYOK Credit Score APIs (Spinwheel / Array / CRS / Custom) -->
+      <!-- Optional Third-Party Credit Score APIs (Collapsed by default) -->
       <section id="credit-apis-card" class="card section-block">
         <div class="section-head">
           <div>
-            <span class="eyebrow">OPTIONAL DIRECT BUREAU &amp; SCORE INTEGRATIONS</span>
-            <h2>CREDIT SCORE APIS (BYOK)</h2>
+            <h2>Automatic Bureau Sync (Optional)</h2>
             <span class="muted small">
-              Optionally connect Spinwheel, Array, CRS Credit API, or a Custom HTTPS/local credit bridge to sync live bureau scores, hard inquiries, derogatories &amp; tradelines. Keys are sealed in AES-256-GCM <code>secrets.enc</code>.
+              Connect a supported credit data provider if you want ChronoX to pull live scores and accounts automatically.
             </span>
           </div>
           <span id="credit-apis-count" class="pill pill-soft">0 connected</span>
@@ -1126,33 +1152,33 @@
         <div id="credit-apis-list" class="stack-sm"></div>
         <div id="credit-api-status-box" class="notice-bar hidden" aria-live="polite"></div>
 
-        <details class="math-drawer details-spacer">
-          <summary>+ CONNECT CREDIT SCORE API (SPINWHEEL / ARRAY / CRS / CUSTOM)</summary>
-          <form id="credit-api-connect-form" class="stack-sm details-body">
+        <details class="advanced-disclosure">
+          <summary>Advanced: Connect a Credit Bureau API (Spinwheel, Array, CRS, Custom)</summary>
+          <form id="credit-api-connect-form" class="stack-sm advanced-disclosure-body">
             <div class="form-grid-compact">
               <label class="field">
                 <span>Provider</span>
                 <select id="capi-vendor">
                   <option value="spinwheel">Spinwheel (Equifax Score + Liabilities)</option>
-                  <option value="array">Array (Experian / Equifax / TransUnion 1B/3B)</option>
+                  <option value="array">Array (Experian / Equifax / TransUnion)</option>
                   <option value="crs">CRS Credit API (Experian / Equifax / TransUnion)</option>
-                  <option value="custom">Custom Credit Score API (HTTPS / Local Bridge)</option>
+                  <option value="custom">Custom Credit Bridge URL</option>
                 </select>
               </label>
               <label class="field">
-                <span>Display Label (optional)</span>
+                <span>Display Name (optional)</span>
                 <input id="capi-label" type="text" placeholder="e.g. Equifax Live Pull" maxlength="100" />
               </label>
             </div>
 
             <div id="capi-vendor-hint" class="small muted">
-              Equifax credit score &amp; full liabilities profile via Bearer API Key + Spinwheel User ID.
+              Sync Equifax credit score and liabilities with your Spinwheel API key and user ID.
             </div>
 
             <div id="capi-field-apikey" class="form-grid-compact">
               <label class="field">
-                <span>API Key / Server Token / Bearer JWT</span>
-                <input id="capi-api-key" type="password" autocomplete="off" placeholder="Write-only; sealed in secrets.enc" />
+                <span>API Key or Access Token</span>
+                <input id="capi-api-key" type="password" autocomplete="off" placeholder="Stored privately on your device" />
               </label>
             </div>
 
@@ -1166,22 +1192,22 @@
             <div id="capi-field-array" class="form-grid-compact hidden">
               <label class="field">
                 <span>Array Report Key</span>
-                <input id="capi-report-key" type="text" autocomplete="off" placeholder="reportKey from Array" />
+                <input id="capi-report-key" type="text" autocomplete="off" placeholder="Report key from Array" />
               </label>
               <label class="field">
                 <span>Array Display Token</span>
-                <input id="capi-display-token" type="password" autocomplete="off" placeholder="displayToken (sealed in vault)" />
+                <input id="capi-display-token" type="password" autocomplete="off" placeholder="Display token" />
               </label>
             </div>
 
             <div id="capi-field-crs" class="form-grid-compact hidden">
               <label class="field">
-                <span>CRS Username (if not using Bearer JWT)</span>
-                <input id="capi-username" type="text" autocomplete="off" placeholder="CRS API username" />
+                <span>CRS Username</span>
+                <input id="capi-username" type="text" autocomplete="off" placeholder="CRS username" />
               </label>
               <label class="field">
                 <span>CRS Password</span>
-                <input id="capi-password" type="password" autocomplete="off" placeholder="CRS API password (sealed in vault)" />
+                <input id="capi-password" type="password" autocomplete="off" placeholder="CRS password" />
               </label>
               <label class="field">
                 <span>Default Bureau</span>
@@ -1192,36 +1218,36 @@
                 </select>
               </label>
               <label class="field">
-                <span>Report Option Slug (optional)</span>
-                <input id="capi-option" type="text" autocomplete="off" placeholder="e.g. credit-report-equifax-vantage3" />
+                <span>Report Option (optional)</span>
+                <input id="capi-option" type="text" autocomplete="off" placeholder="Optional report option" />
               </label>
             </div>
 
             <div id="capi-field-baseurl" class="form-grid-compact hidden">
               <label class="field">
-                <span>Custom Credit Score API Endpoint URL</span>
-                <input id="capi-base-url" type="url" autocomplete="off" placeholder="https://credit-bridge.example.com/v1/snapshot or http://127.0.0.1:9001/credit" />
+                <span>Custom Endpoint URL</span>
+                <input id="capi-base-url" type="url" autocomplete="off" placeholder="https://example.com/credit/snapshot" />
               </label>
             </div>
 
             <div class="item-row wrap">
               <label class="checkbox-row small">
                 <input id="capi-test-on-connect" type="checkbox" />
-                <span>Verify live credentials immediately on save</span>
+                <span>Verify credentials immediately on save</span>
               </label>
-              <button type="submit" class="btn btn-primary btn-sm">Seal Credentials &amp; Connect</button>
+              <button type="submit" class="btn btn-primary btn-sm">Save &amp; Connect</button>
             </div>
           </form>
         </details>
       </section>
 
-      <!-- Niche Advisor Alerts + AZEO Statement-Close Calendar -->
+      <!-- Credit Alerts + Best Time to Pay Cards -->
       <section id="credit-advisory-grid" class="two-col section-block">
         <div class="card">
           <div class="section-head">
             <div>
-              <h2>NICHE CREDIT &amp; DEBT ADVISOR</h2>
-              <span class="muted small">Utilization cliffs, grace-period traps, promo APR deadlines &amp; autopay shields</span>
+              <h2>Credit &amp; Debt Alerts</h2>
+              <span class="muted small">High balances, promo deadlines, and autopay protection checks</span>
             </div>
           </div>
           <div id="credit-alerts-list" class="stack-sm"></div>
@@ -1230,20 +1256,20 @@
         <div class="card">
           <div class="section-head">
             <div>
-              <h2>AZEO STATEMENT-CLOSE CALENDAR</h2>
-              <span class="muted small">Pay 3 days BEFORE statement closing date when bureaus snapshot balances</span>
+              <h2>Best Time to Pay Cards</h2>
+              <span class="muted small">Pay 3 days before each statement closes so lower balances are reported to credit bureaus</span>
             </div>
           </div>
           <div id="credit-azeo-list" class="stack-sm"></div>
         </div>
       </section>
 
-      <!-- Debt Payoff Strategy Comparison -->
+      <!-- Debt Payoff Plans -->
       <section id="credit-strategies-card" class="card section-block">
         <div class="section-head">
           <div>
-            <h2>DEBT PAYOFF STRATEGY COMPARISON</h2>
-            <p class="muted small">Exact-cent monthly amortization comparing ADHD Hybrid, Credit-First, Avalanche &amp; Snowball.</p>
+            <h2>Debt Payoff Plans</h2>
+            <p class="muted small">Compare payoff timelines and total interest across Balanced, Credit-First, Highest APR, and Smallest Balance plans.</p>
           </div>
           <form id="debt-extra-form" class="row-gap">
             <label class="muted small" for="debt-extra-input">Extra $/mo:</label>
@@ -1254,13 +1280,13 @@
         <div id="debt-strategies-grid" class="jars-grid"></div>
       </section>
 
-      <!-- Credit Lines Manager + Balance Transfer Breakeven -->
+      <!-- Credit Cards & Loans + Balance Transfer Calculator -->
       <section id="credit-lines-grid" class="two-col section-block">
         <div class="card">
-          <h2>CREDIT CARDS &amp; LOANS</h2>
+          <h2>Credit Cards &amp; Loans</h2>
           <div id="credit-lines-list" class="stack-sm"></div>
           <hr class="divider" />
-          <h3>Add Credit Card or Loan</h3>
+          <h3>Add Card or Loan</h3>
           <form id="credit-line-form" class="form-grid-compact">
             <input id="cl-name" type="text" placeholder="Card / Loan name" required />
             <select id="cl-kind">
@@ -1268,37 +1294,37 @@
               <option value="student_loan">Student Loan</option>
               <option value="auto_loan">Auto Loan</option>
               <option value="personal_loan">Personal Loan</option>
-              <option value="bnpl">BNPL / Installment</option>
+              <option value="bnpl">Buy Now Pay Later</option>
               <option value="medical">Medical Debt</option>
             </select>
             <input id="cl-balance" type="number" step="0.01" min="0" placeholder="Balance ($)" required />
-            <input id="cl-limit" type="number" step="1" min="0" placeholder="Limit ($; 0 for loan)" value="0" />
+            <input id="cl-limit" type="number" step="1" min="0" placeholder="Credit limit ($; 0 for loan)" value="0" />
             <input id="cl-apr" type="number" step="0.01" min="0" max="99" placeholder="APR (%)" required />
-            <input id="cl-close-day" type="number" min="1" max="31" placeholder="Stmt Close Day" value="15" />
+            <input id="cl-close-day" type="number" min="1" max="31" placeholder="Statement Close Day" value="15" />
             <input id="cl-due-day" type="number" min="1" max="31" placeholder="Due Day" value="10" />
             <select id="cl-autopay">
               <option value="statement">Autopay: Statement</option>
               <option value="minimum">Autopay: Minimum</option>
               <option value="full">Autopay: Full Balance</option>
-              <option value="none">Autopay: OFF</option>
+              <option value="none">Autopay: Off</option>
             </select>
             <input id="cl-promo-ends" type="date" title="0% Promo APR End Date (optional)" />
-            <input id="cl-opened" type="date" title="Account Opened Date (for AAoA &amp; 5/24)" />
+            <input id="cl-opened" type="date" title="Account Opened Date" />
             <label class="checkbox-row">
               <input id="cl-grace" type="checkbox" checked />
               <span>Active grace period</span>
             </label>
             <label class="checkbox-row">
               <input id="cl-is-au" type="checkbox" />
-              <span>Authorized User (AU)</span>
+              <span>Authorized User card</span>
             </label>
-            <button type="submit" class="btn btn-primary">Add Credit Line</button>
+            <button type="submit" class="btn btn-primary">Add Account</button>
           </form>
         </div>
 
         <div class="card">
-          <h2>0% BALANCE TRANSFER BREAKEVEN</h2>
-          <p class="muted small">Check exact math before paying a 3-5% transfer fee.</p>
+          <h2>0% Balance Transfer Check</h2>
+          <p class="muted small">Compare real interest saved against a 3–5% transfer fee before moving a balance.</p>
           <form id="bt-form" class="form-grid-compact">
             <label class="field"><span>Balance ($)</span><input id="bt-balance" type="number" step="10" min="50" placeholder="e.g. 2500" required /></label>
             <label class="field"><span>Current APR (%)</span><input id="bt-apr" type="number" step="0.01" min="0" placeholder="e.g. 22.99" required /></label>
@@ -1306,7 +1332,7 @@
             <label class="field"><span>0% Promo Months</span><input id="bt-months" type="number" min="3" max="36" value="15" required /></label>
             <label class="field"><span>Post-Promo APR (%)</span><input id="bt-post-apr" type="number" step="0.01" min="0" max="99" placeholder="Same as current" /></label>
             <label class="field"><span>Planned $/mo</span><input id="bt-pay" type="number" step="10" min="25" placeholder="e.g. 200" required /></label>
-            <button type="submit" class="btn btn-soft align-end">Check Breakeven</button>
+            <button type="submit" class="btn btn-soft align-end">Check Savings</button>
           </form>
           <div id="bt-result" class="coach-answer hidden" aria-live="polite"></div>
         </div>
@@ -1317,17 +1343,17 @@
     <!-- TAB 5: GOALS & RULES (goals — goals-dnd.js)                         -->
     <!-- =================================================================== -->
     <main id="tab-goals" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-goals">
-      <!-- Drag-to-Reprioritize & Swipe/Button Tracked Goals -->
+      <!-- Drag-to-Prioritize Savings Goals -->
       <section id="goals-tracked-card" class="card">
         <div class="section-head">
           <div>
-            <span class="eyebrow">DIRECT MANIPULATION PRIORITY QUEUE</span>
-            <h2>Tracked Goals</h2>
-            <p class="muted small">Drag grip handle (or press Alt+Up/Down) to reprioritize surplus order. Swipe right to fund +$50, swipe left to remove (with 8s Undo), or use desktop action buttons.</p>
+            <span class="eyebrow">Priority Order</span>
+            <h2>Savings Goals</h2>
+            <p class="muted small">Drag the handle (or press Alt+Up/Down) to reorder priority. Swipe right to add $50, or use the action buttons.</p>
           </div>
           <div class="row-gap wrap">
             <button id="btn-goals-new-toggle" type="button" class="btn btn-primary btn-sm">+ New Goal</button>
-            <button id="btn-goals-open-impulse" type="button" class="btn btn-soft btn-sm">Impulse Vault</button>
+            <button id="btn-goals-open-impulse" type="button" class="btn btn-soft btn-sm">Impulse Pause</button>
           </div>
         </div>
         <form id="goal-quick-create-form" class="form-grid-compact inline-editor hidden">
@@ -1347,50 +1373,50 @@
         <div id="goals-grid" class="goals-dnd-list"></div>
       </section>
 
-      <!-- $1,000 Credit-Safe Purchase Optimizer -->
+      <!-- Purchase Planner -->
       <section id="goals-optimizer-card" class="card section-block">
-        <h2>CREDIT-SAFE GOAL &amp; PURCHASE OPTIMIZER</h2>
+        <h2>Purchase Planner</h2>
         <p class="muted small">
-          Enter any target purchase to generate 3 exact math-verified paths that shield bills, respect AZEO utilization rules, and flag Chase 5/24 status.
+          Enter any upcoming purchase to see 3 realistic saving paths that protect your bills and credit utilization.
         </p>
         <form id="goal-plan-form" class="form-grid">
-          <input id="gp-name" type="text" placeholder="What do you want? (e.g. $1000 Workstation)" required />
+          <input id="gp-name" type="text" placeholder="What are you saving for? (e.g. New Laptop)" required />
           <input id="gp-price" type="number" step="0.01" min="1" placeholder="Target ($)" required />
           <input id="gp-saved" type="number" step="0.01" min="0" placeholder="Already saved ($)" value="0" />
           <input id="gp-date" type="date" title="Target date (optional)" />
-          <button type="submit" class="btn btn-primary">Optimize Plan</button>
+          <button type="submit" class="btn btn-primary">Build Plan</button>
         </form>
         <div id="goal-plan-output" class="section-block hidden"></div>
       </section>
 
-      <!-- Firefly III-Inspired Automation Rule Builder -->
+      <!-- Auto-Categorize Rules -->
       <section id="rules-builder-card" class="card section-block">
         <div class="section-head">
           <div>
-            <span class="eyebrow">FIREFLY AUTOMATION ENGINE</span>
-            <h2>Transaction Automation Rules &amp; 2-Year Dry-Run</h2>
-            <p class="muted small">Create ordered rules with strict AND / ANY trigger logic, dry-run preview against 730 days of history, and retroactive apply.</p>
+            <span class="eyebrow">Automatic Sorting</span>
+            <h2>Auto-Categorize Rules</h2>
+            <p class="muted small">Automatically assign jars, tags, or notes to matching transactions — preview matches before applying.</p>
           </div>
           <button id="btn-rules-new-toggle" type="button" class="btn btn-primary btn-sm">+ New Rule</button>
         </div>
 
         <form id="rule-create-form" class="stack-sm inline-editor hidden">
           <div class="form-grid-compact">
-            <input id="rl-name" type="text" placeholder="Rule name (e.g. Costco Split &amp; Tag)" required />
+            <input id="rl-name" type="text" placeholder="Rule name (e.g. Costco Groceries)" required />
             <select id="rl-match-mode">
-              <option value="strict_and">Match ALL triggers (Strict AND)</option>
-              <option value="any">Match ANY trigger (OR)</option>
+              <option value="strict_and">Match all conditions</option>
+              <option value="any">Match any condition</option>
             </select>
             <input id="rl-priority" type="number" min="0" max="999" value="10" placeholder="Priority" />
             <label class="checkbox-row">
               <input id="rl-stop" type="checkbox" />
-              <span>Stop processing after match</span>
+              <span>Stop checking more rules after match</span>
             </label>
           </div>
           <div class="form-grid-compact">
             <select id="rl-trigger-field">
               <option value="merchant">Merchant</option>
-              <option value="memo">Memo</option>
+              <option value="memo">Note / Memo</option>
               <option value="amount">Amount ($)</option>
               <option value="tx_type">Transaction Type</option>
             </select>
@@ -1398,22 +1424,22 @@
               <option value="contains">contains</option>
               <option value="starts_with">starts with</option>
               <option value="ends_with">ends with</option>
-              <option value="exact">exact match</option>
-              <option value="regex">regex</option>
+              <option value="exact">matches exactly</option>
+              <option value="regex">matches pattern</option>
               <option value="gt">greater than</option>
               <option value="lt">less than</option>
             </select>
-            <input id="rl-trigger-val" type="text" placeholder="Trigger value (e.g. COSTCO)" required />
+            <input id="rl-trigger-val" type="text" placeholder="Value (e.g. COSTCO)" required />
           </div>
           <div class="form-grid-compact">
             <select id="rl-action-type">
               <option value="set_jar">Assign Jar</option>
               <option value="add_tag">Add Tag</option>
-              <option value="append_memo">Append Memo</option>
-              <option value="set_memo">Set Memo</option>
-              <option value="allocate_goal">Allocate to Goal</option>
+              <option value="append_memo">Append Note</option>
+              <option value="set_memo">Set Note</option>
+              <option value="allocate_goal">Assign to Goal</option>
             </select>
-            <input id="rl-action-val" type="text" placeholder="Action value (jar ID/name, tag, or memo)" required />
+            <input id="rl-action-val" type="text" placeholder="Jar name, tag, or note" required />
             <button type="submit" class="btn btn-primary btn-sm">Save Rule</button>
           </div>
         </form>
@@ -1424,15 +1450,15 @@
     </main>
 
     <!-- =================================================================== -->
-    <!-- TAB 6: ACTIVITY & BILLS (activity — vault.js)                       -->
+    <!-- TAB 6: ACTIVITY (activity — vault.js)                               -->
     <!-- =================================================================== -->
     <main id="tab-activity" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-activity">
       <section class="two-col">
         <!-- Accounts -->
         <div class="card">
           <div class="section-head">
-            <h2>ACCOUNTS</h2>
-            <span class="muted small">Exact integer-cent reconciliation</span>
+            <h2>Accounts</h2>
+            <span class="muted small">Live and manual balances</span>
           </div>
           <div id="accounts-list" class="stack-sm"></div>
           <hr class="divider" />
@@ -1443,36 +1469,40 @@
               <option value="savings">Savings</option>
               <option value="credit">Credit Card</option>
               <option value="cash">Cash</option>
-              <option value="trading">Brokerage / Trading</option>
+              <option value="trading">Brokerage</option>
             </select>
             <input id="acct-balance" type="number" step="0.01" placeholder="Balance ($)" required />
             <button type="submit" class="btn btn-soft">Add Account</button>
           </form>
         </div>
 
-        <!-- Universal Statement Import -->
+        <!-- Import Bank Statements & Export Studio -->
         <div class="card">
           <div class="section-head">
-            <h2>UNIVERSAL STATEMENT IMPORT</h2>
-            <a id="btn-export-csv-link" href="/api/v1/export/csv" class="btn btn-ghost btn-sm">Export CSV</a>
+            <h2>Import Bank Statements</h2>
+            <div class="row-gap wrap">
+              <button id="btn-activity-export-numbers" type="button" class="btn btn-soft btn-xs">Export Apple Numbers (.xlsx)</button>
+              <a id="btn-export-csv-link" href="/api/v1/export/csv" class="btn btn-ghost btn-xs">Export CSV</a>
+              <button id="btn-activity-export-csv-pack" type="button" class="btn btn-ghost btn-xs">CSV Pack (.zip)</button>
+            </div>
           </div>
           <p class="muted small">
-            Zero-3rd-party support for Navy Federal (CSV &amp; PDF), Plaid (JSON/CSV), Chase, BofA, Capital One, Amex, OFX/QFX &amp; QIF with cross-source deduplication.
+            Upload CSV, PDF, OFX, QIF, or Plaid files from Navy Federal, Chase, BofA, Capital One, or Amex with automatic duplicate protection.
           </p>
           <form id="csv-upload-form" class="stack-sm">
             <div class="row-gap wrap">
               <input id="csv-file-input" class="grow" type="file" accept=".csv,.tsv,.pdf,.ofx,.qfx,.qif,.json,text/csv,application/json,application/pdf" />
-              <button id="btn-desktop-import-dialog" type="button" class="btn btn-ghost btn-sm hidden">Native Picker</button>
+              <button id="btn-desktop-import-dialog" type="button" class="btn btn-ghost btn-sm hidden">Choose File...</button>
             </div>
-            <div class="row-gap">
+            <div class="row-gap wrap">
               <label class="field grow">
-                <span>Target Account</span>
+                <span>Account</span>
                 <select id="csv-account-select">
                   <option value="">Auto-Match from Statement / Default Checking</option>
                 </select>
               </label>
               <label class="field grow">
-                <span>Institution Profile (Optional)</span>
+                <span>Bank Format</span>
                 <select id="csv-institution">
                   <option value="auto">Auto-Detect (Recommended)</option>
                   <option value="navy_federal">Navy Federal Credit Union (CSV / PDF)</option>
@@ -1484,7 +1514,7 @@
             <div id="desktop-selected-statement" class="notice-bar hidden" aria-live="polite"></div>
             <label class="checkbox-row">
               <input id="csv-skip-pending" type="checkbox" checked />
-              <span>Skip pending authorizations</span>
+              <span>Skip pending transactions</span>
             </label>
             <label class="checkbox-row">
               <input id="csv-flip-sign" type="checkbox" />
@@ -1492,69 +1522,69 @@
             </label>
             <label class="checkbox-row">
               <input id="csv-detect-transfers" type="checkbox" checked />
-              <span>Auto-detect internal card payments &amp; share transfers</span>
+              <span>Detect internal card payments &amp; transfers</span>
             </label>
             <label class="checkbox-row">
               <input id="csv-sync-balance" type="checkbox" />
-              <span>Sync balance from statement header</span>
+              <span>Update account balance from statement</span>
             </label>
             <div class="row-gap wrap">
-              <button id="btn-preview-statement" type="button" class="btn btn-soft">Preview First</button>
-              <button type="submit" class="btn btn-primary">Import &amp; Auto-Update</button>
+              <button id="btn-preview-statement" type="button" class="btn btn-soft">Preview</button>
+              <button type="submit" class="btn btn-primary">Import Statement</button>
             </div>
           </form>
           <div id="csv-import-result" class="notice-bar hidden" aria-live="polite"></div>
         </div>
       </section>
 
-      <!-- 2-Year Transaction Ledger -->
+      <!-- Transaction History -->
       <section id="tx-ledger-card" class="card section-block">
         <div class="section-head">
           <div class="row-gap wrap">
-            <h2>2-YEAR TRANSACTION LEDGER</h2>
+            <h2>Transactions</h2>
             <span id="tx-count-pill" class="pill pill-soft">0 items</span>
           </div>
           <div class="row-gap wrap tx-filter-bar">
             <select id="tx-date-range" aria-label="Date range">
-              <option value="30">Last 30D</option>
-              <option value="90" selected>Last 90D</option>
-              <option value="365">Last 1Y</option>
-              <option value="730">Full 2Y (730D)</option>
+              <option value="30">Last 30 Days</option>
+              <option value="90" selected>Last 90 Days</option>
+              <option value="365">Last Year</option>
+              <option value="730">Last 2 Years</option>
               <option value="all">All Time</option>
             </select>
-            <input id="tx-search" type="search" placeholder="Search merchant, memo or tag..." aria-label="Search transactions" />
+            <input id="tx-search" type="search" placeholder="Search merchant, note, or tag..." aria-label="Search transactions" />
             <select id="tx-jar-filter" aria-label="Filter by jar">
               <option value="">All Jars</option>
             </select>
           </div>
         </div>
 
-        <details class="math-drawer details-spacer">
-          <summary>+ MANUAL TRANSACTION ENTRY</summary>
-          <form id="manual-tx-form" class="form-grid-compact details-body">
+        <details class="advanced-disclosure">
+          <summary>Add a Transaction Manually</summary>
+          <form id="manual-tx-form" class="form-grid-compact advanced-disclosure-body">
             <select id="manual-tx-type">
               <option value="expense">Expense</option>
               <option value="income">Income</option>
               <option value="transfer_out">Transfer Out (-)</option>
               <option value="transfer_in">Transfer In (+)</option>
             </select>
-            <input id="manual-tx-merchant" type="text" placeholder="Merchant / source" required />
+            <input id="manual-tx-merchant" type="text" placeholder="Merchant or source" required />
             <input id="manual-tx-amount" type="number" step="0.01" min="0.01" placeholder="Amount ($)" required />
             <input id="manual-tx-date" type="date" required />
             <select id="manual-tx-account"></select>
             <select id="manual-tx-jar"></select>
-            <input id="manual-tx-memo" type="text" placeholder="Memo (optional)" />
-            <button type="submit" class="btn btn-primary">Save Entry</button>
+            <input id="manual-tx-memo" type="text" placeholder="Note (optional)" />
+            <button type="submit" class="btn btn-primary">Save</button>
           </form>
         </details>
 
-        <div class="table-wrap">
+        <div class="table-wrap details-spacer">
           <table class="tx-table">
             <thead>
               <tr>
                 <th>Date</th>
-                <th>Merchant, Tags &amp; Memo</th>
-                <th>Jar (auto-learns)</th>
+                <th>Merchant, Tags &amp; Note</th>
+                <th>Jar</th>
                 <th class="num">Amount</th>
                 <th class="num">Actions</th>
               </tr>
@@ -1568,29 +1598,29 @@
       <section id="email-queue-card" class="card section-block">
         <div class="section-head">
           <div class="row-gap wrap">
-            <h2>EMAIL BILL REVIEW QUEUE</h2>
+            <h2>Email Bill Reminders</h2>
             <span id="email-queue-count" class="pill pill-soft">0 pending</span>
           </div>
-          <div class="row-gap">
-            <button id="btn-email-scan-now" type="button" class="btn btn-soft btn-sm">Scan Read-Only IMAP</button>
-            <button type="button" class="btn btn-ghost btn-sm" data-goto-tab="settings">IMAP Config</button>
+          <div class="row-gap wrap">
+            <button id="btn-email-scan-now" type="button" class="btn btn-soft btn-sm">Scan Inbox</button>
+            <button type="button" class="btn btn-ghost btn-sm" data-goto-tab="settings">Email Settings</button>
           </div>
         </div>
-        <p class="muted small">Extracted via read-only <code>BODY.PEEK</code> (emails stay unread). Approve to create or match a recurring bill.</p>
+        <p class="muted small">Reads bills without marking emails as read. Approve detected bills to add them to your schedule.</p>
         <div id="email-queue-list" class="stack-sm"></div>
       </section>
 
-      <!-- Recurring Bills (with Min/Max Ranges) + Audit Log -->
+      <!-- Recurring Bills + Activity History -->
       <section class="two-col section-block">
         <div class="card">
           <div class="section-head">
-            <h2>RECURRING BILLS &amp; MIN/MAX RANGES</h2>
+            <h2>Recurring Bills</h2>
             <span id="all-bills-count" class="pill pill-soft">0 active</span>
           </div>
           <div id="bill-anomalies-list" class="stack-xs details-spacer"></div>
           <div id="all-bills-list" class="stack-xs"></div>
           <hr class="divider" />
-          <h3>Add Recurring Bill / Variable Utility</h3>
+          <h3>Add Recurring Bill</h3>
           <form id="bill-form" class="form-grid-compact">
             <input id="bill-name" type="text" placeholder="Bill name (e.g. Electric)" required />
             <input id="bill-amount" type="number" step="0.01" min="0.50" placeholder="Expected ($)" required />
@@ -1614,71 +1644,73 @@
         </div>
 
         <div class="card">
-          <h2>AUTO-BUDGET AUDIT LOG</h2>
-          <p class="muted small">Every automatic adjustment recorded with exact timestamps.</p>
+          <h2>Budget History</h2>
+          <p class="muted small">Automatic updates to your budget and jars.</p>
           <div id="audit-log-list" class="stack-xs"></div>
         </div>
       </section>
     </main>
 
     <!-- =================================================================== -->
-    <!-- TAB 7: AI COACH (coach — ai.js)                                     -->
+    <!-- TAB 7: AI FINANCIAL COACH (coach — ai.js)                           -->
     <!-- =================================================================== -->
     <main id="tab-coach" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-coach">
-      <!-- Intelligence Mode Control Bar -->
+      <!-- AI Coach Header & Smart Mode -->
       <section id="coach-hub-card" class="card">
         <div class="section-head">
           <div>
-            <span class="eyebrow">STATELESS PROMPT-CACHED INTELLIGENCE</span>
-            <h2>AI Coach &amp; Agentic Command Console</h2>
+            <span class="eyebrow">AI Financial Assistant</span>
+            <h2>AI Financial Coach</h2>
           </div>
           <div class="row-gap wrap">
-            <span id="ai-source-badge" class="pill pill-soft">Loading...</span>
+            <span id="coach-local-cli-pill" class="pill pill-calm hidden">AI Active</span>
+            <span id="ai-source-badge" class="pill pill-soft">Checking AI...</span>
+            <button id="btn-coach-onetap" type="button" class="btn btn-primary btn-sm">One-Tap Optimize</button>
             <button id="btn-coach-open-usage" type="button" class="btn btn-soft btn-sm">Usage &amp; Savings</button>
             <button id="btn-refresh-ai" type="button" class="btn btn-ghost btn-sm">Refresh</button>
           </div>
         </div>
-        <div id="coach-mode-switcher" class="segmented mode-switcher" role="group" aria-label="Intelligence mode">
-          <button type="button" class="seg-btn" data-set-mode="deterministic_only" aria-pressed="false">Quant Math</button>
-          <button type="button" class="seg-btn active" data-set-mode="hybrid" aria-pressed="true">Hybrid</button>
-          <button type="button" class="seg-btn" data-set-mode="ai_standalone" aria-pressed="false">AI Only</button>
+        <div id="coach-mode-switcher" class="segmented mode-switcher" role="group" aria-label="Smart mode">
+          <button type="button" class="seg-btn" data-set-mode="deterministic_only" aria-pressed="false">Built-in Math</button>
+          <button type="button" class="seg-btn active" data-set-mode="hybrid" aria-pressed="true">Auto (Recommended)</button>
+          <button type="button" class="seg-btn" data-set-mode="ai_standalone" aria-pressed="false">AI Direct</button>
         </div>
       </section>
 
-      <!-- Agentic Natural-Language Command Console (Plan -> Diff -> Execute -> Undo) -->
+      <!-- Assistant Action Planner -->
       <section id="agent-console-card" class="card section-block">
         <div class="section-head">
           <div>
-            <h2>AGENTIC COMMAND CONSOLE</h2>
-            <p class="muted small">Describe changes in plain English. ChronoX generates a validated Plan -> Action Diff Preview -> Atomic Execute -> 8s Undo (zero money movement, max 25 actions).</p>
+            <h2>Tell ChronoX What to Update</h2>
+            <p class="muted small">Ask anything or describe changes in plain English — you always review proposed updates before applying, with 1-click Undo.</p>
           </div>
         </div>
         <form id="agent-prompt-form" class="ask-row">
           <input
             id="agent-prompt-input"
             type="text"
-            placeholder='Command: "Create a $1,200 GPU goal by July", "Comment on tx #4", or "Split my Costco run 70/30"...'
+            placeholder='Try "Create a $1,200 laptop goal by July", "Split my grocery run 70/30", or "Tag coffee purchases"...'
             autocomplete="off"
             required
           />
-          <button type="submit" class="btn btn-primary">PLAN ACTIONS</button>
+          <button type="submit" class="btn btn-primary">Preview Changes</button>
         </form>
         <div class="chip-row details-spacer">
-          <span class="chip-label">EXAMPLES:</span>
-          <button type="button" class="chip" data-agent-example="Create a $1,200 GPU goal by 2027-07-01">Create $1,200 GPU Goal</button>
-          <button type="button" class="chip" data-agent-example="Analyze my portfolio allocation and cash runway">Analyze Portfolio</button>
-          <button type="button" class="chip" data-agent-example="Create a rule tagging Starbucks purchases as coffee">Add Tag Rule</button>
+          <span class="chip-label">Ideas:</span>
+          <button type="button" class="chip" data-agent-example="Create a $1,200 laptop goal by 2027-07-01">Create $1,200 Goal</button>
+          <button type="button" class="chip" data-agent-example="Analyze my portfolio allocation and cash runway">Review Portfolio</button>
+          <button type="button" class="chip" data-agent-example="Create a rule tagging coffee shop purchases as coffee">Add Auto-Tag Rule</button>
         </div>
         <div id="agent-preview-wrap" class="section-block hidden"></div>
         <div id="agent-history-list" class="stack-xs details-spacer"></div>
       </section>
 
-      <!-- Suggestions Feed + Direct Q&A -->
+      <!-- Recommendations Feed + Ask Coach -->
       <section id="coach-qa-grid" class="two-col section-block">
         <div class="card">
           <div class="section-head">
-            <h2>VERIFIED SUGGESTIONS</h2>
-            <span class="muted small">1-click actionable recommendations</span>
+            <h2>Personalized Recommendations</h2>
+            <span class="muted small">Grounded in your live balances and bills</span>
           </div>
           <p id="ai-notice" class="notice-bar hidden"></p>
           <div id="ai-suggestions-list" class="stack-sm"></div>
@@ -1686,18 +1718,18 @@
 
         <div class="card">
           <div class="section-head">
-            <h2>ASK COACH</h2>
-            <span class="muted small">Grounded on live exact-cent balances</span>
+            <h2>Ask Coach</h2>
+            <span class="muted small">Clear answers based on your actual numbers</span>
           </div>
           <form id="ask-coach-form" class="ask-row">
             <input
               id="ask-coach-input"
               type="text"
-              placeholder='Ask: "Can I afford a $1,000 workstation without hurting utilization?"'
+              placeholder='Ask: "Can I afford a $1,000 purchase without dipping into bills?"'
               autocomplete="off"
               required
             />
-            <button type="submit" class="btn btn-soft">ASK</button>
+            <button type="submit" class="btn btn-soft">Ask</button>
           </form>
           <div id="ask-coach-answer" class="coach-answer hidden" aria-live="polite"></div>
         </div>
@@ -1705,95 +1737,15 @@
     </main>
 
     <!-- =================================================================== -->
-    <!-- TAB 8: VAULT & CONNECTORS (settings — vault.js)                     -->
+    <!-- TAB 8: SETTINGS (settings — vault.js)                               -->
     <!-- =================================================================== -->
     <main id="tab-settings" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-settings">
-      <!-- Vault Security & Password Management -->
-      <section class="two-col">
-        <div id="vault-security-card" class="card">
-          <div class="section-head">
-            <div>
-              <span class="eyebrow">ENVELOPE ENCRYPTION · PBKDF2 600K</span>
-              <h2>VAULT SECURITY &amp; BACKUPS</h2>
-            </div>
-            <button id="btn-settings-lock-vault" type="button" class="btn btn-soft btn-sm">Lock Vault Now</button>
-          </div>
-          <p class="muted small">
-            API keys, Plaid tokens, broker keys, and IMAP credentials are sealed inside <code>secrets.enc</code> using a 256-bit DEK wrapped by your master password and one-time Recovery Key. The SQLite ledger is stored locally with <code>0600</code> permissions (unencrypted at rest).
-          </p>
-          <form id="vault-change-pwd-form" class="stack-sm">
-            <div class="form-grid-compact">
-              <input id="vcp-current" type="password" autocomplete="current-password" placeholder="Current password" required />
-              <input id="vcp-new" type="password" minlength="8" autocomplete="new-password" placeholder="New password (8+ chars)" required />
-              <input id="vcp-confirm" type="password" minlength="8" autocomplete="new-password" placeholder="Confirm new password" required />
-            </div>
-            <div class="row-gap wrap">
-              <button type="submit" class="btn btn-primary btn-sm">Change Master Password (Rewrap DEK)</button>
-              <label class="field-inline">
-                <span class="muted small">Auto-lock (min):</span>
-                <input id="set-auto-lock-minutes" type="number" min="1" max="480" value="30" class="input-xs" />
-              </label>
-              <button id="btn-save-auto-lock" type="button" class="btn btn-ghost btn-sm">Save Timeout</button>
-            </div>
-          </form>
-          <hr class="divider" />
-          <div class="row-gap wrap">
-            <a id="btn-backup-export-link" href="/api/v1/backup/export" class="btn btn-ghost btn-sm">Export JSON Backup</a>
-            <label class="btn btn-ghost btn-sm file-btn">
-              Restore JSON Backup
-              <input id="backup-import-input" type="file" accept=".json,application/json" class="sr-only" />
-            </label>
-            <button id="btn-reopen-onboarding" type="button" class="btn btn-ghost btn-sm">Open Data Setup Wizard</button>
-          </div>
-          <div id="backup-preview-box" class="inline-editor hidden" aria-live="polite"></div>
-        </div>
-
-        <!-- ADHD Profile & Guardrails -->
-        <div class="card">
-          <span class="eyebrow">CASHFLOW &amp; PAYDAY CALIBRATION</span>
-          <h2>ADHD PROFILE &amp; GUARDRAILS</h2>
-          <form id="profile-settings-form" class="stack-sm">
-            <div class="row-gap">
-              <label class="field grow">
-                <span>Hourly Wage ($/hr)</span>
-                <input id="set-hourly-wage" type="number" step="1" min="5" value="30" />
-              </label>
-              <label class="field grow">
-                <span>Emergency Overdraft Shield ($)</span>
-                <input id="set-emergency-buffer" type="number" step="25" min="0" value="500" />
-              </label>
-            </div>
-            <div class="row-gap">
-              <label class="field grow">
-                <span>Default Impulse Cooldown (hours)</span>
-                <input id="set-cooling-hours" type="number" min="1" max="720" value="48" />
-              </label>
-              <label class="field grow">
-                <span>Payday Cadence (days)</span>
-                <input id="set-payday-cadence" type="number" min="7" max="31" value="14" />
-              </label>
-            </div>
-            <div class="row-gap">
-              <label class="field grow">
-                <span>Next Payday Date</span>
-                <input id="set-next-payday" type="date" />
-              </label>
-              <label class="field grow">
-                <span>Expected Paycheck ($)</span>
-                <input id="set-expected-paycheck" type="number" step="10" min="0" value="0" placeholder="0 (auto-detect from deposits)" />
-              </label>
-            </div>
-            <button type="submit" class="btn btn-primary btn-sm">Save ADHD Profile</button>
-          </form>
-        </div>
-      </section>
-
-      <!-- Banking Connectors (Plaid Hosted Link BYOK + SimpleFIN + Active Connections) -->
-      <section id="connectors-card" class="card section-block">
+      <!-- 1. Banks & Connected Accounts -->
+      <section id="connectors-card" class="card">
         <div class="section-head">
           <div>
-            <span class="eyebrow">2-YEAR (730D) BANKING &amp; AGGREGATOR CONNECTORS</span>
-            <h2>BANKING CONNECTORS</h2>
+            <span class="eyebrow">Bank Sync</span>
+            <h2>Banks &amp; Connected Accounts</h2>
           </div>
           <button id="btn-refresh-connections" type="button" class="btn btn-ghost btn-sm">Refresh Connections</button>
         </div>
@@ -1801,272 +1753,403 @@
         <div id="connections-list" class="stack-sm details-spacer"></div>
 
         <div class="two-col">
-          <!-- Plaid Hosted Link BYOK -->
+          <!-- Connect Your Bank (Plaid) -->
           <div class="subpanel stack-sm">
             <div class="item-row">
-              <h3>Plaid Hosted Link (BYOK)</h3>
-              <span id="plaid-status-pill" class="pill pill-soft">BYOK</span>
+              <h3>Connect Your Bank (Plaid)</h3>
+              <span id="plaid-status-pill" class="pill pill-soft">Not Connected</span>
             </div>
             <p class="muted small">
-              Enter your own Plaid credentials (stored sealed in <code>secrets.enc</code>). Link opens in your system browser and polls automatically. Requests 730 days at Link time — existing items require re-Link to extend history.
+              Enter your Plaid Client ID and Secret once, then click Connect Bank. Sign-in opens in your browser and imports up to 24 months of history automatically.
             </p>
             <form id="plaid-config-form" class="stack-sm">
               <label class="field">
-                <span>Plaid Client ID</span>
-                <input id="set-plaid-client-id" type="text" autocomplete="off" placeholder="Plaid client_id" />
+                <span>Client ID</span>
+                <input id="set-plaid-client-id" type="text" autocomplete="off" placeholder="Enter Plaid Client ID" />
               </label>
               <label class="field">
-                <span>Plaid Secret (write-only)</span>
-                <input id="set-plaid-secret" type="password" autocomplete="off" placeholder="Paste Plaid secret" />
+                <span>Secret</span>
+                <input id="set-plaid-secret" type="password" autocomplete="off" placeholder="Enter Plaid Secret" />
               </label>
               <div class="row-gap wrap">
-                <button type="submit" class="btn btn-soft btn-sm">Save Plaid Credentials</button>
-                <button id="btn-plaid-connect" type="button" class="btn btn-primary btn-sm">Launch Hosted Link (730d)</button>
+                <button id="btn-plaid-connect" type="button" class="btn btn-primary btn-sm">Connect Bank</button>
+                <button type="submit" class="btn btn-ghost btn-sm">Save Credentials</button>
               </div>
             </form>
-            <div id="plaid-link-status" class="notice-bar hidden" aria-live="polite"></div>
+            <div id="plaid-link-status" class="plaid-progress-card hidden" aria-live="polite"></div>
           </div>
 
-          <!-- SimpleFIN Bridge -->
+          <!-- SimpleFIN Sync -->
           <div class="subpanel stack-sm">
             <div class="item-row">
-              <h3>SimpleFIN Bridge</h3>
-              <span class="pill pill-blue">730D CHUNKED SYNC</span>
+              <h3>SimpleFIN Sync</h3>
+              <span class="pill pill-blue">Up to 24 Months</span>
             </div>
             <p class="muted small">
-              Generate a one-time Base64 Setup Token in SimpleFIN Bridge and paste it below. ChronoX claims the access URL, seals it in your vault, and pulls up to 730 days of accounts &amp; transactions.
+              Paste a one-time setup token from SimpleFIN Bridge to sync checking, savings, and credit cards directly to your device.
             </p>
             <form id="simplefin-claim-form" class="stack-sm">
               <label class="field">
-                <span>SimpleFIN Base64 Setup Token</span>
-                <input id="set-simplefin-token" type="password" autocomplete="off" placeholder="Paste Base64 setup token..." required />
+                <span>SimpleFIN Setup Token</span>
+                <input id="set-simplefin-token" type="password" autocomplete="off" placeholder="Paste setup token..." required />
               </label>
-              <button type="submit" class="btn btn-primary btn-sm">Claim Token &amp; Sync 730d</button>
+              <button type="submit" class="btn btn-primary btn-sm">Connect &amp; Sync</button>
             </form>
             <div id="simplefin-status" class="notice-bar hidden" aria-live="polite"></div>
           </div>
         </div>
       </section>
 
-      <!-- Optional Read-Only IMAP Email Bill Scanner -->
-      <section id="email-scanner-card" class="card section-block">
-        <div class="section-head">
-          <div>
-            <span class="eyebrow">OPT-IN · READ-ONLY IMAP (BODY.PEEK)</span>
-            <h2>EMAIL BILL &amp; RECEIPT SCANNER</h2>
-          </div>
-          <span id="email-scanner-badge" class="pill pill-soft">Disabled</span>
-        </div>
-        <p class="muted small">
-          Disabled by default. Connects locally via <code>IMAP4_SSL</code> using an App Password (v1) in <code>EXAMINE</code> read-only mode with <code>BODY.PEEK</code> so messages are NEVER marked read. Extracted bills land in Activity -&gt; Email Bill Review Queue.
-        </p>
-        <form id="email-config-form" class="form-grid-compact">
-          <label class="checkbox-row">
-            <input id="email-enabled" type="checkbox" />
-            <span>Enable Scanner</span>
-          </label>
-          <input id="email-host" type="text" placeholder="IMAP Host (e.g. imap.gmail.com)" />
-          <input id="email-port" type="number" min="1" max="65535" value="993" placeholder="Port (993)" />
-          <input id="email-username" type="email" placeholder="Email address" />
-          <input id="email-password" type="password" autocomplete="off" placeholder="App Password (write-only)" />
-          <input id="email-folder" type="text" value="INBOX" placeholder="Folder (INBOX)" />
-          <div class="row-gap wrap">
-            <button type="submit" class="btn btn-primary btn-sm">Save IMAP Config</button>
-            <button id="btn-email-test-scan" type="button" class="btn btn-soft btn-sm">Scan Now</button>
-          </div>
-        </form>
-        <div id="email-config-status" class="notice-bar hidden" aria-live="polite"></div>
-      </section>
-
-      <!-- Multi-Provider AI Routing Hub -->
+      <!-- 2. AI Assistant (Automagic Local AI + Collapsible Custom API Keys) -->
       <section id="ai-providers-section" class="card section-block">
         <div class="section-head">
           <div>
-            <span class="eyebrow">MULTI-PROVIDER STATELESS ROUTER</span>
-            <h2>AI PROVIDERS &amp; ROUTING</h2>
+            <span class="eyebrow">AI Assistant</span>
+            <h2>AI Assistant &amp; Smart Mode</h2>
           </div>
-          <span id="active-provider-badge" class="pill pill-soft">Active: Local Quant Math</span>
+          <div class="row-gap wrap">
+            <span id="active-provider-badge" class="pill pill-soft">Active: Built-in Math</span>
+            <button id="btn-ai-usage" class="btn btn-ghost btn-sm ai-usage-trigger" type="button" title="View AI Usage and Savings">
+              <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="square" aria-hidden="true">
+                <rect x="4" y="4" width="16" height="16" />
+                <rect x="9" y="9" width="6" height="6" />
+              </svg>
+              <span id="ai-usage-badge-text">AI Usage</span>
+            </button>
+          </div>
         </div>
 
-        <div class="hub-controls-grid">
+        <!-- Automagic Local AI Status Banner -->
+        <div id="local-cli-status-banner" class="local-cli-banner">
+          <div class="row-gap wrap">
+            <span id="local-cli-status-dot" class="status-dot-live is-idle" aria-hidden="true"></span>
+            <strong id="local-cli-status-text">Checking installed local AI assistants...</strong>
+          </div>
+          <div class="row-gap wrap">
+            <label class="checkbox-row small">
+              <input id="set-local-cli-auto-detect" type="checkbox" checked />
+              <span>Auto-detect local AI</span>
+            </label>
+            <button id="btn-rescan-local-clis" type="button" class="btn btn-ghost btn-xs">Re-Scan</button>
+          </div>
+        </div>
+
+        <!-- Detected Local AI CLI Cards (Claude, OpenCode, Codex, Antigravity) -->
+        <div id="local-cli-cards-grid" class="local-cli-grid"></div>
+
+        <div class="hub-controls-grid details-spacer">
           <div class="field">
-            <span>Intelligence Mode</span>
-            <div id="settings-mode-switcher" class="segmented" role="group" aria-label="Settings intelligence mode">
-              <button type="button" class="seg-btn" data-set-mode="deterministic_only" aria-pressed="false">Quant Math</button>
-              <button type="button" class="seg-btn active" data-set-mode="hybrid" aria-pressed="true">Hybrid</button>
-              <button type="button" class="seg-btn" data-set-mode="ai_standalone" aria-pressed="false">AI Only</button>
+            <span>Smart Mode</span>
+            <div id="settings-mode-switcher" class="segmented" role="group" aria-label="Settings smart mode">
+              <button type="button" class="seg-btn" data-set-mode="deterministic_only" aria-pressed="false">Built-in Math</button>
+              <button type="button" class="seg-btn active" data-set-mode="hybrid" aria-pressed="true">Auto (Recommended)</button>
+              <button type="button" class="seg-btn" data-set-mode="ai_standalone" aria-pressed="false">AI Direct</button>
             </div>
             <p id="settings-mode-desc" class="muted small"></p>
           </div>
 
           <div class="field">
-            <span>Preferred Provider</span>
+            <span>Preferred AI Provider</span>
             <div id="settings-provider-switcher" class="segmented segmented-wrap" role="group" aria-label="Preferred AI provider">
               <button type="button" class="seg-btn active" data-set-provider="auto" aria-pressed="true">Auto</button>
-              <button type="button" class="seg-btn" data-set-provider="opencode_go" aria-pressed="false">OpenCode Go</button>
+              <button type="button" class="seg-btn" data-set-provider="claude_cli" aria-pressed="false">Claude</button>
+              <button type="button" class="seg-btn" data-set-provider="opencode_cli" aria-pressed="false">OpenCode</button>
+              <button type="button" class="seg-btn" data-set-provider="codex_cli" aria-pressed="false">Codex</button>
+              <button type="button" class="seg-btn" data-set-provider="agy_cli" aria-pressed="false">Antigravity</button>
+              <button type="button" class="seg-btn" data-set-provider="opencode_go" aria-pressed="false">OpenCode Cloud</button>
               <button type="button" class="seg-btn" data-set-provider="gemini" aria-pressed="false">Gemini</button>
-              <button type="button" class="seg-btn" data-set-provider="openai_codex" aria-pressed="false">OpenAI/Codex</button>
-              <button type="button" class="seg-btn" data-set-provider="chat_wrapper" aria-pressed="false">Chat-Wrapper</button>
-              <button type="button" class="seg-btn" data-set-provider="codex_cli" aria-pressed="false">Codex CLI</button>
+              <button type="button" class="seg-btn" data-set-provider="openai_codex" aria-pressed="false">OpenAI</button>
+              <button type="button" class="seg-btn" data-set-provider="chat_wrapper" aria-pressed="false">Custom Gateway</button>
             </div>
           </div>
         </div>
 
-        <div class="two-col details-spacer">
-          <!-- OpenCode Go -->
-          <div class="subpanel stack-sm">
-            <div class="item-row">
-              <h3>OpenCode Go</h3>
-              <span id="key-status-badge" class="pill pill-soft">Not set</span>
-            </div>
-            <form id="opencode-settings-form" class="stack-sm">
-              <label class="field">
-                <span>API Key (sealed in vault)</span>
-                <input id="set-opencode-key" type="password" autocomplete="off" placeholder="Paste OPENCODE_GO_API_KEY" />
-              </label>
-              <label class="field">
-                <span>Base URL</span>
-                <input id="set-opencode-url" type="url" value="https://opencode.ai/zen/go/v1" required />
-              </label>
-              <div class="row-gap">
-                <label class="field grow">
-                  <span>Model</span>
-                  <select id="set-opencode-model"></select>
-                </label>
-                <button id="btn-fetch-models" type="button" class="btn btn-ghost btn-sm align-end">Live Models</button>
+        <!-- Advanced Cloud API Keys & Custom Gateways (Collapsed by default) -->
+        <details class="advanced-disclosure">
+          <summary>Advanced: Custom API Keys &amp; Local Gateways</summary>
+          <div class="two-col advanced-disclosure-body">
+            <!-- OpenCode Cloud -->
+            <div class="subpanel stack-sm">
+              <div class="item-row">
+                <h3>OpenCode Cloud</h3>
+                <span id="key-status-badge" class="pill pill-soft">Not set</span>
               </div>
-              <div class="row-gap">
-                <label class="field grow">
-                  <span>Protocol</span>
-                  <select id="set-opencode-proto">
-                    <option value="auto">Auto</option>
-                    <option value="openai">OpenAI /chat/completions</option>
-                    <option value="anthropic">Anthropic /messages</option>
-                  </select>
-                </label>
-                <label class="field grow">
-                  <span>Daily Quota Guard</span>
-                  <input id="set-opencode-quota" type="number" min="1" max="500" value="60" />
-                </label>
-              </div>
-              <div class="row-gap wrap">
-                <button type="submit" class="btn btn-primary btn-sm">Save OpenCode</button>
-                <button id="btn-test-opencode" type="button" class="btn btn-soft btn-sm">Test</button>
-                <button id="btn-clear-opencode-key" type="button" class="btn btn-ghost btn-xs">Clear Key</button>
-              </div>
-            </form>
-            <div id="opencode-test-result" class="notice-bar hidden" aria-live="polite"></div>
-          </div>
-
-          <!-- Google Gemini -->
-          <div class="subpanel stack-sm">
-            <div class="item-row">
-              <h3>Google Gemini</h3>
-              <span id="gemini-key-status-badge" class="pill pill-soft">Not set</span>
-            </div>
-            <form id="gemini-settings-form" class="stack-sm">
-              <label class="field">
-                <span>API Key (sealed in vault)</span>
-                <input id="set-gemini-key" type="password" autocomplete="off" placeholder="Paste GEMINI_API_KEY" />
-              </label>
-              <label class="field">
-                <span>Base URL</span>
-                <input id="set-gemini-url" type="url" value="https://generativelanguage.googleapis.com/v1beta" required />
-              </label>
-              <div class="row-gap">
-                <label class="field grow">
-                  <span>Model</span>
-                  <select id="set-gemini-model"></select>
-                </label>
-                <button id="btn-fetch-gemini-models" type="button" class="btn btn-ghost btn-sm align-end">Live Models</button>
-              </div>
-              <div class="row-gap wrap">
-                <button type="submit" class="btn btn-primary btn-sm">Save Gemini</button>
-                <button id="btn-test-gemini" type="button" class="btn btn-soft btn-sm">Test</button>
-                <button id="btn-clear-gemini-key" type="button" class="btn btn-ghost btn-xs">Clear Key</button>
-              </div>
-            </form>
-            <div id="gemini-test-result" class="notice-bar hidden" aria-live="polite"></div>
-          </div>
-
-          <!-- OpenAI / Codex Responses API (Stateless store=false) -->
-          <div class="subpanel stack-sm">
-            <div class="item-row">
-              <h3>OpenAI / Codex Responses</h3>
-              <span id="codex-key-status-badge" class="pill pill-soft">Not set</span>
-            </div>
-            <p class="muted small">Stateless <code>store=false</code> with stable &gt;=1024-token cached prefix.</p>
-            <form id="codex-settings-form" class="stack-sm">
-              <label class="field">
-                <span>OpenAI / Codex API Key</span>
-                <input id="set-codex-key" type="password" autocomplete="off" placeholder="Paste OPENAI_API_KEY" />
-              </label>
-              <label class="field">
-                <span>Base URL</span>
-                <input id="set-codex-url" type="url" value="https://api.openai.com/v1" required />
-              </label>
-              <label class="field">
-                <span>Model</span>
-                <input id="set-codex-model" type="text" value="gpt-5-codex" placeholder="gpt-5-codex / gpt-4.1-mini" />
-              </label>
-              <div class="row-gap wrap">
-                <button type="submit" class="btn btn-primary btn-sm">Save OpenAI/Codex</button>
-                <button id="btn-test-codex" type="button" class="btn btn-soft btn-sm">Test</button>
-                <button id="btn-clear-codex-key" type="button" class="btn btn-ghost btn-xs">Clear Key</button>
-              </div>
-            </form>
-            <div id="codex-test-result" class="notice-bar hidden" aria-live="polite"></div>
-          </div>
-
-          <!-- Durable Chat-Wrapper & Read-Only Codex CLI -->
-          <div class="subpanel stack-sm">
-            <div class="item-row">
-              <h3>Chat-Wrapper &amp; Codex CLI</h3>
-              <span id="wrapper-key-status-badge" class="pill pill-soft">Optional</span>
-            </div>
-            <p class="muted small">LiteLLM / OpenRouter / Ollama gateway or isolated read-only local <code>codex exec</code>.</p>
-            <form id="wrapper-settings-form" class="stack-sm">
-              <label class="field">
-                <span>Wrapper API Key (optional for Ollama)</span>
-                <input id="set-wrapper-key" type="password" autocomplete="off" placeholder="Paste wrapper bearer key" />
-              </label>
-              <div class="row-gap">
-                <label class="field grow">
-                  <span>Wrapper Base URL</span>
-                  <input id="set-wrapper-url" type="url" placeholder="http://127.0.0.1:4000/v1" />
+              <form id="opencode-settings-form" class="stack-sm">
+                <label class="field">
+                  <span>API Key</span>
+                  <input id="set-opencode-key" type="password" autocomplete="off" placeholder="Paste API key" />
                 </label>
                 <label class="field">
-                  <span>Wire API</span>
-                  <select id="set-wrapper-wire-api">
-                    <option value="responses">Responses</option>
-                    <option value="chat_completions">Chat Completions</option>
-                  </select>
+                  <span>Endpoint URL</span>
+                  <input id="set-opencode-url" type="url" value="https://opencode.ai/zen/go/v1" required />
                 </label>
+                <div class="row-gap">
+                  <label class="field grow">
+                    <span>Model</span>
+                    <select id="set-opencode-model"></select>
+                  </label>
+                  <button id="btn-fetch-models" type="button" class="btn btn-ghost btn-sm align-end">Refresh Models</button>
+                </div>
+                <div class="row-gap">
+                  <label class="field grow">
+                    <span>API Format</span>
+                    <select id="set-opencode-proto">
+                      <option value="auto">Auto</option>
+                      <option value="openai">OpenAI Compatible</option>
+                      <option value="anthropic">Anthropic Compatible</option>
+                    </select>
+                  </label>
+                  <label class="field grow">
+                    <span>Daily Request Limit</span>
+                    <input id="set-opencode-quota" type="number" min="1" max="500" value="60" />
+                  </label>
+                </div>
+                <div class="row-gap wrap">
+                  <button type="submit" class="btn btn-primary btn-sm">Save</button>
+                  <button id="btn-test-opencode" type="button" class="btn btn-soft btn-sm">Test</button>
+                  <button id="btn-clear-opencode-key" type="button" class="btn btn-ghost btn-xs">Clear Key</button>
+                </div>
+              </form>
+              <div id="opencode-test-result" class="notice-bar hidden" aria-live="polite"></div>
+            </div>
+
+            <!-- Google Gemini -->
+            <div class="subpanel stack-sm">
+              <div class="item-row">
+                <h3>Google Gemini</h3>
+                <span id="gemini-key-status-badge" class="pill pill-soft">Not set</span>
               </div>
-              <label class="field">
-                <span>Wrapper Model</span>
-                <input id="set-wrapper-model" type="text" placeholder="e.g. gpt-4o-mini / qwen2.5" />
-              </label>
-              <label class="checkbox-row">
-                <input id="set-codex-cli-enabled" type="checkbox" />
-                <span>Enable isolated read-only local <code>codex exec</code></span>
-              </label>
-              <div class="row-gap wrap">
-                <button type="submit" class="btn btn-primary btn-sm">Save Wrapper &amp; CLI</button>
-                <button id="btn-test-wrapper" type="button" class="btn btn-soft btn-sm">Test Wrapper</button>
+              <form id="gemini-settings-form" class="stack-sm">
+                <label class="field">
+                  <span>API Key</span>
+                  <input id="set-gemini-key" type="password" autocomplete="off" placeholder="Paste Gemini API key" />
+                </label>
+                <label class="field">
+                  <span>Endpoint URL</span>
+                  <input id="set-gemini-url" type="url" value="https://generativelanguage.googleapis.com/v1beta" required />
+                </label>
+                <div class="row-gap">
+                  <label class="field grow">
+                    <span>Model</span>
+                    <select id="set-gemini-model"></select>
+                  </label>
+                  <button id="btn-fetch-gemini-models" type="button" class="btn btn-ghost btn-sm align-end">Refresh Models</button>
+                </div>
+                <div class="row-gap wrap">
+                  <button type="submit" class="btn btn-primary btn-sm">Save</button>
+                  <button id="btn-test-gemini" type="button" class="btn btn-soft btn-sm">Test</button>
+                  <button id="btn-clear-gemini-key" type="button" class="btn btn-ghost btn-xs">Clear Key</button>
+                </div>
+              </form>
+              <div id="gemini-test-result" class="notice-bar hidden" aria-live="polite"></div>
+            </div>
+
+            <!-- OpenAI -->
+            <div class="subpanel stack-sm">
+              <div class="item-row">
+                <h3>OpenAI</h3>
+                <span id="codex-key-status-badge" class="pill pill-soft">Not set</span>
               </div>
-            </form>
-            <div id="wrapper-test-result" class="notice-bar hidden" aria-live="polite"></div>
+              <p class="muted small">Connect your OpenAI account using a private API key stored on your device.</p>
+              <form id="codex-settings-form" class="stack-sm">
+                <label class="field">
+                  <span>OpenAI API Key</span>
+                  <input id="set-codex-key" type="password" autocomplete="off" placeholder="Paste OpenAI API key" />
+                </label>
+                <label class="field">
+                  <span>Endpoint URL</span>
+                  <input id="set-codex-url" type="url" value="https://api.openai.com/v1" required />
+                </label>
+                <label class="field">
+                  <span>Model</span>
+                  <input id="set-codex-model" type="text" value="gpt-5-codex" placeholder="gpt-5-codex / gpt-4.1-mini" />
+                </label>
+                <div class="row-gap wrap">
+                  <button type="submit" class="btn btn-primary btn-sm">Save</button>
+                  <button id="btn-test-codex" type="button" class="btn btn-soft btn-sm">Test</button>
+                  <button id="btn-clear-codex-key" type="button" class="btn btn-ghost btn-xs">Clear Key</button>
+                </div>
+              </form>
+              <div id="codex-test-result" class="notice-bar hidden" aria-live="polite"></div>
+            </div>
+
+            <!-- Custom Gateway (Ollama / LiteLLM / OpenRouter) -->
+            <div class="subpanel stack-sm">
+              <div class="item-row">
+                <h3>Custom Local Gateway</h3>
+                <span id="wrapper-key-status-badge" class="pill pill-soft">Optional</span>
+              </div>
+              <p class="muted small">Connect Ollama, LiteLLM, or another OpenAI-compatible local gateway.</p>
+              <form id="wrapper-settings-form" class="stack-sm">
+                <label class="field">
+                  <span>Access Key (optional for local servers)</span>
+                  <input id="set-wrapper-key" type="password" autocomplete="off" placeholder="Optional access key" />
+                </label>
+                <div class="row-gap wrap">
+                  <label class="field grow">
+                    <span>Gateway URL</span>
+                    <input id="set-wrapper-url" type="url" placeholder="http://127.0.0.1:4000/v1" />
+                  </label>
+                  <label class="field">
+                    <span>API Style</span>
+                    <select id="set-wrapper-wire-api">
+                      <option value="responses">Responses</option>
+                      <option value="chat_completions">Chat Completions</option>
+                    </select>
+                  </label>
+                </div>
+                <label class="field">
+                  <span>Model Name</span>
+                  <input id="set-wrapper-model" type="text" placeholder="e.g. qwen2.5 or gpt-4o-mini" />
+                </label>
+                <label class="checkbox-row">
+                  <input id="set-codex-cli-enabled" type="checkbox" />
+                  <span>Allow local Codex assistant</span>
+                </label>
+                <div class="row-gap wrap">
+                  <button type="submit" class="btn btn-primary btn-sm">Save Gateway</button>
+                  <button id="btn-test-wrapper" type="button" class="btn btn-soft btn-sm">Test Gateway</button>
+                </div>
+              </form>
+              <div id="wrapper-test-result" class="notice-bar hidden" aria-live="polite"></div>
+            </div>
           </div>
+        </details>
+      </section>
+
+      <!-- 3. Budget Preferences & Security / Exports -->
+      <section class="two-col section-block">
+        <!-- Budget Preferences -->
+        <div class="card">
+          <span class="eyebrow">Budget Preferences</span>
+          <h2>Payday &amp; Safety Cushion</h2>
+          <form id="profile-settings-form" class="stack-sm">
+            <div class="row-gap wrap">
+              <label class="field grow">
+                <span>Hourly Wage ($/hr)</span>
+                <input id="set-hourly-wage" type="number" step="1" min="5" value="30" />
+              </label>
+              <label class="field grow">
+                <span>Safety Cushion ($)</span>
+                <input id="set-emergency-buffer" type="number" step="25" min="0" value="500" />
+              </label>
+            </div>
+            <div class="row-gap wrap">
+              <label class="field grow">
+                <span>Default Impulse Pause (hours)</span>
+                <input id="set-cooling-hours" type="number" min="1" max="720" value="48" />
+              </label>
+              <label class="field grow">
+                <span>Payday Frequency (days)</span>
+                <input id="set-payday-cadence" type="number" min="7" max="31" value="14" />
+              </label>
+            </div>
+            <div class="row-gap wrap">
+              <label class="field grow">
+                <span>Next Payday Date</span>
+                <input id="set-next-payday" type="date" />
+              </label>
+              <label class="field grow">
+                <span>Expected Paycheck ($)</span>
+                <input id="set-expected-paycheck" type="number" step="10" min="0" value="0" placeholder="0 (auto-detect)" />
+              </label>
+            </div>
+            <button type="submit" class="btn btn-primary btn-sm">Save Preferences</button>
+          </form>
+        </div>
+
+        <!-- Security, Exports & Backups -->
+        <div id="vault-security-card" class="card">
+          <div class="section-head">
+            <div>
+              <span class="eyebrow">Privacy &amp; Exports</span>
+              <h2>Security, Backups &amp; Exports</h2>
+            </div>
+            <button id="btn-settings-lock-vault" type="button" class="btn btn-soft btn-sm">Lock Now</button>
+          </div>
+          <p class="muted small">
+            Everything stays private on your device. Export Apple Numbers workbooks, CSV reports, or full backups anytime.
+          </p>
+
+          <!-- Export Studio -->
+          <div class="export-studio-box">
+            <strong class="small">Export Studio</strong>
+            <div class="row-gap wrap">
+              <button id="btn-settings-export-numbers" type="button" class="btn btn-primary btn-sm">Export Apple Numbers (.xlsx)</button>
+              <button id="btn-settings-export-csv" type="button" class="btn btn-soft btn-sm">Export CSV</button>
+              <button id="btn-settings-export-csv-pack" type="button" class="btn btn-soft btn-sm">Export Full CSV Pack (.zip)</button>
+            </div>
+          </div>
+
+          <div class="row-gap wrap details-spacer">
+            <a id="btn-backup-export-link" href="/api/v1/backup/export" class="btn btn-ghost btn-sm">Export JSON Backup</a>
+            <label class="btn btn-ghost btn-sm file-btn">
+              Restore JSON Backup
+              <input id="backup-import-input" type="file" accept=".json,application/json" class="sr-only" />
+            </label>
+            <button id="btn-reopen-onboarding" type="button" class="btn btn-ghost btn-sm">Account Setup Wizard</button>
+          </div>
+          <div id="backup-preview-box" class="inline-editor hidden" aria-live="polite"></div>
+
+          <hr class="divider" />
+
+          <form id="vault-change-pwd-form" class="stack-sm">
+            <div class="form-grid-compact">
+              <input id="vcp-current" type="password" autocomplete="current-password" placeholder="Current passcode" required />
+              <input id="vcp-new" type="password" minlength="8" autocomplete="new-password" placeholder="New passcode (8+ chars)" required />
+              <input id="vcp-confirm" type="password" minlength="8" autocomplete="new-password" placeholder="Confirm new passcode" required />
+            </div>
+            <div class="row-gap wrap">
+              <button type="submit" class="btn btn-soft btn-sm">Change Passcode</button>
+              <label class="field-inline">
+                <span class="muted small">Auto-lock (min):</span>
+                <input id="set-auto-lock-minutes" type="number" min="1" max="480" value="30" class="input-xs" />
+              </label>
+              <button id="btn-save-auto-lock" type="button" class="btn btn-ghost btn-sm">Save Timeout</button>
+            </div>
+          </form>
         </div>
       </section>
 
-      <!-- Desktop App Preferences & Diagnostics Card (shown only inside Electron desktop app) -->
+      <!-- 4. Optional Email Bill Scanner (Collapsed by default) -->
+      <section id="email-scanner-card" class="card section-block">
+        <div class="section-head">
+          <div>
+            <h2>Email Bill Scanner</h2>
+            <p class="muted small">Optionally scan your inbox for upcoming bills and receipts — reads bills without marking emails as read.</p>
+          </div>
+          <span id="email-scanner-badge" class="pill pill-soft">Off</span>
+        </div>
+
+        <details class="advanced-disclosure">
+          <summary>Configure Email Server (Optional)</summary>
+          <div class="advanced-disclosure-body stack-sm">
+            <form id="email-config-form" class="form-grid-compact">
+              <label class="checkbox-row">
+                <input id="email-enabled" type="checkbox" />
+                <span>Enable Email Scanner</span>
+              </label>
+              <input id="email-host" type="text" placeholder="Mail server (e.g. imap.gmail.com)" />
+              <input id="email-port" type="number" min="1" max="65535" value="993" placeholder="Port (993)" />
+              <input id="email-username" type="email" placeholder="Email address" />
+              <input id="email-password" type="password" autocomplete="off" placeholder="App Password" />
+              <input id="email-folder" type="text" value="INBOX" placeholder="Folder (INBOX)" />
+              <div class="row-gap wrap">
+                <button type="submit" class="btn btn-primary btn-sm">Save Email Settings</button>
+                <button id="btn-email-test-scan" type="button" class="btn btn-soft btn-sm">Scan Now</button>
+              </div>
+            </form>
+            <div id="email-config-status" class="notice-bar hidden" aria-live="polite"></div>
+          </div>
+        </details>
+      </section>
+
+      <!-- 5. Desktop App Preferences (shown only inside Electron desktop app) -->
       <section id="desktop-settings-card" class="card section-block desktop-settings-card hidden">
         <div class="section-head">
           <div>
-            <h2>DESKTOP APP PREFERENCES &amp; DIAGNOSTICS</h2>
-            <p class="muted small">Native OS tray, global Quick Capture HUD, local drop folder &amp; sidecar logs.</p>
+            <h2>Desktop App Preferences</h2>
+            <p class="muted small">System tray, Quick Capture shortcut, statement drop folder, and diagnostics.</p>
           </div>
           <span id="desktop-version-pill" class="pill pill-calm">Desktop App</span>
         </div>
@@ -2074,8 +2157,8 @@
         <div class="desktop-prefs-grid">
           <label class="switch-card" for="desktop-pref-close-to-tray">
             <div class="switch-copy">
-              <strong>Keep Running in System Tray on Close</strong>
-              <span class="muted small">Closing the window keeps ChronoX ready in tray for Quick Capture.</span>
+              <strong>Keep Running in System Tray</strong>
+              <span class="muted small">Closing the window keeps ChronoX ready in the tray for Quick Capture.</span>
             </div>
             <span class="switch-control">
               <input id="desktop-pref-close-to-tray" type="checkbox" class="toggle-input" />
@@ -2085,8 +2168,8 @@
 
           <label class="switch-card" for="desktop-pref-launch-login">
             <div class="switch-copy">
-              <strong>Launch ChronoX at Login</strong>
-              <span class="muted small">Start ChronoX automatically on OS sign-in (vault stays locked until unlocked).</span>
+              <strong>Launch at Login</strong>
+              <span class="muted small">Start ChronoX automatically on sign-in (locked until you enter your passcode).</span>
             </div>
             <span class="switch-control">
               <input id="desktop-pref-launch-login" type="checkbox" class="toggle-input" />
@@ -2096,8 +2179,8 @@
 
           <label class="switch-card" for="desktop-pref-watch-enabled">
             <div class="switch-copy">
-              <strong>Auto-Import Drop Folder (Zero 3rd-Party)</strong>
-              <span class="muted small">Watches a local folder for NFCU CSV/PDF or Plaid exports and archives to <code>Imported/</code>.</span>
+              <strong>Auto-Import Statement Folder</strong>
+              <span class="muted small">Automatically import bank CSV/PDF statements dropped into a local folder.</span>
             </div>
             <span class="switch-control">
               <input id="desktop-pref-watch-enabled" type="checkbox" class="toggle-input" />
@@ -2109,9 +2192,9 @@
         <div class="stack-sm details-spacer">
           <div class="row-gap wrap">
             <label class="field grow">
-              <span>Drop Folder Profile</span>
+              <span>Statement Folder Profile</span>
               <select id="desktop-watch-institution">
-                <option value="auto">Auto-Detect (Navy Federal, Plaid &amp; All Banks)</option>
+                <option value="auto">Auto-Detect (All Supported Banks)</option>
                 <option value="navy_federal">Navy Federal Credit Union (CSV / PDF)</option>
                 <option value="plaid">Plaid Exports (JSON / CSV)</option>
                 <option value="generic">Generic Bank Statements</option>
@@ -2129,9 +2212,9 @@
         <hr class="divider" />
 
         <div class="row-gap wrap">
-          <button id="btn-settings-open-hud" type="button" class="btn btn-primary btn-sm">Open Quick Capture HUD</button>
+          <button id="btn-settings-open-hud" type="button" class="btn btn-primary btn-sm">Open Quick Capture</button>
           <button id="btn-desktop-open-data" type="button" class="btn btn-soft btn-sm">Open Data Folder</button>
-          <button id="btn-desktop-view-logs" type="button" class="btn btn-ghost btn-sm">View Backend Logs</button>
+          <button id="btn-desktop-view-logs" type="button" class="btn btn-ghost btn-sm">View App Logs</button>
         </div>
       </section>
     </main>

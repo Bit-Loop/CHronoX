@@ -126,42 +126,42 @@ function buildApplicationMenu(options) {
       label: "Navigate",
       submenu: [
         {
-          label: "Command",
+          label: "Overview",
           accelerator: "CommandOrControl+1",
           click: () => cb.onNavigateTab && cb.onNavigateTab("today"),
         },
         {
-          label: "Analytics & Forecast",
+          label: "Cash Flow",
           accelerator: "CommandOrControl+2",
           click: () => cb.onNavigateTab && cb.onNavigateTab("analytics"),
         },
         {
-          label: "Portfolio",
+          label: "Activity",
           accelerator: "CommandOrControl+3",
-          click: () => cb.onNavigateTab && cb.onNavigateTab("portfolio"),
-        },
-        {
-          label: "Credit & Debt",
-          accelerator: "CommandOrControl+4",
-          click: () => cb.onNavigateTab && cb.onNavigateTab("credit"),
-        },
-        {
-          label: "Goals & Rules",
-          accelerator: "CommandOrControl+5",
-          click: () => cb.onNavigateTab && cb.onNavigateTab("goals"),
-        },
-        {
-          label: "Activity & Bills",
-          accelerator: "CommandOrControl+6",
           click: () => cb.onNavigateTab && cb.onNavigateTab("activity"),
         },
         {
-          label: "AI Coach",
+          label: "Investments",
+          accelerator: "CommandOrControl+4",
+          click: () => cb.onNavigateTab && cb.onNavigateTab("portfolio"),
+        },
+        {
+          label: "Credit",
+          accelerator: "CommandOrControl+5",
+          click: () => cb.onNavigateTab && cb.onNavigateTab("credit"),
+        },
+        {
+          label: "Goals",
+          accelerator: "CommandOrControl+6",
+          click: () => cb.onNavigateTab && cb.onNavigateTab("goals"),
+        },
+        {
+          label: "Coach",
           accelerator: "CommandOrControl+7",
           click: () => cb.onNavigateTab && cb.onNavigateTab("coach"),
         },
         {
-          label: "Vault & Connectors",
+          label: "Settings",
           accelerator: "CommandOrControl+8",
           click: () => cb.onNavigateTab && cb.onNavigateTab("settings"),
         },
@@ -172,19 +172,19 @@ function buildApplicationMenu(options) {
       label: "Intelligence",
       submenu: [
         {
-          label: "Quant Math (Local Deterministic)",
+          label: "Built-in Math (Offline)",
           type: "radio",
           checked: currentMode === "deterministic_only",
           click: () => cb.onSetMode && cb.onSetMode("deterministic_only"),
         },
         {
-          label: "Hybrid (Quant Math + AI)",
+          label: "Auto (Math + AI)",
           type: "radio",
           checked: currentMode === "hybrid",
           click: () => cb.onSetMode && cb.onSetMode("hybrid"),
         },
         {
-          label: "AI Standalone",
+          label: "AI Direct",
           type: "radio",
           checked: currentMode === "ai_standalone",
           click: () => cb.onSetMode && cb.onSetMode("ai_standalone"),

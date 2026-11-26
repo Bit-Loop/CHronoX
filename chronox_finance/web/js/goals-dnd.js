@@ -1,11 +1,11 @@
 /**
- * ChronoX Finance — Direct-Manipulation Goals & Firefly Automation Rules (ES Module)
- * Pure zero-CDN Pointer Events & DOM API:
- * 1. Drag-to-Reprioritize Tracked Goals (grip handle + emerald insertion bar + Alt+Up/Down A11y)
- * 2. Tap-and-Swipe Detents (Swipe Right >=80px -> FUND +$50 with Undo; Swipe Left <=-80px -> DESTROY with 8s Restore Undo)
- *    paired with always-visible desktop buttons (+$50 Fund, Edit, Optimize, Delete)
- * 3. $1,000 Credit-Safe Goal & Purchase Optimizer (3 paths + 1-click Save as Tracked Goal)
- * 4. Firefly III-Inspired Automation Rule Builder + 2-Year Dry-Run Preview & Retroactive Apply
+ * ChronoX Finance — Savings Goals, Purchase Planner & Auto-Categorize Rules (ES Module)
+ * Pure local Pointer Events & DOM API:
+ * 1. Drag-to-Reprioritize Savings Goals (grip handle + emerald insertion bar + Alt+Up/Down A11y)
+ * 2. Swipe Detents (Swipe Right >=80px -> Add $50 with Undo; Swipe Left <=-80px -> Remove with 8s Undo)
+ *    paired with always-visible desktop buttons (+$50 Fund, Edit, Plan, Delete)
+ * 3. Credit-Safe Purchase Planner (3 paths + 1-click Save as Savings Goal)
+ * 4. Auto-Categorize Rule Builder with Match Preview & Retroactive Apply
  */
 
 import {
@@ -23,6 +23,7 @@ import {
   registerTabHook,
   registerRefreshHook,
   registerDashboardHook,
+  renderEmptyState,
   triggerCelebrate,
 } from "./core.js";
 
@@ -446,12 +447,19 @@ function renderGoalsList() {
 
   if (!dndState.goals.length) {
     grid.replaceChildren(
-      el("div", { class: "item-box muted small" }, [
-        el("span", { class: "inline-icon-row" }, [
-          makeIcon("target", "ui-icon-sm"),
-          "No active goals yet. Click '+ New Goal' above or run the $1,000 Purchase Optimizer below to save one in 1 click.",
-        ]),
-      ])
+      renderEmptyState({
+        icon: "target",
+        title: "No savings goals yet",
+        subtitle: "Create your first goal or run the Purchase Planner below to compare credit-safe saving paths.",
+        actionLabel: "+ New Goal",
+        onAction: () => {
+          const f = $("goal-quick-create-form");
+          if (f) {
+            f.classList.remove("hidden");
+            if ($("gq-name")) $("gq-name").focus();
+          }
+        },
+      })
     );
     return;
   }
@@ -570,8 +578,8 @@ function renderGoalsList() {
     ]);
 
     const backdrop = el("div", { class: "goal-swipe-backdrop", "aria-hidden": "true" }, [
-      el("span", { class: "goal-swipe-fund inline-icon-row" }, [makeIcon("plus", "ui-icon-sm"), "FUND +$50"]),
-      el("span", { class: "goal-swipe-destroy inline-icon-row" }, ["DESTROY", makeIcon("trash", "ui-icon-sm")]),
+      el("span", { class: "goal-swipe-fund inline-icon-row" }, [makeIcon("plus", "ui-icon-sm"), "Add $50"]),
+      el("span", { class: "goal-swipe-destroy inline-icon-row" }, ["Remove", makeIcon("trash", "ui-icon-sm")]),
     ]);
 
     const shell = el(
@@ -635,7 +643,7 @@ function renderGoalPlan(plan) {
     el("div", { class: "item-row" }, [
       el("div", {}, [
         el("h3", {
-          text: `PLAN FOR ${plan.item_name} (${fmtMoney(plan.target_cents)} · ~${plan.work_hours_cost}h WORK)`,
+          text: `Plan for ${plan.item_name} (${fmtMoney(plan.target_cents)} · ~${plan.work_hours_cost}h work)`,
         }),
         el("p", {
           class: "muted small tabular-nums",
@@ -658,7 +666,7 @@ function renderGoalPlan(plan) {
   if (Array.isArray(plan.accelerators) && plan.accelerators.length) {
     headerNodes.push(
       el("div", { class: "chip-row" }, [
-        el("span", { class: "chip-label", text: "ACCELERATORS:" }),
+        el("span", { class: "chip-label", text: "Reach it faster:" }),
         ...plan.accelerators.map((a) => el("span", { class: "pill pill-soft", text: a.label || String(a) })),
       ])
     );
@@ -683,16 +691,16 @@ function renderGoalPlan(plan) {
         "article",
         {
           class: "jar-card",
-          style: opt.recommended ? { borderTopColor: "var(--primary)", borderColor: "var(--primary-border)" } : {},
+          style: opt.recommended ? { borderColor: "var(--primary-border)" } : {},
         },
         [
           el("div", { class: "jar-top" }, [
-            el("strong", { text: opt.title }),
+            el("strong", { class: "jar-name-text", text: opt.title }),
             opt.recommended
-              ? el("span", { class: "pill pill-calm" }, [makeIcon("star", "ui-icon-sm"), "RECOMMENDED"])
+              ? el("span", { class: "pill pill-calm" }, [makeIcon("star", "ui-icon-sm"), "Recommended"])
               : el("span", {
                   class: `pill ${opt.credit_safe ? "pill-blue" : "pill-danger"}`,
-                  text: opt.credit_safe ? "CREDIT-SAFE" : "CREDIT WARNING",
+                  text: opt.credit_safe ? "Credit-Safe" : "Credit Warning",
                 }),
           ]),
           el("div", { class: "small", text: opt.summary }),
@@ -716,7 +724,7 @@ function renderGoalPlan(plan) {
 }
 
 /* ============================================================================
-   Firefly III-Inspired Automation Rule Builder + 2-Year Dry-Run Preview
+   Auto-Categorize Rule Builder + Match Preview
    ============================================================================ */
 
 function buildTriggerFromForm() {
@@ -817,7 +825,7 @@ function renderDryRunOutput(rule, res) {
       el("span", { class: "inline-icon-row" }, [
         makeIcon("filter", "ui-icon-sm"),
         el("strong", {
-          text: `2-Year Dry-Run "${rule.name}": ${res.matched_count || 0} matched of ${res.scanned_count || 0} scanned (${res.lookback_days || 730}d)`,
+          text: `Match Preview "${rule.name}": ${res.matched_count || 0} matched of ${res.scanned_count || 0} transactions`,
         }),
       ]),
       el("div", { class: "row-gap" }, [res.matched_count > 0 ? applyBtn : null, closeBtn]),
@@ -905,12 +913,20 @@ function renderRulesList() {
 
   if (!dndState.rules.length) {
     host.replaceChildren(
-      el("div", { class: "item-box muted small" }, [
-        el("span", { class: "inline-icon-row" }, [
-          makeIcon("filter", "ui-icon-sm"),
-          "No Firefly automation rules yet. Click '+ New Rule' above to auto-categorize, tag, or allocate transactions.",
-        ]),
-      ])
+      renderEmptyState({
+        icon: "filter",
+        title: "No auto-categorize rules yet",
+        subtitle: "Create a rule to automatically sort merchants into jars, add tags, or assign notes.",
+        actionLabel: "+ New Rule",
+        onAction: () => {
+          const f = $("rule-create-form");
+          if (f) {
+            f.classList.remove("hidden");
+            if ($("rl-name")) $("rl-name").focus();
+          }
+        },
+        compact: true,
+      })
     );
     return;
   }
@@ -919,7 +935,7 @@ function renderRulesList() {
     const toggleBtn = el("button", {
       type: "button",
       class: `btn btn-xs ${r.active ? "btn-win" : "btn-ghost"}`,
-      text: r.active ? "ACTIVE" : "PAUSED",
+      text: r.active ? "Active" : "Paused",
     });
     toggleBtn.addEventListener("click", () =>
       withBusy(toggleBtn, async () => {
@@ -938,7 +954,7 @@ function renderRulesList() {
     const testBtn = el(
       "button",
       { type: "button", class: "btn btn-soft btn-xs" },
-      [makeIcon("eye", "ui-icon-sm"), "2Y Dry-Run"]
+      [makeIcon("eye", "ui-icon-sm"), "Preview Matches"]
     );
     testBtn.addEventListener("click", () => dryRunRule(r, testBtn));
 
@@ -986,16 +1002,16 @@ function renderRulesList() {
           el("strong", { text: r.name }),
           el("span", {
             class: `pill ${r.strict_and ? "pill-blue" : "pill-watch"}`,
-            text: r.strict_and ? "STRICT AND" : "ANY OR",
+            text: r.strict_and ? "Match All" : "Match Any",
           }),
-          r.stop_processing ? el("span", { class: "pill pill-danger", text: "STOP" }) : null,
+          r.stop_processing ? el("span", { class: "pill pill-danger", text: "Stop After Match" }) : null,
         ]),
         el("div", { class: "row-gap wrap" }, [toggleBtn, testBtn, applyBtn, editBtn, delBtn]),
       ]),
       el("div", { class: "chip-row", style: { marginTop: "2px" } }, [
-        el("span", { class: "chip-label", text: "IF:" }),
+        el("span", { class: "chip-label", text: "When:" }),
         ...triggers.map((t) => el("span", { class: "pill pill-soft", text: formatTriggerSummary(t) })),
-        el("span", { class: "chip-label", style: { marginLeft: "6px" }, text: "THEN:" }),
+        el("span", { class: "chip-label", style: { marginLeft: "6px" }, text: "Then:" }),
         ...actions.map((a) => el("span", { class: "pill pill-calm", text: formatActionSummary(a) })),
       ]),
       dndState.editingRuleId === r.id ? buildRuleEditForm(r) : null,
