@@ -337,10 +337,17 @@ export function renderCommandDashboard(dash) {
 
   const mathBox = $("safe-math-breakdown");
   if (mathBox) {
-    mathBox.replaceChildren(
+    const ewaReserved = Number(s.ewa_advance_reserved_cents) || 0;
+    const ewaDetected = Number(s.detected_open_ewa_advance_cents) || 0;
+    const mathLines = [
       mathLine("Liquid cash (checking + savings + cash)", fmtMoney(s.total_liquid_cash_cents)),
       mathLine("- Unpaid bills due before payday", `-${fmtMoney(s.unpaid_bills_until_payday_cents)}`),
       mathLine("- Credit card payoff reserve", `-${fmtMoney(s.credit_card_reserved_cents)}`),
+    ];
+    if (ewaReserved > 0) {
+      mathLines.push(mathLine("- Unsettled cash advances (EWA shield)", `-${fmtMoney(ewaReserved)}`));
+    }
+    mathLines.push(
       mathLine("- Protected Safety & Invest jars", `-${fmtMoney(s.locked_jar_reserves_cents)}`),
       mathLine("- Safety cushion", `-${fmtMoney(s.emergency_buffer_cents)}`),
       mathLine("= Safe to Spend Until Payday", fmtMoney(s.safe_to_spend_cents), true),
@@ -350,6 +357,12 @@ export function renderCommandDashboard(dash) {
         true
       )
     );
+    if (ewaDetected > 0 && ewaReserved === 0) {
+      mathLines.push(
+        mathLine("Note: Unshielded open cash advances", fmtMoney(ewaDetected))
+      );
+    }
+    mathBox.replaceChildren(...mathLines);
   }
 
   animateMoney($("hero-safe-invest"), dash.safe_to_invest_cents || 0, "heroSafeInvest");
@@ -2000,10 +2013,141 @@ function renderLocalAiClis(data) {
         })
       );
 
+      const isAgentCard = ["claude_cli", "opencode_cli", "codex_cli", "agy_cli"].includes(cli.provider_id);
+      const isWrapperActive = Boolean(cli.use_wrapper && cli.wrapper_base_url);
+      const transportPill = isAgentCard
+        ? el("span", {
+            class: `pill ${isWrapperActive ? "pill-blue" : "pill-soft"}`,
+            text: isWrapperActive ? "Wrapper" : "CLI",
+          })
+        : null;
+
+      const cardControls = [];
+      if (isAgentCard) {
+        const useWrapperKey = `${cli.provider_id}_use_wrapper`;
+        const modelKey = `${cli.provider_id}_model`;
+        const hasWrapperUrl = Boolean(cli.wrapper_base_url || (state.settings && state.settings.wrapper_base_url));
+
+        const cliModeBtn = el("button", {
+          type: "button",
+          class: `seg-btn${!cli.use_wrapper ? " active" : ""}`,
+          text: "Direct CLI",
+          "aria-pressed": String(!cli.use_wrapper),
+        });
+        const wrapModeBtn = el("button", {
+          type: "button",
+          class: `seg-btn${cli.use_wrapper ? " active" : ""}`,
+          text: "Wrapper",
+          title: hasWrapperUrl
+            ? `Route ${cli.display_name} via ${cli.wrapper_base_url || state.settings.wrapper_base_url}`
+            : "Configure Custom Local Gateway URL below first (e.g. http://127.0.0.1:8788/v1)",
+          "aria-pressed": String(Boolean(cli.use_wrapper)),
+        });
+
+        const toggleTransport = (enableWrapper, btn) =>
+          withBusy(btn, async () => {
+            if (enableWrapper && !hasWrapperUrl) {
+              toast("Set a Custom Local Gateway URL below first (e.g. http://127.0.0.1:8788/v1).", true);
+              const adv = document.querySelector("#tab-settings .advanced-disclosure");
+              if (adv) adv.open = true;
+              const urlInput = $("set-wrapper-url");
+              if (urlInput) urlInput.focus();
+              return;
+            }
+            try {
+              const updated = await api("/api/v1/settings", {
+                method: "PATCH",
+                body: JSON.stringify({ [useWrapperKey]: Boolean(enableWrapper) }),
+              });
+              state.settings = updated;
+              syncProviderControls(updated.ai_provider, updated.active_provider_resolved);
+              toast(`${cli.display_name}: switched to ${enableWrapper ? "Wrapper" : "Direct CLI"} mode.`);
+              await loadLocalAiClis(false);
+            } catch (err) {
+              toast(err.message || `Could not update ${cli.display_name} transport.`, true);
+            }
+          });
+
+        cliModeBtn.addEventListener("click", () => {
+          if (cli.use_wrapper) toggleTransport(false, cliModeBtn);
+        });
+        wrapModeBtn.addEventListener("click", () => {
+          if (!cli.use_wrapper) toggleTransport(true, wrapModeBtn);
+        });
+
+        const datalistId = `cli-models-${cli.provider_id}`;
+        const modelsList = Array.isArray(cli.available_models) ? cli.available_models : [];
+        const datalist = el(
+          "datalist",
+          { id: datalistId },
+          modelsList
+            .filter((m) => m && typeof m.id === "string" && m.id)
+            .map((m) =>
+              el("option", {
+                value: m.id,
+                text: m.note && m.note !== m.id ? `${m.id} — ${m.note}` : m.id,
+              })
+            )
+        );
+        const modelInput = el("input", {
+          type: "text",
+          class: "cli-model-input",
+          list: datalistId,
+          value: cli.selected_model || "",
+          placeholder: cli.default_model ? `Default (${cli.default_model})` : "Default model",
+          "aria-label": `${cli.display_name} model`,
+        });
+        const saveModelBtn = el("button", {
+          type: "button",
+          class: "btn btn-ghost btn-xs",
+          text: "Save",
+        });
+        const persistModel = () =>
+          withBusy(saveModelBtn, async () => {
+            const val = modelInput.value.trim();
+            try {
+              const updated = await api("/api/v1/settings", {
+                method: "PATCH",
+                body: JSON.stringify({ [modelKey]: val }),
+              });
+              state.settings = updated;
+              toast(
+                val
+                  ? `${cli.display_name} model set to ${val}.`
+                  : `${cli.display_name} reset to default model.`
+              );
+              await loadLocalAiClis(false);
+            } catch (err) {
+              toast(err.message || `Could not save ${cli.display_name} model.`, true);
+            }
+          });
+        saveModelBtn.addEventListener("click", persistModel);
+        modelInput.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter") {
+            ev.preventDefault();
+            persistModel();
+          }
+        });
+
+        cardControls.push(
+          el("div", { class: "cli-card-controls" }, [
+            el(
+              "div",
+              { class: "segmented cli-transport-seg", role: "group", "aria-label": `${cli.display_name} transport` },
+              [cliModeBtn, wrapModeBtn]
+            ),
+            el("div", { class: "cli-model-row" }, [modelInput, datalist, saveModelBtn]),
+          ])
+        );
+      }
+
       return el("div", { class: `local-cli-card${isActive ? " is-active" : ""}` }, [
         el("div", { class: "item-row" }, [
           el("strong", { text: cli.display_name || cli.provider_id }),
-          el("span", { class: `pill ${badgeCls}`, text: badgeLabel }),
+          el("div", { class: "row-gap" }, [
+            ...(transportPill ? [transportPill] : []),
+            el("span", { class: `pill ${badgeCls}`, text: badgeLabel }),
+          ]),
         ]),
         el("div", {
           class: "muted small",
@@ -2011,6 +2155,7 @@ function renderLocalAiClis(data) {
             cli.status_detail ||
             (cli.version ? `Version ${cli.version}` : cli.installed ? "Detected on this device" : "Not detected on PATH"),
         }),
+        ...cardControls,
         el("div", { class: "row-gap wrap" }, [useBtn, testBtn]),
         testOut,
       ]);
@@ -2168,6 +2313,8 @@ export async function loadSettings() {
     setVal("set-payday-cadence", s.payday_cadence_days || 14);
     setVal("set-next-payday", s.next_payday_date || "");
     setVal("set-expected-paycheck", Math.round((s.expected_paycheck_cents ?? 0) / 100));
+    const ewaCb = $("set-reserve-open-ewa");
+    if (ewaCb) ewaCb.checked = s.reserve_open_ewa_advances !== false;
     setVal("set-auto-lock-minutes", s.vault_auto_lock_minutes ?? 30);
 
     await Promise.all([
@@ -2286,9 +2433,15 @@ export function initVaultAndShell() {
       const errEl = $("vault-unlock-error");
       await withBusy(unlockForm.querySelector("button[type=submit]"), async () => {
         try {
+          const remember7d = Boolean(
+            $("vault-unlock-remember-7d") && $("vault-unlock-remember-7d").checked
+          );
           const res = await api("/api/v1/auth/login", {
             method: "POST",
-            body: JSON.stringify({ password: $("vault-unlock-pwd").value }),
+            body: JSON.stringify({
+              password: $("vault-unlock-pwd").value,
+              remember_days: remember7d ? 7 : 0,
+            }),
           });
           $("vault-unlock-pwd").value = "";
           errEl.classList.add("hidden");
@@ -2386,15 +2539,39 @@ export function initVaultAndShell() {
   if (btnSaveAutoLock) {
     btnSaveAutoLock.addEventListener("click", (e) =>
       withBusy(e.currentTarget, async () => {
-        const mins = parseInt($("set-auto-lock-minutes").value, 10) || 30;
+        const parsed = parseInt($("set-auto-lock-minutes").value, 10);
+        const mins = Number.isNaN(parsed) ? 30 : Math.max(0, Math.min(10080, parsed));
         try {
           await api("/api/v1/settings", {
             method: "PATCH",
             body: JSON.stringify({ vault_auto_lock_minutes: mins }),
           });
-          toast(`Auto-lock timeout set to ${mins} minutes.`);
+          toast(
+            mins === 0
+              ? "Idle auto-lock disabled."
+              : `Auto-lock timeout set to ${mins} minutes.`
+          );
         } catch (err) {
           toast(err.message, true);
+        }
+      })
+    );
+  }
+
+  const btnLease7d = $("btn-vault-lease-7d");
+  if (btnLease7d) {
+    btnLease7d.addEventListener("click", (e) =>
+      withBusy(e.currentTarget, async () => {
+        try {
+          const res = await api("/api/v1/auth/lease", {
+            method: "POST",
+            body: JSON.stringify({ days: 7 }),
+          });
+          if (res && res.csrf_token) setCsrfToken(res.csrf_token);
+          if ($("set-auto-lock-minutes")) $("set-auto-lock-minutes").value = "10080";
+          toast("ChronoX will stay unlocked for 7 days on this device (even across restarts).");
+        } catch (err) {
+          toast(err.message || "Could not enable 7-day unlock lease.", true);
         }
       })
     );
@@ -3293,6 +3470,22 @@ export function initVaultAndShell() {
       }
     })
   );
+  bindClick("btn-preset-omc-wrapper", () => {
+    const urlEl = $("set-wrapper-url");
+    const wireEl = $("set-wrapper-wire-api");
+    const modelEl = $("set-wrapper-model");
+    if (urlEl) urlEl.value = "http://127.0.0.1:8788/v1";
+    if (wireEl) wireEl.value = "chat_completions";
+    if (modelEl && !modelEl.value.trim()) modelEl.value = "codex:default";
+    toast("Filled OMC Provider Wrapper preset (http://127.0.0.1:8788/v1). Click Save Gateway to apply.");
+  });
+  bindClick("btn-clear-wrapper-key", (e) =>
+    withBusy(e.currentTarget, async () => {
+      await api("/api/v1/settings", { method: "PATCH", body: JSON.stringify({ clear_wrapper_key: true }) });
+      toast("Cleared Custom Gateway key.");
+      await loadSettings();
+    })
+  );
 
   // --- Budget Preferences & Backup Restore ---
   const profForm = $("profile-settings-form");
@@ -3307,6 +3500,7 @@ export function initVaultAndShell() {
             default_cooling_hours: parseInt($("set-cooling-hours").value, 10) || 48,
             payday_cadence_days: parseInt($("set-payday-cadence").value, 10) || 14,
             expected_paycheck_cents: dollarsToCents($("set-expected-paycheck").value, { allowZero: true }),
+            reserve_open_ewa_advances: Boolean($("set-reserve-open-ewa") ? $("set-reserve-open-ewa").checked : true),
           };
           if ($("set-next-payday").value) body.next_payday_date = $("set-next-payday").value;
           await api("/api/v1/settings", { method: "PATCH", body: JSON.stringify(body) });

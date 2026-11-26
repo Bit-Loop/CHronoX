@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import calendar
 import math
+import re
+from collections import defaultdict
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -33,6 +35,7 @@ from chronox_finance.models import (
     AZEOAction,
     BalanceTransferRequest,
     BalanceTransferResult,
+    BridgeActionStepOut,
     CreditAdvisorAlert,
     CreditDerogatoryOut,
     CreditFactorBreakdown,
@@ -43,7 +46,11 @@ from chronox_finance.models import (
     CreditReportOut,
     DebtKind,
     DebtStrategyResult,
+    DerogatoryResolutionOut,
+    DragUtilizationBridge,
+    EwaAppSummaryOut,
     FiveTwentyFourStatus,
+    UtilizationMilestoneOut,
     utc_now_iso,
 )
 
@@ -660,6 +667,8 @@ class CreditDebtOptimizer:
         credit_reports: Optional[Sequence[Any]] = None,
         credit_inquiries: Optional[Sequence[Any]] = None,
         credit_derogatories: Optional[Sequence[Any]] = None,
+        transactions: Optional[Sequence[Any]] = None,
+        lookback_days: int = 365,
         include_authorized_user: bool = True,
         today: Optional[date] = None,
     ) -> CreditOptimizationReport:
@@ -816,6 +825,15 @@ class CreditDebtOptimizer:
             five_twenty_four=five_twenty_four,
         )
 
+        drag_bridge = analyze_financial_drag_bridge(
+            credit_lines=enriched,
+            transactions=transactions or (),
+            derogatories=norm_derogs,
+            extra_monthly_budget_cents=max(0, int(extra_monthly_budget_cents)),
+            lookback_days=lookback_days,
+            today=ref,
+        )
+
         return CreditOptimizationReport(
             generated_at=utc_now_iso(),
             total_revolving_balance_cents=total_rev_bal,
@@ -841,6 +859,7 @@ class CreditDebtOptimizer:
             alerts=alerts,
             factor_analysis=factor_analysis,
             five_twenty_four=five_twenty_four,
+            drag_bridge=drag_bridge,
             credit_reports=norm_reports,
             credit_inquiries=norm_inquiries,
             credit_derogatories=norm_derogs,
@@ -1473,3 +1492,648 @@ class CreditDebtOptimizer:
             min_amortizing_payment_cents=min_amortizing_cents,
             explanation=expl,
         )
+
+
+# ============================================================================
+# Financial Drag & Utilization Paydown Bridge
+# ============================================================================
+
+_EWA_APP_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
+    ("Dave", re.compile(r"\bdave\b(?!\s*&\s*buster)", re.I)),
+    ("Brigit", re.compile(r"\bbrigit\b", re.I)),
+    ("EarnIn", re.compile(r"\bearnin\b", re.I)),
+    ("Klover", re.compile(r"\bklover\b", re.I)),
+    ("Albert Instant", re.compile(r"\balbert\s+instant\b", re.I)),
+    ("MoneyLion", re.compile(r"\bmoneylion\b", re.I)),
+)
+_BNPL_RE = re.compile(r"\b(afterpay|klarna|affirm|sezzle|zip\s*pay)\b", re.I)
+_INTEREST_RE = re.compile(r"\b(interest\s*charge|finance\s*charge)\b", re.I)
+_CASH_ADV_INT_RE = re.compile(r"(cash\s*adv|protected\s*cash\s*adv)", re.I)
+_CARD_CASH_ADV_RE = re.compile(r"(credit\s*card\s*cash\s*advance|online\s*cash\s*advance)", re.I)
+_FX_FEE_RE = re.compile(r"(intl\s+transaction\s+fee|international\s+transaction\s+fee|foreign\s+transaction\s+fee)", re.I)
+_ATM_FEE_RE = re.compile(r"\batm\s+fee\b", re.I)
+
+_UTIL_MILESTONE_SPEC: Tuple[Tuple[float, str], ...] = (
+    (88.9, "Exit Maxed-Out Band (<88.9%)"),
+    (68.9, "Clear High-Drag Cliff (<68.9%)"),
+    (48.9, "Mid-Utilization Cliff (<48.9%)"),
+    (28.9, "Sub-30% Standard Cliff (<28.9%)"),
+    (8.9, "Peak Low-Utilization Band (<8.9%)"),
+    (1.0, "AZEO Optimal Target (1%–4.9%)"),
+    (0.0, "Full Grace-Period Reset ($0.00)"),
+)
+
+
+def _match_ewa_app(merchant: str) -> Optional[str]:
+    for name, pattern in _EWA_APP_PATTERNS:
+        if pattern.search(merchant):
+            return name
+    return None
+
+
+def detect_open_ewa_advances(
+    transactions: Sequence[Any],
+    *,
+    today: Optional[date] = None,
+    lookback_days: int = 90,
+    open_recency_days: int = 45,
+) -> Tuple[int, Dict[str, int]]:
+    """
+    Detect unsettled open EWA paycheck advances (Dave, Brigit, EarnIn, Klover, etc.)
+    using the trailing-tail matched-cycle rule:
+    - Any inbound advance (`tx_type == "income"`, `amount_cents >= 500`) posted within
+      `open_recency_days` (default 45d) AND strictly after that app's most recent outbound
+      repayment (`last_out_date`) is an open unsettled advance due on an upcoming payday.
+    - Micro-deposit pennies (`< $5.00`) and stale >45d deposits are ignored.
+    """
+    ref = today or date.today()
+    ref_iso = ref.isoformat()
+    start_iso = (ref - timedelta(days=max(open_recency_days, int(lookback_days)) - 1)).isoformat()
+    recency_iso = (ref - timedelta(days=max(1, int(open_recency_days)) - 1)).isoformat()
+
+    events_by_app: Dict[str, List[Tuple[str, str, int]]] = defaultdict(list)
+    for tx in transactions or ():
+        tx_date_str = str(_get_field(tx, "tx_date", "") or "")[:10]
+        if len(tx_date_str) < 10 or not (start_iso <= tx_date_str <= ref_iso):
+            continue
+        amt = max(0, int(_get_field(tx, "amount_cents", 0) or 0))
+        if amt <= 0:
+            continue
+        ttype_raw = _get_field(tx, "tx_type", "expense")
+        ttype = str(ttype_raw.value if hasattr(ttype_raw, "value") else (ttype_raw or "expense")).strip().lower()
+        if ttype not in ("income", "expense"):
+            continue
+        merchant = str(_get_field(tx, "merchant", "") or "").strip()
+        app_name = _match_ewa_app(merchant)
+        if app_name is not None:
+            events_by_app[app_name].append((tx_date_str, ttype, amt))
+
+    per_app: Dict[str, int] = {}
+    for app_name, evs in sorted(events_by_app.items()):
+        outs = [d for d, t, _ in evs if t == "expense"]
+        last_out = max(outs) if outs else ""
+        open_cents = sum(
+            a
+            for d, t, a in evs
+            if t == "income" and a >= 500 and d >= recency_iso and (not last_out or d > last_out)
+        )
+        if open_cents > 0:
+            per_app[app_name] = open_cents
+    return sum(per_app.values()), per_app
+
+
+def _months_to_reach_balance(
+    start_balance_cents: int,
+    target_balance_cents: int,
+    apr_bps: int,
+    monthly_payment_cents: int,
+) -> Optional[int]:
+    """Exact integer-cent amortization until balance <= target_balance_cents (None if non-amortizing)."""
+    bal = max(0, int(start_balance_cents))
+    tgt = max(0, int(target_balance_cents))
+    pmt = max(0, int(monthly_payment_cents))
+    if bal <= tgt:
+        return 0
+    if pmt <= 0:
+        return None
+    rate_m = max(0, int(apr_bps)) / 10000.0 / 12.0
+    for month in range(1, MAX_AMORTIZATION_MONTHS + 1):
+        interest = int(round(bal * rate_m)) if rate_m > 0 else 0
+        if pmt <= interest:
+            return None
+        bal = max(0, bal + interest - pmt)
+        if bal <= tgt:
+            return month
+    return None
+
+
+def _months_between(ref: date, future_iso: str) -> Optional[int]:
+    try:
+        dt = date.fromisoformat(str(future_iso)[:10])
+    except ValueError:
+        return None
+    return max(0, (dt.year - ref.year) * 12 + (dt.month - ref.month))
+
+
+def _match_line_balance_for_lender(lender: str, lines: Sequence[Any]) -> int:
+    tokens = [
+        t
+        for t in re.findall(r"[a-z0-9]+", (lender or "").lower())
+        if len(t) >= 4 and t not in ("orig", "comm", "mgmt", "inc", "llc", "corp", "wireless", "resource")
+    ]
+    if not tokens:
+        return 0
+    for ln in lines:
+        ln_name = str(_get_field(ln, "name", "") or "").lower()
+        if any(tok in ln_name for tok in tokens[:3]):
+            return max(0, int(_get_field(ln, "balance_cents", 0) or 0))
+    return 0
+
+
+def analyze_financial_drag_bridge(
+    *,
+    credit_lines: Sequence[Any],
+    transactions: Sequence[Any] = (),
+    derogatories: Sequence[Any] = (),
+    extra_monthly_budget_cents: int = 25_000,
+    lookback_days: int = 365,
+    today: Optional[date] = None,
+) -> DragUtilizationBridge:
+    """
+    Forensic Financial Drag & Utilization Paydown Bridge.
+
+    Connects ledger-level interest burn, FX/ATM fees, card cash advances, and EWA/BNPL
+    reborrowing churn directly to FICO 8 / 10T / VantageScore 3.0 & 4.0 revolving
+    utilization cliffs and CARD Act (15 U.S.C. § 1666c(b)) payment allocation mechanics.
+    """
+    ref = today or date.today()
+    span_days = max(30, min(730, int(lookback_days)))
+    start_iso = (ref - timedelta(days=span_days - 1)).isoformat()
+    recent90_iso = (ref - timedelta(days=89)).isoformat()
+    ref_iso = ref.isoformat()
+
+    # 1. Forensic Ledger Scan (separating unrecoverable fees/interest from EWA principal churn)
+    card_interest_burn = 0
+    cash_adv_interest = 0
+    cash_adv_int_90d = 0
+    bank_and_fx_fees = 0
+    bank_fx_90d = 0
+    fx_fee_count = 0
+    atm_fee_count = 0
+    bnpl_outflow = 0
+    bnpl_90d = 0
+    recent_card_cash_adv = 0
+    seen_card_adv_legs: set[Tuple[str, int]] = set()
+
+    ewa_events: Dict[str, List[Tuple[str, str, int]]] = defaultdict(list)
+    ewa_monthly_out_90d: Dict[str, int] = defaultdict(int)
+
+    for tx in transactions or ():
+        tx_date_str = str(_get_field(tx, "tx_date", "") or "")[:10]
+        if len(tx_date_str) < 10 or not (start_iso <= tx_date_str <= ref_iso):
+            continue
+        amt = max(0, int(_get_field(tx, "amount_cents", 0) or 0))
+        if amt <= 0:
+            continue
+        ttype = str(_get_field(tx, "tx_type", "expense") or "expense").strip().lower()
+        if hasattr(ttype, "value"):
+            ttype = str(ttype.value)
+        merchant = str(_get_field(tx, "merchant", "") or "").strip()
+        subcat = str(_get_field(tx, "subcategory", "") or "").strip()
+        in_90d = tx_date_str >= recent90_iso
+
+        # Card cash advances (deduplicate paired checking-in / card-transfer legs on same date & amount)
+        if _CARD_CASH_ADV_RE.search(merchant):
+            if in_90d:
+                leg_key = (tx_date_str, amt)
+                if leg_key not in seen_card_adv_legs:
+                    seen_card_adv_legs.add(leg_key)
+                    recent_card_cash_adv += amt
+            continue
+
+        # EWA apps (track BOTH outbound repayments and inbound advances so principal churn is never double-counted)
+        ewa_app = _match_ewa_app(merchant)
+        if ewa_app is not None:
+            if ttype in ("expense", "income"):
+                ewa_events[ewa_app].append((tx_date_str, ttype, amt))
+                if ttype == "expense" and in_90d:
+                    ewa_monthly_out_90d[tx_date_str[:7]] += amt
+            continue
+
+        if ttype != "expense":
+            continue
+
+        if _BNPL_RE.search(merchant):
+            bnpl_outflow += amt
+            if in_90d:
+                bnpl_90d += amt
+            continue
+
+        if _INTEREST_RE.search(merchant):
+            card_interest_burn += amt
+            if _CASH_ADV_INT_RE.search(merchant):
+                cash_adv_interest += amt
+                if in_90d:
+                    cash_adv_int_90d += amt
+            continue
+
+        if _FX_FEE_RE.search(merchant):
+            bank_and_fx_fees += amt
+            fx_fee_count += 1
+            if in_90d:
+                bank_fx_90d += amt
+            continue
+
+        if _ATM_FEE_RE.search(merchant):
+            bank_and_fx_fees += amt
+            atm_fee_count += 1
+            if in_90d:
+                bank_fx_90d += amt
+            continue
+
+        if subcat == "Interest & Bank Fees":
+            bank_and_fx_fees += amt
+            if in_90d:
+                bank_fx_90d += amt
+        elif subcat == "Cash Advances & BNPL":
+            bnpl_outflow += amt
+            if in_90d:
+                bnpl_90d += amt
+
+    # Summarize EWA apps using matched-cycle boundaries ([first_in .. last_out]) so:
+    # - Repayments crossing the left window boundary never inflate fees
+    # - Inbound advances strictly after the last repayment are surfaced penny-exact as open unsettled advances
+    def _matched_ewa_fees_and_open(events: List[Tuple[str, str, int]]) -> Tuple[int, int]:
+        ins = [(d, a) for d, t, a in events if t == "income"]
+        outs = [(d, a) for d, t, a in events if t == "expense"]
+        if not ins:
+            return sum(a for _, a in outs), 0
+        if not outs:
+            return 0, sum(a for _, a in ins if a >= 500)
+        first_in = min(d for d, _ in ins)
+        last_out = max(d for d, _ in outs)
+        trailing_open = sum(a for d, a in ins if d > last_out and a >= 500)
+        settled_in = sum(a for d, a in ins if d <= last_out)
+        settled_out = sum(a for d, a in outs if d >= first_in)
+        matched_fees = max(0, settled_out - settled_in)
+        open_adv = max(trailing_open, max(0, sum(a for _, a in ins) - sum(a for _, a in outs)))
+        return matched_fees, open_adv
+
+    ewa_apps: List[EwaAppSummaryOut] = []
+    ewa_gross_out = 0
+    ewa_gross_in = 0
+    ewa_net_fee = 0
+    ewa_net_fee_90d = 0
+    ewa_open_adv = 0
+    ewa_cycles = 0
+    ewa_active_90d = 0
+    for app_name, evs in sorted(
+        ewa_events.items(),
+        key=lambda kv: (-sum(a for _, t, a in kv[1] if t == "expense"), kv[0]),
+    ):
+        out_c = sum(a for _, t, a in evs if t == "expense")
+        in_c = sum(a for _, t, a in evs if t == "income")
+        cycles = sum(1 for _, t, _ in evs if t == "expense")
+        cycles_90d = sum(1 for d, t, _ in evs if t == "expense" and d >= recent90_iso)
+        last_dt = max((d for d, _, _ in evs), default="")
+        net_f, open_a = _matched_ewa_fees_and_open(evs)
+        evs_90d = [e for e in evs if e[0] >= recent90_iso]
+        net_f_90d, _ = _matched_ewa_fees_and_open(evs_90d)
+
+        ewa_gross_out += out_c
+        ewa_gross_in += in_c
+        ewa_net_fee += net_f
+        ewa_net_fee_90d += net_f_90d
+        ewa_open_adv += open_a
+        ewa_cycles += cycles
+        ewa_active_90d += cycles_90d
+        ewa_apps.append(
+            EwaAppSummaryOut(
+                app_name=app_name,
+                outflow_cents=out_c,
+                inflow_cents=in_c,
+                cycle_count=cycles,
+                net_fee_or_subscription_cents=net_f,
+                estimated_open_advance_cents=open_a,
+                last_activity_date=last_dt,
+            )
+        )
+
+    peak_monthly_ewa_90d = max(ewa_monthly_out_90d.values(), default=0)
+    ewa_exit_buffer = (
+        max(ewa_open_adv, peak_monthly_ewa_90d)
+        if (ewa_active_90d > 0 or ewa_open_adv > 0)
+        else 0
+    )
+
+    # Strictly reclaimable monthly cash flow (NEVER counts recycled EWA principal as free surplus!)
+    reclaimable_monthly_cents = (
+        int(round(bank_fx_90d / 3.0))
+        + int(round(bnpl_90d / 3.0))
+        + int(round(ewa_net_fee_90d / 3.0))
+        + int(round(cash_adv_int_90d / 3.0))
+    )
+    total_recorded_drag = card_interest_burn + bank_and_fx_fees + ewa_gross_out + bnpl_outflow
+
+    # 2. Revolving Portfolio & Exact Utilization Cliff Ladder
+    rev_cards: List[Dict[str, Any]] = []
+    for ln in credit_lines or ():
+        active = bool(_get_field(ln, "active", True))
+        if not active:
+            continue
+        kind_raw = _get_field(ln, "kind", "")
+        kind_str = str(kind_raw.value if hasattr(kind_raw, "value") else kind_raw).lower()
+        if kind_str != DebtKind.CREDIT_CARD.value:
+            continue
+        bal = max(0, int(_get_field(ln, "balance_cents", 0) or 0))
+        lim = max(0, int(_get_field(ln, "credit_limit_cents", 0) or 0))
+        apr = max(0, int(_get_field(ln, "effective_apr_bps", None) or _get_field(ln, "apr_bps", 0) or 0))
+        cfg_min = max(
+            0,
+            int(_get_field(ln, "effective_min_payment_cents", None) or _get_field(ln, "min_payment_cents", 0) or 0),
+        )
+        eff_min = compute_effective_min_payment(bal, cfg_min, DebtKind.CREDIT_CARD, apr)
+        close_day = int(_get_field(ln, "statement_closing_day", 15) or 15)
+        next_close = str(
+            _get_field(ln, "next_statement_close_date", None)
+            or next_occurrence_of_day(close_day, ref).isoformat()
+        )
+        rev_cards.append(
+            {
+                "name": str(_get_field(ln, "name", "Credit Card")),
+                "balance_cents": bal,
+                "limit_cents": lim,
+                "apr_bps": apr,
+                "min_cents": eff_min,
+                "has_grace": bool(_get_field(ln, "has_grace_period", True)),
+                "next_close": next_close,
+                "util_pct": (bal / lim * 100.0) if lim > 0 else 0.0,
+            }
+        )
+
+    rev_bal = sum(c["balance_cents"] for c in rev_cards)
+    rev_lim = sum(c["limit_cents"] for c in rev_cards)
+    curr_util = round((rev_bal / rev_lim) * 100.0, 2) if rev_lim > 0 else 0.0
+    weighted_apr = (
+        int(round(sum(c["balance_cents"] * c["apr_bps"] for c in rev_cards) / rev_bal))
+        if rev_bal > 0
+        else 0
+    )
+    live_monthly_interest = (
+        int(round(sum(c["balance_cents"] * (c["apr_bps"] / 10000.0) / 12.0 for c in rev_cards)))
+        if rev_bal > 0
+        else 0
+    )
+    rev_mins = sum(c["min_cents"] for c in rev_cards)
+    baseline_pmt = rev_mins + max(0, int(extra_monthly_budget_cents)) if rev_bal > 0 else 0
+    accelerated_pmt = baseline_pmt + reclaimable_monthly_cents if rev_bal > 0 else 0
+
+    min_amort_pmt = (
+        live_monthly_interest + max(100, int(math.ceil(rev_bal * 0.01)))
+        if rev_bal > 0 and weighted_apr > 0
+        else (min(rev_bal, 2_500) if rev_bal > 0 else 0)
+    )
+    non_amort_warn = rev_bal > 0 and weighted_apr > 0 and baseline_pmt <= live_monthly_interest
+
+    trailing_interest_detected = cash_adv_interest > 0
+    any_grace_lost = any((not c["has_grace"] and c["balance_cents"] > 0) for c in rev_cards)
+    cash_adv_grace_lost = trailing_interest_detected or recent_card_cash_adv > 0 or any_grace_lost
+
+    primary_card = (
+        max(rev_cards, key=lambda c: (c["util_pct"], c["balance_cents"]))
+        if rev_cards
+        else None
+    )
+    primary_card_name = primary_card["name"] if primary_card else None
+    primary_close_date = primary_card["next_close"] if primary_card else None
+
+    milestones: List[UtilizationMilestoneOut] = []
+    if rev_lim > 0 and rev_bal > 0:
+        for target_pct, tier_label in _UTIL_MILESTONE_SPEC:
+            if target_pct > 0.0 and curr_util <= target_pct:
+                continue
+            target_bal = (rev_lim * int(round(target_pct * 10))) // 1000 if target_pct > 0.0 else 0
+            paydown = max(0, rev_bal - target_bal)
+            if paydown <= 0:
+                continue
+            ann_saved = int(round(paydown * (weighted_apr / 10000.0)))
+            mo_saved = int(round(ann_saved / 12.0))
+            b_mo = _months_to_reach_balance(rev_bal, target_bal, weighted_apr, baseline_pmt)
+            a_mo = _months_to_reach_balance(rev_bal, target_bal, weighted_apr, accelerated_pmt)
+            b_dt = _add_months_date(ref, b_mo).isoformat() if b_mo is not None else None
+            a_dt = _add_months_date(ref, a_mo).isoformat() if a_mo is not None else None
+            m_saved = (b_mo - a_mo) if (b_mo is not None and a_mo is not None and b_mo > a_mo) else 0
+
+            if target_pct == 0.0:
+                tip = (
+                    "Clears all revolving principal and residual trailing interest to restore the 25-day purchase grace period."
+                )
+            elif primary_close_date:
+                tip = (
+                    f"Post paydown 3 days before {primary_close_date} statement close so bureaus record "
+                    f"<= {target_pct:.1f}% utilization and downward 24-month FICO 10T / VantageScore 4.0 trended balance."
+                )
+            else:
+                tip = f"Target <= {target_pct:.1f}% before statement closing date."
+
+            milestones.append(
+                UtilizationMilestoneOut(
+                    target_util_pct=target_pct,
+                    tier_label=tier_label,
+                    target_balance_cents=target_bal,
+                    paydown_needed_cents=paydown,
+                    monthly_interest_saved_cents=mo_saved,
+                    annual_interest_saved_cents=ann_saved,
+                    baseline_months=b_mo,
+                    baseline_target_date=b_dt,
+                    accelerated_months=a_mo,
+                    accelerated_target_date=a_dt,
+                    months_saved=m_saved,
+                    statement_close_tip=tip,
+                )
+            )
+
+    # 3. Derogatory & Collection Model-Specific Guidance (FICO 8 vs. FICO 9/10T & VantageScore 3.0/4.0)
+    derog_guidance: List[DerogatoryResolutionOut] = []
+    for dg in derogatories or ():
+        if not bool(_get_field(dg, "active", True)):
+            continue
+        dkind = str(_get_field(dg, "kind", "other") or "other").lower()
+        dlender = str(_get_field(dg, "lender", "") or "Reported Account").strip()
+        ddrops = str(_get_field(dg, "drops_off", "") or "")[:10]
+        m_left = _months_between(ref, ddrops) if ddrops else None
+        bal_match = _match_line_balance_for_lender(dlender, credit_lines)
+
+        if dkind == "collection":
+            fico8_r = (
+                "FICO 8 counts both unpaid and paid non-medical collections >= $100; only written Pay-for-Delete "
+                "or 7-year FCRA removal clears FICO 8 impact."
+            )
+            fico9_r = (
+                "FICO 9 / 10T and VantageScore 3.0 / 4.0 completely exclude paid or settled collections once reported at $0."
+            )
+            move = (
+                f"Request written Pay-for-Delete before paying ${bal_match / 100:,.2f} to {dlender} (maximizes FICO 8 while "
+                f"$0 status automatically clears FICO 9/10T and VantageScore)."
+                if bal_match > 0
+                else f"Negotiate written Pay-for-Delete with {dlender} before settling."
+            )
+        elif dkind in ("late_30", "late_60", "late_90"):
+            fico8_r = (
+                "Active past-due tradelines risk escalating into third-party collections and recurring 30/60/90-day delinquency marks."
+            )
+            fico9_r = (
+                "Both FICO 9/10T and VantageScore 3.0/4.0 weigh recent delinquencies heavily; bringing the account current stops compounding recency damage."
+            )
+            move = (
+                f"Clear the ${bal_match / 100:,.2f} past-due balance on {dlender} first to stop third-party collection referral, then request goodwill adjustment."
+                if bal_match > 0
+                else f"Bring {dlender} current immediately to prevent collection escalation."
+            )
+        elif dkind == "bankruptcy_ch7":
+            fico8_r = (
+                f"Chapter 7 remains on FICO 8 reports for 10 years (statutory FCRA removal {ddrops or 'in 10y'}). "
+                f"Revolving utilization (30% weight) is your primary controllable lever right now."
+            )
+            fico9_r = (
+                "FICO 10T and VantageScore 4.0 reward 24-month downward revolving balance trajectories even while older public records age out."
+            )
+            move = (
+                f"Wait out the remaining {m_left} months to {ddrops} statutory removal while keeping zero new late marks and driving revolving utilization under 8.9%."
+                if m_left is not None and ddrops
+                else "Keep all open tradelines on autopay while driving revolving utilization under 8.9%."
+            )
+        else:
+            fico8_r = "Remains reported up to 7 years under FCRA; verify Date of First Delinquency (DOFD) accuracy."
+            fico9_r = "Paid/settled status reduces lender manual-underwriting friction across newer scoring models."
+            move = f"Verify DOFD and balance accuracy for {dlender}."
+
+        derog_guidance.append(
+            DerogatoryResolutionOut(
+                kind=dkind,
+                lender=dlender,
+                balance_cents=bal_match,
+                drops_off=ddrops,
+                months_until_drop_off=m_left,
+                fico8_rule=fico8_r,
+                fico9_vantage_rule=fico9_r,
+                recommended_move=move,
+            )
+        )
+
+    # 4. Sequenced Action Playbook (strictly driven by real ledger & credit metrics)
+    steps: List[BridgeActionStepOut] = []
+    step_idx = 1
+
+    if cash_adv_grace_lost or ewa_active_90d > 0 or ewa_open_adv > 0:
+        parts: List[str] = []
+        if trailing_interest_detected or recent_card_cash_adv > 0:
+            parts.append(
+                f"Stop credit-card cash advances immediately (${recent_card_cash_adv / 100:,.2f} in 90d; "
+                f"${cash_adv_interest / 100:,.2f} cash-advance interest recorded). Cash advances accrue daily interest "
+                f"with zero grace period; under 15 U.S.C. § 1666c(b), payments above the minimum clear the highest-APR "
+                f"balance first, and paying to $0 restores the 25-day purchase grace period."
+            )
+        if ewa_active_90d > 0 or ewa_open_adv > 0:
+            open_txt = (
+                f" Account for ~${ewa_open_adv / 100:,.2f} in estimated unsettled EWA advance debits before your next payday."
+                if ewa_open_adv > 0
+                else ""
+            )
+            buf_txt = (
+                f" Build a one-time ${ewa_exit_buffer / 100:,.2f} checking cushion to break the "
+                f"{ewa_cycles}-cycle EWA reborrowing loop permanently."
+                if ewa_exit_buffer > 0
+                else ""
+            )
+            parts.append(f"Active EWA advance cycling detected ({ewa_active_90d} outflows in 90d).{open_txt}{buf_txt}")
+        steps.append(
+            BridgeActionStepOut(
+                step_number=step_idx,
+                priority="critical",
+                title="Stop Cash-Advance Trailing Interest & Exit EWA Reborrowing",
+                detail=" ".join(parts),
+                dollar_impact_label=(
+                    f"${ewa_exit_buffer / 100:,.2f} exit cushion"
+                    if ewa_exit_buffer > 0
+                    else f"${live_monthly_interest / 100:,.2f}/mo interest burn"
+                ),
+            )
+        )
+        step_idx += 1
+
+    if milestones:
+        first_m = milestones[0]
+        card_label = primary_card_name or "revolving cards"
+        close_txt = f" (3 days before {primary_close_date} statement close)" if primary_close_date else ""
+        curr_util_disp = f"{curr_util:.2f}%" if 99.9 < curr_util < 100.0 else f"{curr_util:.1f}%"
+        steps.append(
+            BridgeActionStepOut(
+                step_number=step_idx,
+                priority="high",
+                title=f"Clear First Utilization Cliff: {curr_util_disp} → <{first_m.target_util_pct:.1f}%",
+                detail=(
+                    f"Pay ${first_m.paydown_needed_cents / 100:,.2f} toward {card_label}{close_txt} to drop balance to "
+                    f"${first_m.target_balance_cents / 100:,.2f}. Cuts ${first_m.annual_interest_saved_cents / 100:,.2f}/yr "
+                    f"in revolving interest immediately and begins a downward 24-month FICO 10T / VantageScore 4.0 trend."
+                ),
+                dollar_impact_label=f"-${first_m.monthly_interest_saved_cents / 100:,.2f}/mo interest",
+            )
+        )
+        step_idx += 1
+
+    if fx_fee_count > 0 or atm_fee_count > 0:
+        fx_txt = (
+            f"{fx_fee_count} foreign transaction fee hits detected on debit/checking swipes. "
+            f"Once a $0-FTF credit card regains its 25-day grace period, routing overseas purchases through it eliminates 1% FX fees."
+            if fx_fee_count > 0
+            else ""
+        )
+        atm_txt = f" {atm_fee_count} out-of-network ATM fees recorded." if atm_fee_count > 0 else ""
+        steps.append(
+            BridgeActionStepOut(
+                step_number=step_idx,
+                priority="medium",
+                title="Plug Recurring Foreign Transaction & ATM Fee Leaks",
+                detail=f"Recorded ${bank_and_fx_fees / 100:,.2f} in avoidable bank/FX/ATM fees.{(' ' + fx_txt) if fx_txt else ''}{atm_txt}".strip(),
+                dollar_impact_label=f"${bank_and_fx_fees / 100:,.2f} recorded fees",
+            )
+        )
+        step_idx += 1
+
+    actionable_derogs = [d for d in derog_guidance if d.kind in ("late_30", "late_60", "late_90", "collection")]
+    if actionable_derogs:
+        total_derog_bal = sum(d.balance_cents for d in actionable_derogs)
+        names = ", ".join(d.lender for d in actionable_derogs[:2])
+        steps.append(
+            BridgeActionStepOut(
+                step_number=step_idx,
+                priority="strategic",
+                title="Resolve Past-Due & Collection Tradelines Strategically",
+                detail=(
+                    f"Clear active past-due balances before third-party collection escalation, and request written "
+                    f"Pay-for-Delete on collections ({names}) so both FICO 8 and FICO 9/10T / VantageScore reflect clean status."
+                ),
+                dollar_impact_label=(
+                    f"${total_derog_bal / 100:,.2f} total open" if total_derog_bal > 0 else "Model-specific cleanup"
+                ),
+            )
+        )
+
+    return DragUtilizationBridge(
+        lookback_days=span_days,
+        card_interest_burn_cents=card_interest_burn,
+        cash_advance_interest_cents=cash_adv_interest,
+        recent_card_cash_advance_cents=recent_card_cash_adv,
+        cash_advance_grace_period_lost=cash_adv_grace_lost,
+        trailing_interest_detected=trailing_interest_detected,
+        bank_and_fx_fee_cents=bank_and_fx_fees,
+        fx_fee_count=fx_fee_count,
+        atm_fee_count=atm_fee_count,
+        ewa_gross_outflow_cents=ewa_gross_out,
+        ewa_gross_inflow_cents=ewa_gross_in,
+        ewa_net_fee_bleed_cents=ewa_net_fee,
+        ewa_estimated_open_advance_cents=ewa_open_adv,
+        ewa_cycle_count=ewa_cycles,
+        ewa_active_90d_cycles=ewa_active_90d,
+        ewa_exit_buffer_target_cents=ewa_exit_buffer,
+        bnpl_outflow_cents=bnpl_outflow,
+        total_recorded_drag_cents=total_recorded_drag,
+        reclaimable_monthly_cents=reclaimable_monthly_cents,
+        revolving_balance_cents=rev_bal,
+        revolving_limit_cents=rev_lim,
+        current_utilization_pct=curr_util,
+        weighted_revolving_apr_bps=weighted_apr,
+        live_monthly_revolving_interest_cents=live_monthly_interest,
+        baseline_monthly_payment_cents=baseline_pmt,
+        accelerated_monthly_payment_cents=accelerated_pmt,
+        min_amortizing_revolving_payment_cents=min_amort_pmt,
+        non_amortizing_warning=non_amort_warn,
+        primary_target_card_name=primary_card_name,
+        primary_target_close_date=primary_close_date,
+        ewa_apps=ewa_apps,
+        utilization_milestones=milestones,
+        derogatory_guidance=derog_guidance,
+        ordered_action_steps=steps,
+    )
+

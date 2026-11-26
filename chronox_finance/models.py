@@ -241,6 +241,7 @@ class VaultStatus(BaseModel):
     authenticated: bool = False
     onboarding_completed: bool = False
     auto_lock_minutes: int = 30
+    lease_expires_at: Optional[int] = None
     csrf_token: Optional[str] = None
     recovery_configured: bool = False
     db_encrypted_at_rest: bool = False
@@ -261,6 +262,11 @@ class VaultSetupResponse(BaseModel):
 
 class VaultUnlockRequest(BaseModel):
     password: str = Field(..., min_length=1, max_length=128)
+    remember_days: int = Field(0, ge=0, le=7)
+
+
+class VaultLeaseRequest(BaseModel):
+    days: int = Field(7, ge=1, le=7)
 
 
 class VaultRecoverRequest(BaseModel):
@@ -459,6 +465,16 @@ class TransactionOut(BaseModel):
     comment_count: int = 0
 
 
+class ReclassifyTransactionsRequest(BaseModel):
+    preserve_learned: bool = True
+
+
+class ReclassifyTransactionsOut(BaseModel):
+    reclassified_count: int
+    total_scanned: int
+    by_category: Dict[str, int] = Field(default_factory=dict)
+
+
 class RecurringBillCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     amount_cents: int = Field(..., gt=0, le=100_000_000_00)
@@ -563,6 +579,9 @@ class SafeToSpendBreakdown(BaseModel):
     locked_jar_reserves_cents: int
     emergency_buffer_cents: int
     credit_card_reserved_cents: int
+    ewa_advance_reserved_cents: int = 0
+    detected_open_ewa_advance_cents: int = 0
+    reserve_open_ewa_advances: bool = True
     safe_to_spend_cents: int
     days_until_payday: int
     daily_safe_to_spend_cents: int
@@ -674,6 +693,13 @@ class AISettingsOut(BaseModel):
     wrapper_key_masked: str = ""
     codex_cli_enabled: bool = False
     codex_cli_model: str = ""
+    claude_cli_model: str = ""
+    opencode_cli_model: str = ""
+    agy_cli_model: str = ""
+    claude_cli_use_wrapper: bool = False
+    opencode_cli_use_wrapper: bool = False
+    codex_cli_use_wrapper: bool = False
+    agy_cli_use_wrapper: bool = False
     local_cli_auto_detect: bool = True
     requests_used_today: int = 0
     quota_remaining_today: int = 60
@@ -703,6 +729,13 @@ class AISettingsUpdate(BaseModel):
     clear_wrapper_key: bool = False
     codex_cli_enabled: Optional[bool] = None
     codex_cli_model: Optional[str] = None
+    claude_cli_model: Optional[str] = None
+    opencode_cli_model: Optional[str] = None
+    agy_cli_model: Optional[str] = None
+    claude_cli_use_wrapper: Optional[bool] = None
+    opencode_cli_use_wrapper: Optional[bool] = None
+    codex_cli_use_wrapper: Optional[bool] = None
+    agy_cli_use_wrapper: Optional[bool] = None
     local_cli_auto_detect: Optional[bool] = None
 
 
@@ -716,6 +749,13 @@ class LocalCLIInfo(BaseModel):
     status_detail: str = ""
     is_active: bool = False
     default_model: str = ""
+    selected_model: str = ""
+    use_wrapper: bool = False
+    transport: Literal["cli", "wrapper"] = "cli"
+    wrapper_ready: bool = False
+    wrapper_base_url: str = ""
+    wrapper_provider_prefix: str = ""
+    available_models: List[Dict[str, str]] = Field(default_factory=list)
     in_cooldown: bool = False
 
 
@@ -822,8 +862,9 @@ class ProfileSettings(BaseModel):
     expected_paycheck_cents: int = Field(0, ge=0, le=50_000_000)
     calm_mode: bool = True
     auto_rebalance_enabled: bool = True
+    reserve_open_ewa_advances: bool = True
     onboarding_completed: bool = False
-    vault_auto_lock_minutes: int = Field(30, ge=0, le=1440)
+    vault_auto_lock_minutes: int = Field(30, ge=0, le=10080)
     email_scanner_enabled: bool = False
     intelligence_mode: IntelligenceMode = IntelligenceMode.HYBRID
     ai_provider: AIProvider = AIProvider.AUTO
@@ -852,6 +893,13 @@ class ProfileSettings(BaseModel):
     wrapper_key_masked: str = ""
     codex_cli_enabled: bool = False
     codex_cli_model: str = ""
+    claude_cli_model: str = ""
+    opencode_cli_model: str = ""
+    agy_cli_model: str = ""
+    claude_cli_use_wrapper: bool = False
+    opencode_cli_use_wrapper: bool = False
+    codex_cli_use_wrapper: bool = False
+    agy_cli_use_wrapper: bool = False
     local_cli_auto_detect: bool = True
     auth_enabled: bool = False
 
@@ -866,8 +914,9 @@ class ProfileSettingsUpdate(BaseModel):
     expected_paycheck_cents: Optional[int] = Field(None, ge=0, le=50_000_000)
     calm_mode: Optional[bool] = None
     auto_rebalance_enabled: Optional[bool] = None
+    reserve_open_ewa_advances: Optional[bool] = None
     onboarding_completed: Optional[bool] = None
-    vault_auto_lock_minutes: Optional[int] = Field(None, ge=0, le=1440)
+    vault_auto_lock_minutes: Optional[int] = Field(None, ge=0, le=10080)
     email_scanner_enabled: Optional[bool] = None
     intelligence_mode: Optional[IntelligenceMode] = None
     ai_provider: Optional[AIProvider] = None
@@ -892,6 +941,13 @@ class ProfileSettingsUpdate(BaseModel):
     clear_wrapper_key: bool = False
     codex_cli_enabled: Optional[bool] = None
     codex_cli_model: Optional[str] = None
+    claude_cli_model: Optional[str] = None
+    opencode_cli_model: Optional[str] = None
+    agy_cli_model: Optional[str] = None
+    claude_cli_use_wrapper: Optional[bool] = None
+    opencode_cli_use_wrapper: Optional[bool] = None
+    codex_cli_use_wrapper: Optional[bool] = None
+    agy_cli_use_wrapper: Optional[bool] = None
     local_cli_auto_detect: Optional[bool] = None
 
 
@@ -1430,6 +1486,91 @@ class CreditAdvisorAlert(BaseModel):
     credit_line_id: Optional[int] = None
 
 
+class UtilizationMilestoneOut(BaseModel):
+    target_util_pct: float
+    tier_label: str
+    target_balance_cents: int
+    paydown_needed_cents: int
+    monthly_interest_saved_cents: int
+    annual_interest_saved_cents: int
+    baseline_months: Optional[int] = None
+    baseline_target_date: Optional[str] = None
+    accelerated_months: Optional[int] = None
+    accelerated_target_date: Optional[str] = None
+    months_saved: int = 0
+    statement_close_tip: str = ""
+
+
+class EwaAppSummaryOut(BaseModel):
+    app_name: str
+    outflow_cents: int
+    inflow_cents: int
+    cycle_count: int
+    net_fee_or_subscription_cents: int
+    estimated_open_advance_cents: int
+    last_activity_date: str = ""
+
+
+class DerogatoryResolutionOut(BaseModel):
+    kind: str
+    lender: str
+    balance_cents: int = 0
+    drops_off: str = ""
+    months_until_drop_off: Optional[int] = None
+    fico8_rule: str
+    fico9_vantage_rule: str
+    recommended_move: str
+
+
+class BridgeActionStepOut(BaseModel):
+    step_number: int
+    priority: Literal["critical", "high", "medium", "strategic"]
+    title: str
+    detail: str
+    dollar_impact_label: str = ""
+
+
+class DragUtilizationBridge(BaseModel):
+    lookback_days: int = 365
+    card_interest_burn_cents: int = 0
+    cash_advance_interest_cents: int = 0
+    recent_card_cash_advance_cents: int = 0
+    cash_advance_grace_period_lost: bool = False
+    trailing_interest_detected: bool = False
+    bank_and_fx_fee_cents: int = 0
+    fx_fee_count: int = 0
+    atm_fee_count: int = 0
+    ewa_gross_outflow_cents: int = 0
+    ewa_gross_inflow_cents: int = 0
+    ewa_net_fee_bleed_cents: int = 0
+    ewa_estimated_open_advance_cents: int = 0
+    ewa_cycle_count: int = 0
+    ewa_active_90d_cycles: int = 0
+    ewa_exit_buffer_target_cents: int = 0
+    bnpl_outflow_cents: int = 0
+    total_recorded_drag_cents: int = 0
+    reclaimable_monthly_cents: int = 0
+    revolving_balance_cents: int = 0
+    revolving_limit_cents: int = 0
+    current_utilization_pct: float = 0.0
+    weighted_revolving_apr_bps: int = 0
+    live_monthly_revolving_interest_cents: int = 0
+    baseline_monthly_payment_cents: int = 0
+    accelerated_monthly_payment_cents: int = 0
+    min_amortizing_revolving_payment_cents: int = 0
+    non_amortizing_warning: bool = False
+    primary_target_card_name: Optional[str] = None
+    primary_target_close_date: Optional[str] = None
+    ewa_apps: List[EwaAppSummaryOut] = Field(default_factory=list)
+    utilization_milestones: List[UtilizationMilestoneOut] = Field(default_factory=list)
+    derogatory_guidance: List[DerogatoryResolutionOut] = Field(default_factory=list)
+    ordered_action_steps: List[BridgeActionStepOut] = Field(default_factory=list)
+    methodology_note: str = (
+        "Exact integer-cent amortization across empirical FICO 8 / 10T / VantageScore 3.0 & 4.0 utilization "
+        "thresholds and CARD Act (15 U.S.C. § 1666c(b)) payment allocation — no estimated score-delta claims."
+    )
+
+
 class CreditOptimizationReport(BaseModel):
     generated_at: str
     total_revolving_balance_cents: int
@@ -1455,6 +1596,7 @@ class CreditOptimizationReport(BaseModel):
     alerts: List[CreditAdvisorAlert]
     factor_analysis: Optional[CreditFactorBreakdown] = None
     five_twenty_four: Optional[FiveTwentyFourStatus] = None
+    drag_bridge: Optional[DragUtilizationBridge] = None
     credit_reports: List[CreditReportOut] = Field(default_factory=list)
     credit_inquiries: List[CreditInquiryOut] = Field(default_factory=list)
     credit_derogatories: List[CreditDerogatoryOut] = Field(default_factory=list)
@@ -1764,19 +1906,56 @@ class NetWorthPoint(BaseModel):
     net_worth_cents: int
 
 
+class CategoryMerchantItem(BaseModel):
+    merchant: str
+    normalized_merchant: str = ""
+    amount_cents: int
+    tx_count: int = 1
+
+
+class CategoryTxItem(BaseModel):
+    id: int
+    tx_date: str
+    merchant: str
+    normalized_merchant: str = ""
+    amount_cents: int
+    jar_id: Optional[int] = None
+    jar_name: str = ""
+    subcategory: str = ""
+    memo: str = ""
+
+
+class CategoryBreakdownItem(BaseModel):
+    label: str
+    jar_slug: str = ""
+    jar_name: str = ""
+    amount_cents: int
+    tx_count: int = 0
+    avg_monthly_cents: int = 0
+    pct_of_expenses: float = 0.0
+    pct_of_income: float = 0.0
+    color: str = "#64748b"
+    is_financial_drag: bool = False
+    top_merchants: List[CategoryMerchantItem] = Field(default_factory=list)
+    sample_transactions: List[CategoryTxItem] = Field(default_factory=list)
+
+
 class AnalyticsOverview(BaseModel):
     period: str
     start_date: str
     end_date: str
+    group_by: str = "jar"
     total_income_cents: int
     total_expense_cents: int
     net_surplus_cents: int
+    financial_drag_cents: int = 0
     savings_rate_pct: float
     avg_monthly_surplus_cents: int
     top_5_expenses: List[TopExpenseItem] = Field(default_factory=list)
     sankey_nodes: List[SankeyNode] = Field(default_factory=list)
     sankey_links: List[SankeyLink] = Field(default_factory=list)
     expense_distribution: List[TopExpenseItem] = Field(default_factory=list)
+    category_breakdown: List[CategoryBreakdownItem] = Field(default_factory=list)
     monthly_trends: List[MonthlyTrendPoint] = Field(default_factory=list)
     net_worth_series: List[NetWorthPoint] = Field(default_factory=list)
 

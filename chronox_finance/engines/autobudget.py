@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+from chronox_finance.engines.credit_debt import detect_open_ewa_advances
 from chronox_finance.engines.recurring import (
     DetectedPayday,
     detect_payday_schedule,
@@ -626,6 +627,9 @@ class AutoBudgetEngine:
 
         # 7. Real-time Safe-to-Spend Firewall Calculation
         emergency_buffer_cents = int(settings.get("emergency_buffer_cents", 50_000))
+        reserve_open_ewa = bool(settings.get("reserve_open_ewa_advances", 1))
+        detected_open_ewa_cents, _open_ewa_by_app = detect_open_ewa_advances(transactions, today=ref)
+        ewa_advance_reserved_cents = detected_open_ewa_cents if reserve_open_ewa else 0
 
         locked_jar_reserves_cents = sum(
             max(0, js.available_cents)
@@ -644,6 +648,7 @@ class AutoBudgetEngine:
             - locked_jar_reserves_cents
             - emergency_buffer_cents
             - credit_card_reserved_cents
+            - ewa_advance_reserved_cents
         )
         safe_to_spend_cents = max(0, raw_safe_to_spend)
         daily_safe_to_spend_cents = safe_to_spend_cents // days_until_payday
@@ -654,6 +659,9 @@ class AutoBudgetEngine:
             locked_jar_reserves_cents=locked_jar_reserves_cents,
             emergency_buffer_cents=emergency_buffer_cents,
             credit_card_reserved_cents=credit_card_reserved_cents,
+            ewa_advance_reserved_cents=ewa_advance_reserved_cents,
+            detected_open_ewa_advance_cents=detected_open_ewa_cents,
+            reserve_open_ewa_advances=reserve_open_ewa,
             safe_to_spend_cents=safe_to_spend_cents,
             days_until_payday=days_until_payday,
             daily_safe_to_spend_cents=daily_safe_to_spend_cents,
@@ -670,12 +678,14 @@ class AutoBudgetEngine:
             - unpaid_bills_until_payday_cents
             - emergency_buffer_cents
             - credit_card_reserved_cents
+            - ewa_advance_reserved_cents
             - locked_non_invest_reserves_cents
         )
         deployable_checking_headroom = (
             checking_and_cash_cents
             - unpaid_bills_until_payday_cents
             - credit_card_reserved_cents
+            - ewa_advance_reserved_cents
         )
         investable_cash_ceiling = min(cash_after_essentials_and_safety, deployable_checking_headroom)
         invest_jar = next((js for js in jar_states if js.kind == JarKind.INVEST), None)

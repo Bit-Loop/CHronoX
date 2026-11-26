@@ -850,9 +850,10 @@ function renderCreditReport(rep) {
   // 3. Chase 5/24 Velocity + Inquiries + Derogatories
   renderVelocityAndDropOffs(rep);
 
-  // 4. Alerts, AZEO, Debt Payoff Strategies, Credit Lines
+  // 4. Alerts, AZEO, Drag-to-Utilization Paydown Bridge, Debt Payoff Strategies, Credit Lines
   renderCreditAlerts(rep.alerts || []);
   renderAzeoCalendar(rep.azeo_plan || []);
+  renderDragUtilizationBridge(rep.drag_bridge || null);
   renderDebtStrategies(rep.strategies || []);
   renderCreditLines(rep.credit_lines || []);
 }
@@ -1108,12 +1109,15 @@ function renderPdfReviewBox(bundle) {
   portState.pendingPdfBundle = bundle;
   box.classList.remove("hidden");
 
-  const reports = Array.isArray(bundle.reports) ? bundle.reports : [];
+  const reports = (Array.isArray(bundle.reports) ? bundle.reports : []).filter(
+    (r) => r && r.score != null && Number(r.score) >= 300 && Number(r.score) <= 850
+  );
+  const tradelines = Array.isArray(bundle.tradelines) ? bundle.tradelines : [];
   const inquiries = Array.isArray(bundle.inquiries) ? bundle.inquiries : [];
   const derogatories = Array.isArray(bundle.derogatories) ? bundle.derogatories : [];
   const warnings = Array.isArray(bundle.warnings) ? bundle.warnings : [];
 
-  const checkRefs = { reports: [], inquiries: [], derogatories: [] };
+  const checkRefs = { reports: [], tradelines: [], inquiries: [], derogatories: [] };
 
   const confirmBtn = el(
     "button",
@@ -1141,6 +1145,26 @@ function renderPdfReviewBox(bundle) {
               score: Number(item.data.score),
               pulled_date: item.data.pulled_date || isoDateOffset(0),
               source: "annualcreditreport_pdf_reviewed",
+            }),
+          });
+          savedCount += 1;
+        }
+        for (const item of checkRefs.tradelines) {
+          if (!item.cb.checked) continue;
+          await api("/api/v1/credit/lines", {
+            method: "POST",
+            body: JSON.stringify({
+              name: String(item.data.name || "Credit Account").slice(0, 80),
+              issuer: String(item.data.issuer || item.data.name || "").slice(0, 60),
+              kind: item.data.kind || "credit_card",
+              balance_cents: Math.max(0, Number(item.data.balance_cents || 0)),
+              credit_limit_cents: Math.max(0, Number(item.data.credit_limit_cents || 0)),
+              apr_bps: Math.max(0, Number(item.data.apr_bps || 0)),
+              min_payment_cents: Math.max(0, Number(item.data.min_payment_cents || 0)),
+              statement_closing_day: Math.min(31, Math.max(1, Number(item.data.statement_closing_day || 15))),
+              payment_due_day: Math.min(31, Math.max(1, Number(item.data.payment_due_day || 10))),
+              opened_date: item.data.opened_date || null,
+              is_authorized_user: Boolean(item.data.is_authorized_user),
             }),
           });
           savedCount += 1;
@@ -1207,6 +1231,20 @@ function renderPdfReviewBox(bundle) {
       sectionNodes.push(makeRow("reports", r, `${String(r.bureau).toUpperCase()} ${r.model}: ${r.score} (${r.pulled_date})`))
     );
   }
+  if (tradelines.length) {
+    sectionNodes.push(el("h4", { text: `Extracted Accounts & Tradelines (${tradelines.length})` }));
+    tradelines.forEach((t) =>
+      sectionNodes.push(
+        makeRow(
+          "tradelines",
+          t,
+          `${t.name} (${t.kind}) · Bal ${fmtMoney(t.balance_cents || 0)}${
+            t.credit_limit_cents ? ` / Limit ${fmtMoney(t.credit_limit_cents)}` : ""
+          }`
+        )
+      )
+    );
+  }
   if (inquiries.length) {
     sectionNodes.push(el("h4", { text: `Extracted Hard Inquiries (${inquiries.length})` }));
     inquiries.forEach((i) =>
@@ -1219,7 +1257,7 @@ function renderPdfReviewBox(bundle) {
       sectionNodes.push(makeRow("derogatories", d, `${d.kind} · ${d.lender || "Account"} · opened ${d.opened_date}`))
     );
   }
-  if (!reports.length && !inquiries.length && !derogatories.length) {
+  if (!reports.length && !tradelines.length && !inquiries.length && !derogatories.length) {
     sectionNodes.push(
       el("p", {
         class: "small muted",
@@ -1328,6 +1366,284 @@ function renderAzeoCalendar(azeoPlan) {
       ]);
     })
   );
+}
+
+function renderDragUtilizationBridge(bridge) {
+  const wrap = $("credit-drag-bridge-wrap");
+  const statusPill = $("credit-drag-bridge-status");
+  if (!wrap) return;
+
+  if (!bridge) {
+    if (statusPill) {
+      statusPill.textContent = "NO DATA YET";
+      statusPill.className = "pill pill-soft";
+    }
+    wrap.replaceChildren(
+      el("p", {
+        class: "small muted",
+        text: "Add credit cards or sync transactions to compute your Financial Drag & Utilization Paydown Bridge.",
+      })
+    );
+    return;
+  }
+
+  const utilPct = Number(bridge.current_utilization_pct || 0);
+  const revBal = Number(bridge.revolving_balance_cents || 0);
+  const interestBurn = Number(bridge.card_interest_burn_cents || 0);
+  const liveMoInt = Number(bridge.live_monthly_revolving_interest_cents || 0);
+  const bankFees = Number(bridge.bank_and_fx_fee_cents || 0);
+  const ewaOut = Number(bridge.ewa_gross_outflow_cents || 0);
+  const ewaIn = Number(bridge.ewa_gross_inflow_cents || 0);
+  const ewaOpen = Number(bridge.ewa_estimated_open_advance_cents || 0);
+  const ewaBuf = Number(bridge.ewa_exit_buffer_target_cents || 0);
+  const reclaimMo = Number(bridge.reclaimable_monthly_cents || 0);
+  const basePmt = Number(bridge.baseline_monthly_payment_cents || 0);
+  const accelPmt = Number(bridge.accelerated_monthly_payment_cents || 0);
+
+  if (statusPill) {
+    if (bridge.cash_advance_grace_period_lost || utilPct >= 88.9) {
+      statusPill.textContent = bridge.trailing_interest_detected
+        ? "GRACE PERIOD LOST · MAXED CLIFF"
+        : `${utilPct.toFixed(1)}% UTILIZATION`;
+      statusPill.className = "pill pill-danger";
+    } else if (utilPct >= 28.9 || Number(bridge.ewa_active_90d_cycles || 0) > 0) {
+      statusPill.textContent = `${utilPct.toFixed(1)}% UTILIZATION`;
+      statusPill.className = "pill pill-watch";
+    } else {
+      statusPill.textContent = revBal > 0 ? `${utilPct.toFixed(1)}% LOW DRAG` : "ZERO REVOLVING DRAG";
+      statusPill.className = "pill pill-calm";
+    }
+  }
+
+  // 1. 4-Tile Forensic Drag Strip
+  const tile1 = el("div", { class: "drag-bridge-tile" }, [
+    el("span", { class: "eyebrow", text: `CARD INTEREST (${bridge.lookback_days || 365}D)` }),
+    el("strong", {
+      class: "tabular-nums",
+      style: { fontSize: "1.18rem", color: interestBurn > 0 || liveMoInt > 0 ? "var(--crimson)" : "var(--primary)" },
+      text: fmtMoney(interestBurn),
+    }),
+    el("div", {
+      class: "small muted tabular-nums",
+      text: `Live burn: ${fmtMoney(liveMoInt)}/mo (${(Number(bridge.weighted_revolving_apr_bps || 0) / 100).toFixed(2)}% APR)`,
+    }),
+    bridge.cash_advance_grace_period_lost
+      ? el("span", {
+          class: "pill pill-danger",
+          text: bridge.trailing_interest_detected ? "Cash-Adv Trailing Interest Active" : "Grace Period Suspended",
+        })
+      : null,
+  ]);
+
+  const ewaShieldActive = Boolean(
+    state.dashboard &&
+      state.dashboard.safe_to_spend &&
+      state.dashboard.safe_to_spend.reserve_open_ewa_advances !== false
+  );
+  const tile2 = el("div", { class: "drag-bridge-tile" }, [
+    el("span", { class: "eyebrow", text: "EWA REBORROWING CHURN" }),
+    el("strong", {
+      class: "tabular-nums",
+      style: { fontSize: "1.18rem", color: ewaOut > 0 ? "var(--amber)" : "var(--primary)" },
+      text: fmtMoney(ewaOut),
+    }),
+    el("div", {
+      class: "small muted tabular-nums",
+      text: `${Number(bridge.ewa_cycle_count || 0)} outflows · ${fmtMoney(ewaIn)} inflows${
+        ewaOpen > 0 ? ` · ~${fmtMoney(ewaOpen)} open` : ""
+      }`,
+    }),
+    el("div", { class: "row-gap wrap", style: { gap: "6px" } }, [
+      ewaBuf > 0
+        ? el("span", { class: "pill pill-watch", text: `Exit Cushion: ${fmtMoney(ewaBuf)}` })
+        : null,
+      ewaOpen > 0 && ewaShieldActive
+        ? el("span", { class: "pill pill-calm", text: "Shielded in Safe-to-Spend" })
+        : null,
+    ]),
+  ]);
+
+  const tile3 = el("div", { class: "drag-bridge-tile" }, [
+    el("span", { class: "eyebrow", text: "FX & ATM FEE LEAKS" }),
+    el("strong", {
+      class: "tabular-nums",
+      style: { fontSize: "1.18rem", color: bankFees > 0 ? "var(--amber)" : "var(--primary)" },
+      text: fmtMoney(bankFees),
+    }),
+    el("div", {
+      class: "small muted tabular-nums",
+      text: `${Number(bridge.fx_fee_count || 0)} FX fees · ${Number(bridge.atm_fee_count || 0)} ATM fees`,
+    }),
+  ]);
+
+  const tile4 = el("div", { class: "drag-bridge-tile" }, [
+    el("span", { class: "eyebrow", text: "PAYDOWN FUNDING" }),
+    el("strong", {
+      class: "tabular-nums",
+      style: { fontSize: "1.18rem", color: "var(--cyan)" },
+      text: `${fmtMoney(accelPmt)}/mo`,
+    }),
+    el("div", {
+      class: "small muted tabular-nums",
+      text: `Base ${fmtMoney(basePmt)} + ${fmtMoney(reclaimMo)}/mo reclaimed fees`,
+    }),
+  ]);
+
+  const kpiGrid = el("div", { class: "drag-bridge-kpi-grid" }, [tile1, tile2, tile3, tile4]);
+
+  const sections = [kpiGrid];
+
+  if (bridge.non_amortizing_warning) {
+    sections.push(
+      el("div", { class: "notice-bar notice-warn" }, [
+        makeIcon("alert", "ui-icon-sm"),
+        el("span", {
+          text: `Payment warning: ${fmtMoney(basePmt)}/mo does not exceed monthly revolving interest (${fmtMoney(liveMoInt)}/mo). Raise payments to at least ${fmtMoney(bridge.min_amortizing_revolving_payment_cents || 0)}/mo to reduce principal.`,
+        }),
+      ])
+    );
+  }
+
+  // 2. Revolving Utilization Cliff Paydown Ladder
+  const milestones = Array.isArray(bridge.utilization_milestones) ? bridge.utilization_milestones : [];
+  if (milestones.length) {
+    const ladderRows = milestones.map((m) => {
+      const baseStr =
+        m.baseline_months != null
+          ? `${m.baseline_months} mo (${m.baseline_target_date || "--"})`
+          : "Non-amortizing";
+      const accelStr =
+        m.accelerated_months != null
+          ? `${m.accelerated_months} mo (${m.accelerated_target_date || "--"})`
+          : "Non-amortizing";
+      const savedBadge =
+        Number(m.months_saved || 0) > 0
+          ? el("span", { class: "pill pill-calm", text: `-${m.months_saved} mo faster` })
+          : null;
+      const pctBadgeCls =
+        m.target_util_pct <= 8.9
+          ? "pill-calm"
+          : m.target_util_pct <= 28.9
+          ? "pill-blue"
+          : m.target_util_pct <= 48.9
+          ? "pill-watch"
+          : "pill-danger";
+
+      return el("div", { class: "drag-bridge-milestone" }, [
+        el("div", { class: "item-row wrap", style: { gap: "8px" } }, [
+          el("div", { class: "row-gap wrap", style: { gap: "8px" } }, [
+            el("span", {
+              class: `pill ${pctBadgeCls} tabular-nums`,
+              text: m.target_util_pct === 0 ? "$0 RESET" : `<= ${Number(m.target_util_pct).toFixed(1)}%`,
+            }),
+            el("strong", { text: m.tier_label }),
+          ]),
+          el("div", { class: "row-gap wrap tabular-nums", style: { gap: "8px" } }, [
+            savedBadge,
+            el("strong", { text: `Pay ${fmtMoney(m.paydown_needed_cents)}` }),
+          ]),
+        ]),
+        el("div", { class: "item-row wrap small muted tabular-nums", style: { gap: "8px" } }, [
+          el("span", {
+            text: `Target bal <= ${fmtMoney(m.target_balance_cents)} · Saves ${fmtMoney(m.monthly_interest_saved_cents)}/mo (${fmtMoney(m.annual_interest_saved_cents)}/yr)`,
+          }),
+          el("span", {
+            text:
+              accelPmt > basePmt
+                ? `Base: ${baseStr} → Drag-Redirected: ${accelStr}`
+                : `Timeline: ${baseStr}`,
+          }),
+        ]),
+        m.statement_close_tip
+          ? el("div", { class: "small muted", text: m.statement_close_tip })
+          : null,
+      ]);
+    });
+
+    sections.push(
+      el("div", { class: "stack-xs" }, [
+        el("div", { class: "item-row wrap" }, [
+          el("h3", { style: { margin: "4px 0" }, text: "Utilization Cliff Paydown Ladder" }),
+          bridge.primary_target_card_name
+            ? el("span", {
+                class: "small muted tabular-nums",
+                text: `Primary target: ${bridge.primary_target_card_name} · Next close ${bridge.primary_target_close_date || "--"}`,
+              })
+            : null,
+        ]),
+        ...ladderRows,
+      ])
+    );
+  }
+
+  // 3. Sequenced Action Steps + Scoring-Model Derogatory Matrix
+  const steps = Array.isArray(bridge.ordered_action_steps) ? bridge.ordered_action_steps : [];
+  const derogs = Array.isArray(bridge.derogatory_guidance) ? bridge.derogatory_guidance : [];
+  const lowerCols = [];
+
+  if (steps.length) {
+    const prioCls = {
+      critical: "pill-danger",
+      high: "pill-watch",
+      medium: "pill-blue",
+      strategic: "pill-soft",
+    };
+    lowerCols.push(
+      el("div", { class: "stack-xs" }, [
+        el("h3", { style: { margin: "4px 0" }, text: "Sequenced Drag-Escape Playbook" }),
+        ...steps.map((s) =>
+          el("div", { class: "item-box" }, [
+            el("div", { class: "item-row wrap", style: { gap: "6px" } }, [
+              el("div", { class: "row-gap wrap", style: { gap: "6px" } }, [
+                el("span", { class: `pill ${prioCls[s.priority] || "pill-soft"}`, text: `STEP ${s.step_number}` }),
+                el("strong", { text: s.title }),
+              ]),
+              s.dollar_impact_label
+                ? el("span", { class: "small tabular-nums muted", text: s.dollar_impact_label })
+                : null,
+            ]),
+            el("div", { class: "small muted", text: s.detail }),
+          ])
+        ),
+      ])
+    );
+  }
+
+  if (derogs.length) {
+    lowerCols.push(
+      el("div", { class: "stack-xs" }, [
+        el("h3", { style: { margin: "4px 0" }, text: "Collection & Derogatory Model Matrix" }),
+        ...derogs.map((d) =>
+          el("div", { class: "item-box" }, [
+            el("div", { class: "item-row wrap", style: { gap: "6px" } }, [
+              el("strong", { text: d.lender }),
+              el("span", {
+                class: "pill pill-soft tabular-nums",
+                text: `${String(d.kind || "").replace(/_/g, " ").toUpperCase()}${
+                  d.balance_cents > 0 ? ` · ${fmtMoney(d.balance_cents)}` : ""
+                }${d.drops_off ? ` · Drops ${d.drops_off}` : ""}`,
+              }),
+            ]),
+            el("div", { class: "small", text: `FICO 8: ${d.fico8_rule}` }),
+            el("div", { class: "small", text: `FICO 9/10T & VantageScore: ${d.fico9_vantage_rule}` }),
+            el("div", { class: "micro-step", text: d.recommended_move }),
+          ])
+        ),
+      ])
+    );
+  }
+
+  if (lowerCols.length === 2) {
+    sections.push(el("div", { class: "two-col" }, lowerCols));
+  } else if (lowerCols.length === 1) {
+    sections.push(lowerCols[0]);
+  }
+
+  if (bridge.methodology_note) {
+    sections.push(el("p", { class: "muted small", style: { marginTop: "4px" }, text: bridge.methodology_note }));
+  }
+
+  wrap.replaceChildren(...sections);
 }
 
 function renderDebtStrategies(strategies) {

@@ -27,12 +27,42 @@ import {
 } from "./core.js";
 
 const EXPENSE_PALETTE = [
-  "#4f46e5", // Indigo
+  "#b45309", // Burnt Amber
+  "#2563eb", // Royal Blue
   "#7c3aed", // Violet
+  "#dc2626", // Crimson
   "#db2777", // Rose-Magenta
-  "#ea580c", // Burnt Orange
-  "#ca8a04", // Ochre
-  "#475569", // Slate (Others)
+  "#c2410c", // Rust Orange
+  "#4f46e5", // Indigo
+  "#a16207", // Ochre
+  "#9333ea", // Vivid Purple
+  "#e11d48", // Rose Red
+  "#0284c7", // Sky Cobalt
+  "#d97706", // Warm Gold
+];
+const CANONICAL_CATEGORIES = [
+  "Auto & Loan Payments",
+  "Housing & Utilities",
+  "Phone & Internet",
+  "Insurance",
+  "Cash Advances & BNPL",
+  "Interest & Bank Fees",
+  "Storage & Subscriptions",
+  "Software, AI & Services",
+  "Groceries & Superstores",
+  "Gas, Auto & Transit",
+  "Medical & Pharmacy",
+  "Personal, Home & Travel",
+  "Dining & Restaurants",
+  "Fast Food & Coffee",
+  "Bars, Alcohol & Smoke",
+  "Convenience & Snacks",
+  "Clothing & Apparel",
+  "Entertainment & Gaming",
+  "Shopping & Retail",
+  "Savings & Buffer",
+  "Investing & Trading",
+  "Uncategorized",
 ];
 const COLOR_INCOME = "var(--chart-inc-stroke)";
 const COLOR_SAVINGS = "var(--chart-sur-stroke)";
@@ -45,6 +75,7 @@ const TEXT_DEFICIT = "var(--chart-def-text)";
 
 const chartState = {
   period: "1y",
+  groupBy: "category",
   month: null,
   data: null,
   loading: false,
@@ -52,6 +83,7 @@ const chartState = {
   hiddenSeries: new Set(),
   trendScrubIdx: null,
   donutHoveredIdx: null,
+  selectedCategoryLabel: null,
 };
 
 function truncateLabel(text, maxChars = 22) {
@@ -93,6 +125,25 @@ function syncPeriodUI() {
       btn.setAttribute("aria-pressed", String(active));
     });
   }
+  const groupSwitcher = $("analytics-groupby-switcher");
+  if (groupSwitcher) {
+    groupSwitcher.querySelectorAll("[data-analytics-groupby]").forEach((btn) => {
+      const active = btn.dataset.analyticsGroupby === chartState.groupBy;
+      btn.classList.toggle("active", active);
+      btn.setAttribute("aria-pressed", String(active));
+    });
+  }
+  const donutHeading = $("analytics-donut-heading");
+  const breakdownTitle = $("analytics-breakdown-title");
+  const modeLabel =
+    chartState.groupBy === "merchant"
+      ? "Merchant"
+      : chartState.groupBy === "jar"
+      ? "Envelope"
+      : "Category";
+  if (donutHeading) donutHeading.textContent = `Spending by ${modeLabel}`;
+  if (breakdownTitle) breakdownTitle.textContent = `Spending Breakdown by ${modeLabel}`;
+
   const chip = $("analytics-month-chip");
   const clearBtn = $("btn-analytics-clear-month");
   if (chip) {
@@ -114,6 +165,10 @@ export async function loadAnalyticsOverview(opts = {}) {
     chartState.period = opts.period;
     if (!opts.keepMonth) chartState.month = null;
   }
+  if (opts.groupBy) {
+    chartState.groupBy = opts.groupBy;
+    chartState.selectedCategoryLabel = null;
+  }
   if ("month" in opts) {
     chartState.month = opts.month || null;
   }
@@ -124,6 +179,7 @@ export async function loadAnalyticsOverview(opts = {}) {
   try {
     const queryPeriod = chartState.month || chartState.period || "1y";
     const params = new URLSearchParams({ period: queryPeriod });
+    params.set("group_by", chartState.groupBy || "category");
     if (chartState.month) {
       params.set("month", chartState.month);
     }
@@ -164,6 +220,23 @@ function renderAnalyticsOverview(data) {
   renderCashflowSankey(data);
   renderExpenseDonut(data);
   renderTrendChart(data);
+  renderCategoryBreakdown(data);
+}
+
+function selectBreakdownCategory(label, { scroll = false } = {}) {
+  if (!label || !chartState.data) return;
+  const breakdown = Array.isArray(chartState.data.category_breakdown)
+    ? chartState.data.category_breakdown
+    : [];
+  const exact = breakdown.find((it) => it.label === label);
+  if (!exact) return;
+  chartState.selectedCategoryLabel =
+    chartState.selectedCategoryLabel === label ? null : label;
+  renderCategoryBreakdown(chartState.data);
+  if (scroll && chartState.selectedCategoryLabel) {
+    const card = $("analytics-breakdown-card");
+    if (card) card.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "nearest" });
+  }
 }
 
 /* ============================================================================
@@ -245,6 +318,7 @@ function renderKpiStrip(data) {
     ? `Selected month (${fmtMonthShort(chartState.month)})`
     : `${data.start_date || "--"} to ${data.end_date || "--"}`;
 
+  const dragCents = Number(data.financial_drag_cents || 0);
   const card2 = el("article", { class: "card stat-tile", style: { borderTopColor: hasNoActivity ? "var(--border-strong)" : surplusColor } }, [
     el("div", { class: "item-row" }, [
       el("span", { class: "eyebrow", text: "AVG MONTHLY SURPLUS" }),
@@ -259,7 +333,13 @@ function renderKpiStrip(data) {
       el("span", { style: { color: "var(--primary)" }, text: `IN ${fmtMoneyCompact(totalIncome)}` }),
       el("span", { style: { color: "var(--amber)" }, text: `OUT ${fmtMoneyCompact(totalExpense)}` }),
     ]),
-    el("div", { class: "muted small", text: periodCaption }),
+    dragCents > 0
+      ? el("div", {
+          class: "small tabular-nums",
+          style: { color: "var(--crimson)", fontWeight: "600" },
+          text: `Financial Drag (Interest + Advances): ${fmtMoney(dragCents)}`,
+        })
+      : el("div", { class: "muted small", text: periodCaption }),
   ]);
 
   // Card 3: Top 5 Expenses with crisp inline proportional bars
@@ -270,38 +350,48 @@ function renderKpiStrip(data) {
         const pctExp = Number(item.pct_of_expenses || 0);
         const barPct = Math.max(2, Math.min(100, (amt / maxExp) * 100));
         const barColor = item.color || EXPENSE_PALETTE[idx % EXPENSE_PALETTE.length];
-        return el("div", { class: "stack-xs", style: { gap: "3px" } }, [
-          el("div", { class: "item-row small", style: { gap: "6px" } }, [
-            el("span", { class: "row-gap", style: { gap: "6px", minWidth: "0" } }, [
+        const rowNode = el(
+          "div",
+          {
+            class: "stack-xs",
+            style: { gap: "3px", cursor: "pointer" },
+            title: `Click to inspect ${item.label}`,
+          },
+          [
+            el("div", { class: "item-row small", style: { gap: "6px" } }, [
+              el("span", { class: "row-gap", style: { gap: "6px", minWidth: "0" } }, [
+                el("span", {
+                  class: "tabular-nums muted",
+                  style: { fontSize: "0.7rem", fontWeight: "700" },
+                  text: `0${idx + 1}`,
+                }),
+                el("span", {
+                  style: {
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    fontWeight: "600",
+                  },
+                  title: item.label,
+                  text: truncateLabel(item.label, 20),
+                }),
+              ]),
               el("span", {
-                class: "tabular-nums muted",
-                style: { fontSize: "0.7rem", fontWeight: "700" },
-                text: `0${idx + 1}`,
-              }),
-              el("span", {
-                style: {
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                  fontWeight: "600",
-                },
-                title: item.label,
-                text: truncateLabel(item.label, 20),
+                class: "tabular-nums",
+                style: { fontWeight: "700", whiteSpace: "nowrap" },
+                text: `${fmtMoney(amt)} (${pctExp.toFixed(0)}%)`,
               }),
             ]),
-            el("span", {
-              class: "tabular-nums",
-              style: { fontWeight: "700", whiteSpace: "nowrap" },
-              text: `${fmtMoney(amt)} (${pctExp.toFixed(0)}%)`,
-            }),
-          ]),
-          el("div", { class: "progress-track", style: { height: "4px" } }, [
-            el("div", {
-              class: "progress-fill",
-              style: { width: `${barPct.toFixed(1)}%`, backgroundColor: barColor },
-            }),
-          ]),
-        ]);
+            el("div", { class: "progress-track", style: { height: "4px" } }, [
+              el("div", {
+                class: "progress-fill",
+                style: { width: `${barPct.toFixed(1)}%`, backgroundColor: barColor },
+              }),
+            ]),
+          ]
+        );
+        rowNode.addEventListener("click", () => selectBreakdownCategory(item.label, { scroll: true }));
+        return rowNode;
       })
     : [
         el("p", {
@@ -793,6 +883,10 @@ function renderCashflowSankey(data) {
     p.addEventListener("focus", () => isolateLink(p));
     p.addEventListener("pointerleave", resetIsolation);
     p.addEventListener("blur", resetIsolation);
+    p.addEventListener("click", () => {
+      const tgt = nodeMap.get(p._sankeyMeta.target);
+      if (tgt && tgt.col === 2) selectBreakdownCategory(tgt.label, { scroll: true });
+    });
   }
 
   for (const [id, r] of nodeElMap.entries()) {
@@ -800,6 +894,10 @@ function renderCashflowSankey(data) {
     r.addEventListener("focus", () => isolateNode(id));
     r.addEventListener("pointerleave", resetIsolation);
     r.addEventListener("blur", resetIsolation);
+    r.addEventListener("click", () => {
+      const n = nodeMap.get(id);
+      if (n && n.col === 2) selectBreakdownCategory(n.label, { scroll: true });
+    });
   }
 
   const svg = svgEl(
@@ -1010,6 +1108,7 @@ function renderExpenseDonut(data) {
     path.addEventListener("focus", () => highlightIdx(idx));
     path.addEventListener("pointerleave", () => highlightIdx(null));
     path.addEventListener("blur", () => highlightIdx(null));
+    path.addEventListener("click", () => selectBreakdownCategory(it.label, { scroll: true }));
 
     segPaths.push({ path, startDeg, endDeg: Math.max(startDeg + 0.8, endDeg), idx });
 
@@ -1040,6 +1139,7 @@ function renderExpenseDonut(data) {
     legRow.addEventListener("focus", () => highlightIdx(idx));
     legRow.addEventListener("pointerleave", () => highlightIdx(null));
     legRow.addEventListener("blur", () => highlightIdx(null));
+    legRow.addEventListener("click", () => selectBreakdownCategory(it.label, { scroll: true }));
     legendNodes.push(legRow);
   });
 
@@ -1497,10 +1597,245 @@ function renderTrendChart(data) {
 }
 
 /* ============================================================================
+   5. Full Category / Merchant Breakdown + Inline 1-Click Recategorization
+   ============================================================================ */
+
+function getAvailableJarsForDrilldown() {
+  const dashJars =
+    state.dashboard && Array.isArray(state.dashboard.jars) && state.dashboard.jars.length
+      ? state.dashboard.jars
+      : null;
+  if (dashJars) return dashJars;
+  return [
+    { id: 1, slug: "bills", name: "Bills & Essentials" },
+    { id: 2, slug: "daily", name: "Daily Living" },
+    { id: 3, slug: "fun", name: "Dining & Lifestyle" },
+    { id: 4, slug: "safety", name: "Safety & Future" },
+    { id: 5, slug: "invest", name: "ChronoX Invest Vault" },
+  ];
+}
+
+function renderCategoryBreakdown(data) {
+  const host = $("analytics-breakdown-body");
+  const countBadge = $("analytics-breakdown-count");
+  const dragBadge = $("analytics-drag-badge");
+  const bridgeBtn = $("btn-analytics-open-bridge");
+  if (!host) return;
+
+  const items = Array.isArray(data.category_breakdown) ? data.category_breakdown : [];
+  const dragCents = Number(data.financial_drag_cents || 0);
+
+  if (dragBadge) {
+    if (dragCents > 0) {
+      dragBadge.textContent = `Financial Drag: ${fmtMoney(dragCents)}`;
+      dragBadge.classList.remove("hidden");
+    } else {
+      dragBadge.classList.add("hidden");
+    }
+  }
+  if (bridgeBtn) {
+    bridgeBtn.classList.toggle("hidden", dragCents <= 0);
+  }
+
+  const unitWord =
+    chartState.groupBy === "merchant"
+      ? items.length === 1 ? "MERCHANT" : "MERCHANTS"
+      : chartState.groupBy === "jar"
+      ? items.length === 1 ? "ENVELOPE" : "ENVELOPES"
+      : items.length === 1 ? "CATEGORY" : "CATEGORIES";
+  if (countBadge) {
+    countBadge.textContent = `${items.length} ${unitWord}`;
+  }
+
+  if (!items.length) {
+    host.replaceChildren(
+      el("p", {
+        class: "muted small",
+        text: "No expenses recorded in this period yet.",
+      })
+    );
+    return;
+  }
+
+  const jars = getAvailableJarsForDrilldown();
+  const maxAmt = items.reduce((m, it) => Math.max(m, Number(it.amount_cents || 0)), 1);
+
+  const rows = items.map((item, idx) => {
+    const amt = Number(item.amount_cents || 0);
+    const pctExp = Number(item.pct_of_expenses || 0);
+    const avgMo = Number(item.avg_monthly_cents || 0);
+    const txCount = Number(item.tx_count || 0);
+    const barPct = Math.max(1.5, Math.min(100, (amt / maxAmt) * 100));
+    const color = item.color || EXPENSE_PALETTE[idx % EXPENSE_PALETTE.length];
+    const isExpanded = chartState.selectedCategoryLabel === item.label;
+
+    const topMerchants = Array.isArray(item.top_merchants) ? item.top_merchants.slice(0, 5) : [];
+    const merchChips = topMerchants.map((m) =>
+      el("span", {
+        class: "cat-merch-chip tabular-nums",
+        title: `${m.merchant}: ${fmtMoney(m.amount_cents)} (${m.tx_count} tx)`,
+        text: `${truncateLabel(m.merchant, 22)} · ${fmtMoneyCompact(m.amount_cents)}`,
+      })
+    );
+
+    const summaryBtn = el(
+      "button",
+      {
+        type: "button",
+        class: "cat-breakdown-summary",
+        "aria-expanded": String(isExpanded),
+      },
+      [
+        el("div", { class: "cat-breakdown-top" }, [
+          el("div", { class: "row-gap wrap", style: { gap: "8px", minWidth: "0" } }, [
+            el("span", { class: "legend-swatch", style: { backgroundColor: color } }),
+            el("strong", { style: { fontSize: "0.92rem" }, text: item.label }),
+            item.jar_name && chartState.groupBy !== "jar"
+              ? el("span", { class: "pill pill-soft", text: item.jar_name })
+              : null,
+            item.is_financial_drag
+              ? el("span", { class: "pill pill-danger", text: "FINANCIAL DRAG" })
+              : null,
+          ]),
+          el("div", { class: "row-gap wrap tabular-nums", style: { gap: "10px" } }, [
+            el("span", {
+              class: "muted small",
+              text: `${fmtMoneyCompact(avgMo)}/mo · ${txCount} tx`,
+            }),
+            el("strong", {
+              style: { fontSize: "0.95rem" },
+              text: `${fmtMoney(amt)} (${pctExp.toFixed(1)}%)`,
+            }),
+          ]),
+        ]),
+        el("div", { class: "progress-track", style: { height: "5px" } }, [
+          el("div", {
+            class: "progress-fill",
+            style: { width: `${barPct.toFixed(1)}%`, backgroundColor: color },
+          }),
+        ]),
+        merchChips.length && chartState.groupBy !== "merchant"
+          ? el("div", { class: "cat-breakdown-merchants" }, merchChips)
+          : null,
+      ]
+    );
+
+    summaryBtn.addEventListener("click", () => {
+      chartState.selectedCategoryLabel = isExpanded ? null : item.label;
+      renderCategoryBreakdown(data);
+    });
+
+    const children = [summaryBtn];
+
+    if (isExpanded) {
+      const sampleTxs = Array.isArray(item.sample_transactions) ? item.sample_transactions : [];
+      const txRows = sampleTxs.length
+        ? sampleTxs.map((tx) => {
+            const jarSelect = el(
+              "select",
+              { "aria-label": `Envelope for ${tx.merchant}` },
+              jars.map((j) =>
+                el("option", {
+                  value: String(j.id),
+                  selected: Number(j.id) === Number(tx.jar_id) ? "selected" : null,
+                  text: j.name,
+                })
+              )
+            );
+            const catOptions = CANONICAL_CATEGORIES.includes(tx.subcategory)
+              ? CANONICAL_CATEGORIES
+              : [tx.subcategory || "Uncategorized", ...CANONICAL_CATEGORIES];
+            const catSelect = el(
+              "select",
+              { "aria-label": `Category for ${tx.merchant}` },
+              catOptions.map((catName) =>
+                el("option", {
+                  value: catName,
+                  selected: catName === (tx.subcategory || "Uncategorized") ? "selected" : null,
+                  text: catName,
+                })
+              )
+            );
+            const saveBtn = el(
+              "button",
+              { type: "button", class: "btn btn-soft btn-xs", text: "Save Rule" }
+            );
+            saveBtn.addEventListener("click", (ev) =>
+              withBusy(ev.currentTarget, async () => {
+                const nextJarId = Number(jarSelect.value);
+                const nextCat = String(catSelect.value || "").trim();
+                await api(`/api/v1/transactions/${tx.id}`, {
+                  method: "PATCH",
+                  body: {
+                    jar_id: nextJarId,
+                    subcategory: nextCat,
+                    learn_merchant_rule: true,
+                  },
+                });
+                toast(`Saved rule for ${tx.merchant} -> ${nextCat}`);
+                await loadAnalyticsOverview();
+              })
+            );
+
+            return el("div", { class: "cat-drilldown-row" }, [
+              el("div", { class: "stack-xs", style: { gap: "2px", minWidth: "0" } }, [
+                el("div", { class: "row-gap wrap", style: { gap: "8px" } }, [
+                  el("span", { class: "tabular-nums muted small", text: tx.tx_date }),
+                  el("strong", { style: { fontSize: "0.84rem" }, text: tx.merchant }),
+                  el("span", {
+                    class: "tabular-nums",
+                    style: { fontWeight: "700", fontSize: "0.84rem" },
+                    text: fmtMoney(tx.amount_cents),
+                  }),
+                ]),
+                tx.memo
+                  ? el("span", { class: "muted small", text: truncateLabel(tx.memo, 60) })
+                  : null,
+              ]),
+              tx.id > 0
+                ? el("div", { class: "cat-drilldown-controls" }, [jarSelect, catSelect, saveBtn])
+                : null,
+            ]);
+          })
+        : [el("p", { class: "muted small", text: "No individual transactions available." })];
+
+      children.push(
+        el("div", { class: "cat-drilldown-panel" }, [
+          el("div", { class: "item-row small muted" }, [
+            el("span", {
+              text: `Showing ${sampleTxs.length} recent transaction${sampleTxs.length === 1 ? "" : "s"} in ${item.label}`,
+            }),
+            el("span", { text: "Saving a rule remembers that merchant automatically" }),
+          ]),
+          ...txRows,
+        ])
+      );
+    }
+
+    return el(
+      "div",
+      { class: `cat-breakdown-item${isExpanded ? " active" : ""}` },
+      children
+    );
+  });
+
+  host.replaceChildren(...rows);
+}
+
+/* ============================================================================
    Module Bootstrap
    ============================================================================ */
 
 export function initCharts() {
+  const groupSwitcher = $("analytics-groupby-switcher");
+  if (groupSwitcher) {
+    groupSwitcher.addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-analytics-groupby]");
+      if (!btn) return;
+      loadAnalyticsOverview({ groupBy: btn.dataset.analyticsGroupby });
+    });
+  }
+
   const periodSwitcher = $("analytics-period-switcher");
   if (periodSwitcher) {
     periodSwitcher.addEventListener("click", (e) => {
@@ -1514,6 +1849,41 @@ export function initCharts() {
   if (clearMonthBtn) {
     clearMonthBtn.addEventListener("click", () => {
       loadAnalyticsOverview({ month: null });
+    });
+  }
+
+  const reclassifyBtn = $("btn-analytics-reclassify");
+  if (reclassifyBtn) {
+    reclassifyBtn.addEventListener("click", (e) =>
+      withBusy(e.currentTarget, async () => {
+        const res = await api("/api/v1/transactions/reclassify", {
+          method: "POST",
+          body: { preserve_learned: true },
+        });
+        const count = Number((res && res.reclassified_count) || 0);
+        toast(
+          count > 0
+            ? `Reclassified ${count} transaction${count === 1 ? "" : "s"} into clean categories.`
+            : "All transactions already match the clean category taxonomy."
+        );
+        await loadAnalyticsOverview();
+      })
+    );
+  }
+
+  const openBridgeBtn = $("btn-analytics-open-bridge");
+  if (openBridgeBtn) {
+    openBridgeBtn.addEventListener("click", () => {
+      switchTab("credit");
+      requestAnimationFrame(() => {
+        const card = $("credit-drag-bridge-card");
+        if (card) {
+          card.scrollIntoView({
+            behavior: prefersReducedMotion() ? "auto" : "smooth",
+            block: "start",
+          });
+        }
+      });
     });
   }
 

@@ -619,3 +619,284 @@ def test_credit_api_fastapi_e2e_vault_lifecycle_idempotency_and_zero_secret_leak
         assert client.delete(f"/api/v1/credit/apis/{sw_conn_id}", headers=headers2).status_code == 404
     finally:
         svc.close()
+
+
+def test_experian_and_credit_karma_portal_text_importer_and_local_bridge(tmp_path):
+    from chronox_finance.connectors.credit_providers import OfficialCreditReportImporter
+    from scripts.credit_bridge_server import CreditBridgeStore
+
+    importer = OfficialCreditReportImporter()
+
+    experian_print_text = """
+    Experian credit report
+    JORDAN A TAYLOR
+    As of Nov 26, 2026
+    FICO SCORE 8
+    As of today
+    645
+    Fair
+    300 579 669 739 799 850
+    Credit cards or credit lines
+    Total balance: $4,850
+    Credit used: $4,850 Credit limit: $5,000
+    Balance $4,850
+    Balance updated Nov 11, 2026
+    SAMPLE FEDERAL CR UNION
+    Auto loans or leases
+    Balance $11,200
+    Balance updated Nov 22, 2026
+    APEX AUTO FINANCE
+    Student loans
+    Balance $2,400
+    Balance updated Oct 31, 2026
+    NORTHERN SERVICING INC/D
+    Balance $2,650
+    Balance updated Oct 31, 2026
+    NORTHERN SERVICING INC/D
+    Other accounts
+    Balance $140
+    Balance updated Nov 02, 2026
+    METRO WIRELESS POTENTIALLY NEGATIVE
+    1 collection
+    Original creditor CABLE BROADBAND CO
+    Balance $620
+    Balance updated Nov 21, 2026
+    SUMMIT RECOVERY AGENCY
+    4 inquiries
+    Inquiry date Aug 5, 2025
+    Removal date Sep 2027
+    FIRST AUTO LENDING
+    Inquiry date Aug 5, 2025
+    Removal date Sep 2027
+    PACIFIC FINANCE LLC/WCG
+    Inquiry date Aug 5, 2025
+    Removal date Sep 2027
+    COASTAL CONSUMER USA
+    1 public record
+    Record type Bankruptcy chapter 7-discharged
+    Original filing date Apr 15, 2020
+    Latest status date Jul 20, 2020
+    US BKPT CT SAMPLE DIST
+    """
+
+    exp_bundle = importer.import_portal_text(experian_print_text, bureau_hint="experian")
+    assert exp_bundle.reports[0].bureau == "experian"
+    assert exp_bundle.reports[0].model == "fico8"
+    assert exp_bundle.reports[0].score == 645
+    assert len(exp_bundle.tradelines) == 5
+    by_name = {t.name: t for t in exp_bundle.tradelines}
+    assert by_name["SAMPLE FEDERAL CR UNION"].balance_cents == 485_000
+    assert by_name["SAMPLE FEDERAL CR UNION"].credit_limit_cents == 500_000
+    assert by_name["APEX AUTO FINANCE"].kind == "auto_loan"
+    assert by_name["NORTHERN SERVICING INC/D"].balance_cents == 240_000
+    assert by_name["NORTHERN SERVICING INC/D #2"].balance_cents == 265_000
+    assert len(exp_bundle.inquiries) == 3
+    assert any(d.kind == "bankruptcy_ch7" and d.drops_off == "2030-04-15" for d in exp_bundle.derogatories)
+    assert any(d.kind == "collection" and d.amount_cents == 62_000 for d in exp_bundle.derogatories)
+
+    # Credit Karma dual-bureau merge via CreditBridgeStore -> BureauAPIAdapter("custom")
+    ck_text = """
+    Credit Karma
+    TransUnion VantageScore 3.0 618
+    Equifax VantageScore 3.0 614
+    Credit Cards
+    SAMPLE FEDERAL CR UNION
+    Credit Limit: $5,000
+    Balance: $4,850
+    """
+    store = CreditBridgeStore(tmp_path)
+    store.ingest_payload({"source": "experian_companion", "bureau_hint": "experian", "page_text": experian_print_text})
+    store.ingest_payload({"source": "credit_karma_companion", "page_text": ck_text})
+
+    snapshot = store.load_state()
+    bureaus = {(r["bureau"], r["model"]): r["score"] for r in snapshot["reports"]}
+    assert bureaus[("experian", "fico8")] == 645
+    assert bureaus[("transunion", "vantage3")] == 618
+    assert bureaus[("equifax", "vantage3")] == 614
+
+    adapter = BureauAPIAdapter(
+        "custom",
+        api_base_url="http://127.0.0.1:8749/credit/snapshot",
+        api_key="cxcred_test_token",
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, json=snapshot)),
+    )
+    pulled = adapter.fetch_credit_snapshot()
+    assert len(pulled.reports) == 3
+    assert len(pulled.tradelines) >= 5
+
+
+def test_native_messaging_host_direct_db_sync_and_plaid_card_dedup(tmp_path):
+    from chronox_finance.storage import FinanceStorage
+    from scripts.chronox_native_host import handle_native_message
+
+    db_file = tmp_path / "finance.sqlite3"
+    st = FinanceStorage(db_file)
+    # Seed an existing Plaid-linked credit card with live 18.00% APR
+    st.create_credit_line(
+        {
+            "name": "Sample Rewards Card",
+            "issuer": "Sample Federal Credit Union",
+            "kind": "credit_card",
+            "balance_cents": 495_000,
+            "credit_limit_cents": 500_000,
+            "apr_bps": 1800,
+            "min_payment_cents": 9_500,
+            "external_account_id": "plaid_sfcu_1",
+        }
+    )
+    st.close()
+
+    # 1. Ping returns live summary
+    ping_res = handle_native_message({"action": "ping"}, db_path=db_file, data_dir=tmp_path)
+    assert ping_res["ok"] is True
+    assert ping_res["summary"]["credit_lines_count"] == 1
+
+    # 2. Syncing Credit Karma snapshot adds TU + EQ VantageScore 3.0 WITHOUT duplicating card or zeroing APR
+    sync_res = handle_native_message(
+        {
+            "action": "sync_credit",
+            "payload": {
+                "source": "credit_karma_edge",
+                "reports": [
+                    {"bureau": "transunion", "model": "vantage3", "score": 619, "pulled_date": "2026-11-26"},
+                    {"bureau": "equifax", "model": "vantage3", "score": 615, "pulled_date": "2026-11-26"},
+                ],
+                "page_text": "Credit Cards\nSAMPLE FEDERAL CR UNION\nCredit Limit: $5,000\nBalance: $4,850\nAuto Loans\nAPEX AUTO FINANCE\nBalance: $11,200",
+            },
+        },
+        db_path=db_file,
+        data_dir=tmp_path,
+    )
+    assert sync_res["ok"] is True
+    assert sync_res["synced"]["scores_upserted"] == 2
+    assert sync_res["synced"]["tradelines_added"] == 1  # Only Apex Auto added; Sample Federal matched existing Plaid card!
+
+    st_verify = FinanceStorage(db_file)
+    lines = {cl["name"]: cl for cl in st_verify.list_credit_lines()}
+    assert len(lines) == 2
+    assert lines["Sample Rewards Card"]["apr_bps"] == 1800
+    assert lines["Sample Rewards Card"]["balance_cents"] == 495_000
+    assert lines["APEX AUTO FINANCE"]["balance_cents"] == 1_120_000
+    st_verify.close()
+
+
+def test_credit_karma_vantagescore_30_digits_and_titlecase_cards(tmp_path):
+    from chronox_finance.connectors.credit_providers import OfficialCreditReportImporter
+
+    importer = OfficialCreditReportImporter()
+    # Real-world Credit Karma layout where "3.0", "+4 pts", and dates sit between bureau name and score,
+    # and creditor names use Title Case with standalone "$X,XXX" balance lines:
+    ck_realistic = """
+    Credit Karma Dashboard
+    TransUnion
+    VantageScore® 3.0
+    +4 pts · Updated Nov 26, 2026
+    598
+    Needs work
+    Equifax
+    VantageScore® 3.0
+    -2 pts · Updated Nov 26, 2026
+    604
+    Fair
+    Credit Cards
+    Sample Federal Credit Union
+    Credit Limit $5,000
+    $4,850
+    Auto Loans
+    Apex Auto Finance
+    $11,200
+    """
+    bundle = importer.import_portal_text(ck_realistic)
+    scores = {r.bureau: r.score for r in bundle.reports}
+    assert scores["transunion"] == 598
+    assert scores["equifax"] == 604
+    by_name = {t.name: t for t in bundle.tradelines}
+    assert by_name["Sample Federal Credit Union"].balance_cents == 485_000
+    assert by_name["Sample Federal Credit Union"].credit_limit_cents == 500_000
+    assert by_name["Apex Auto Finance"].balance_cents == 1_120_000
+
+
+def test_credit_karma_full_credit_report_page_layout():
+    from chronox_finance.connectors.credit_providers import OfficialCreditReportImporter
+
+    importer = OfficialCreditReportImporter()
+    ck_report_page = """
+    612
+    Calculated using VantageScore 3.0
+    Provided by TransUnion
+    Personal Information
+    NAMES REPORTED
+    Accounts
+    AUTO LOANS
+    APEX AUTO
+    Reported: Nov. 22, 2026
+    +
+    $11,200.00
+    In good standing
+    CREDIT CARDS
+    SAMPLE FCU
+    Reported: Nov. 11, 2026
+    +
+    $4,850.00
+    In good standing
+    OTHER LOANS
+    CLOSEDLENDER
+    Reported: Aug. 31, 2022
+    +
+    $0.00
+    Closed
+    STUDENT LOANS
+    DEPTED/SRV
+    Reported: Oct. 31, 2026
+    +
+    $2,650.00
+    In good standing
+    DEPTED/SRV
+    Reported: Oct. 31, 2026
+    +
+    $2,400.00
+    In good standing
+    Hard Inquiries
+    SAMPLE FCU
+    Inquiry: Sep. 14, 2026
+    +
+    Credit Unions and Finance Companies Other Than Personal Finance Companies
+    SAMPLE FCU
+    Inquiry: Feb. 02, 2026
+    +
+    Credit Unions and Finance Companies Other Than Personal Finance Companies
+    FIRSTBANKCARD
+    Inquiry: Dec. 29, 2024
+    +
+    Banks
+    Collections
+    SUMMIT RECOVERY AGENCY
+    Reported: Nov. 23, 2026
+    +
+    $620.00
+    Needs Attention
+    Public Records
+    Chapter 7 bankruptcy: Bankruptcy
+    Apr. 15, 2020
+    +
+    $0.00
+    Chapter 7 bankruptcy discharged
+    Suggested for your credit
+    Promo Ad Mastercard
+    CREDIT LIMIT
+    $700
+    """
+    bundle = importer.import_portal_text(ck_report_page, bureau_hint="transunion")
+    assert bundle.reports[0].bureau == "transunion"
+    assert bundle.reports[0].score == 612
+    # Must NOT include closed $0 loan or ad card
+    names = [t.name for t in bundle.tradelines]
+    assert "CLOSEDLENDER" not in names
+    assert "Promo Ad Mastercard" not in names
+    assert len(bundle.tradelines) == 4
+    # Must extract all 3 TransUnion hard inquiries ("Inquiry: Sep. 14, 2026", etc.)
+    assert len(bundle.inquiries) == 3
+    inq_dates = {i.inquiry_date for i in bundle.inquiries}
+    assert {"2026-09-14", "2026-02-02", "2024-12-29"} == inq_dates
+    assert any(d.kind == "collection" and d.amount_cents == 62_000 for d in bundle.derogatories)
+    assert any(d.kind == "bankruptcy_ch7" and d.drops_off == "2030-04-15" for d in bundle.derogatories)

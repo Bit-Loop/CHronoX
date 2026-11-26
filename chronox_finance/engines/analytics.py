@@ -25,10 +25,18 @@ from datetime import date, timedelta
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 from chronox_finance.engines.autobudget import iter_effective_tx_allocations
+from chronox_finance.engines.categorizer import (
+    FINANCIAL_DRAG_CATEGORIES,
+    humanize_category_label,
+    normalize_merchant,
+)
 from chronox_finance.engines.quant_math import QuantMathEngine
 from chronox_finance.models import (
     AccountType,
     AnalyticsOverview,
+    CategoryBreakdownItem,
+    CategoryMerchantItem,
+    CategoryTxItem,
     DailyCashflowPoint,
     GoalContributionSeries,
     MonthlyTrendPoint,
@@ -58,6 +66,10 @@ EXPENSE_PALETTE: Tuple[str, ...] = (
     "#c2410c",  # rust orange
     "#4f46e5",  # indigo
     "#a16207",  # ochre
+    "#9333ea",  # vivid purple
+    "#e11d48",  # rose red
+    "#0284c7",  # sky cobalt
+    "#d97706",  # warm gold
 )
 HUB_INCOME_COLOR = "#047857"
 HUB_CASHFLOW_COLOR = "#475569"
@@ -488,17 +500,21 @@ class AnalyticsEngine:
         portfolio_snapshots: Optional[Sequence[Any]] = None,
         splits_by_tx_id: Optional[Dict[int, List[Any]]] = None,
         period: str = "1y",
-        group_by: Literal["jar", "subcategory"] = "jar",
+        group_by: Literal["jar", "category", "subcategory", "merchant"] = "jar",
         today: Optional[date] = None,
     ) -> AnalyticsOverview:
         """
         Compute unified MoneyStill Analytics dashboard payload in exact integer cents:
         - Top 3 KPIs (`savings_rate_pct`, `avg_monthly_surplus_cents`, `top_5_expenses`)
         - 3-Column Cashflow Sankey (honest source/destination labels: Unfunded Gap / Unallocated Surplus)
-        - Expense Distribution Donut (exact shared color palette with Sankey)
+        - Expense Distribution Donut (exact shared color palette with Sankey; up to 10 slices in category/merchant mode)
+        - Full Category/Merchant Breakdown with top merchants & sample transactions for 1-click drilldown
         - Monthly Trend Series (clamped to exact date filter on rolling periods; never plots future months)
         - Net Worth Timeline reconstructed across up to 730 days
         """
+        eff_group_by = (group_by or "jar").strip().lower()
+        if eff_group_by not in ("jar", "category", "subcategory", "merchant"):
+            raise ValueError(f"Unsupported group_by {group_by!r}; expected jar, category, subcategory, or merchant.")
         ref = today or date.today()
         norm_period, start_dt, end_dt, canonical_months = resolve_period(period, today=ref)
         start_iso = start_dt.isoformat()
@@ -546,12 +562,17 @@ class AnalyticsEngine:
         # Period totals (split-aware — ZERO double-counting!)
         total_income_cents = 0
         total_expense_cents = 0
+        financial_drag_cents = 0
         verified_reserve_draw_cents = 0
         verified_savings_transfer_cents = 0
         income_by_source: Dict[str, int] = defaultdict(int)
         expense_by_cat: Dict[str, int] = defaultdict(int)
+        cat_tx_count: Dict[str, int] = defaultdict(int)
         cat_slug_map: Dict[str, str] = {}
+        cat_jar_name: Dict[str, str] = {}
         cat_preferred_color: Dict[str, str] = {}
+        cat_merchants: Dict[str, Dict[str, List[Any]]] = defaultdict(dict)
+        cat_tx_items: Dict[str, List[CategoryTxItem]] = defaultdict(list)
 
         # Pre-index in-period paired transfer legs so two-leg transfers (checking out + savings in)
         # are NEVER double-counted in verified savings or reserve draws.
@@ -643,6 +664,10 @@ class AnalyticsEngine:
                     and bool(splits_by_tx_id.get(int(_get(tx, "id"))))
                 )
                 parent_sub = str(_get(tx, "subcategory", "") or "").strip()
+                merch_raw = str(_get(tx, "merchant", "") or "").strip() or "Unknown Merchant"
+                norm_merch = str(_get(tx, "normalized_merchant", "") or "").strip() or normalize_merchant(merch_raw)
+                tx_id_val = int(_get(tx, "id", 0) or 0)
+                memo_raw = str(_get(tx, "memo", "") or "").strip()
 
                 for jar_id, _goal_id, alloc_amt, alloc_memo in allocs:
                     if alloc_amt <= 0:
@@ -655,11 +680,27 @@ class AnalyticsEngine:
                     total_expense_cents += alloc_amt
                     jar_info = jars_by_id.get(jar_id) if jar_id is not None else None
 
-                    if group_by == "subcategory":
+                    eff_raw_sub = alloc_memo.strip()[:40] if has_splits else parent_sub
+                    human_cat = humanize_category_label(eff_raw_sub) if eff_raw_sub else "Uncategorized"
+                    if human_cat in FINANCIAL_DRAG_CATEGORIES:
+                        financial_drag_cents += alloc_amt
+
+                    if eff_group_by == "category":
+                        if has_splits:
+                            label = (
+                                humanize_category_label(alloc_memo.strip()[:40])
+                                if alloc_memo.strip()
+                                else (jar_info["name"] if jar_info else "Uncategorized")
+                            )
+                        else:
+                            label = human_cat
+                    elif eff_group_by == "subcategory":
                         if has_splits:
                             label = alloc_memo.strip()[:40] or (jar_info["name"] if jar_info else "Uncategorized")
                         else:
                             label = parent_sub or (jar_info["name"] if jar_info else "Uncategorized")
+                    elif eff_group_by == "merchant":
+                        label = merch_raw[:44]
                     else:
                         if jar_info:
                             label = jar_info["name"]
@@ -671,10 +712,34 @@ class AnalyticsEngine:
                             label = "Uncategorized"
 
                     expense_by_cat[label] += alloc_amt
+                    cat_tx_count[label] += 1
+                    m_bucket = cat_merchants[label].get(norm_merch)
+                    if m_bucket is None:
+                        cat_merchants[label][norm_merch] = [merch_raw, alloc_amt, 1]
+                    else:
+                        m_bucket[1] += alloc_amt
+                        m_bucket[2] += 1
+
+                    cat_tx_items[label].append(
+                        CategoryTxItem(
+                            id=tx_id_val,
+                            tx_date=tx_date_str,
+                            merchant=merch_raw,
+                            normalized_merchant=norm_merch,
+                            amount_cents=alloc_amt,
+                            jar_id=int(jar_id) if jar_id is not None else None,
+                            jar_name=jar_info["name"] if jar_info else "",
+                            subcategory=human_cat if parent_sub else "",
+                            memo=(alloc_memo.strip() if has_splits and alloc_memo else memo_raw)[:140],
+                        )
+                    )
+
                     if jar_info:
                         cat_slug_map.setdefault(label, jar_info["slug"])
+                        cat_jar_name.setdefault(label, jar_info["name"])
                         if (
-                            _HEX_COLOR_RE.match(jar_info["color"])
+                            eff_group_by == "jar"
+                            and _HEX_COLOR_RE.match(jar_info["color"])
                             and jar_info["color"].lower() not in _RESERVED_SEMANTIC_COLORS
                         ):
                             cat_preferred_color.setdefault(label, jar_info["color"])
@@ -690,13 +755,14 @@ class AnalyticsEngine:
 
         # --- Ranked Expense Categories & Shared Deterministic Color Map ---
         ranked_expenses = sorted(expense_by_cat.items(), key=lambda kv: (-kv[1], kv[0]))
-        top_5_raw = ranked_expenses[:5]
-        others_raw = ranked_expenses[5:]
+        max_chart_slices = 5 if eff_group_by == "jar" else 10
+        chart_slices_raw = ranked_expenses[:max_chart_slices]
+        others_raw = ranked_expenses[max_chart_slices:]
         others_cents = sum(v for _, v in others_raw)
 
         used_colors: set[str] = set()
         cat_color_map: Dict[str, str] = {}
-        for idx, (label, _amt) in enumerate(top_5_raw):
+        for idx, (label, _amt) in enumerate(ranked_expenses):
             pref = cat_preferred_color.get(label)
             if pref and pref.lower() not in used_colors:
                 color = pref
@@ -711,9 +777,9 @@ class AnalyticsEngine:
         income_denom = total_income_cents if total_income_cents > 0 else max(1, total_expense_cents)
         expense_denom = max(1, total_expense_cents)
 
-        top_5_expenses: List[TopExpenseItem] = []
-        for label, amt in top_5_raw:
-            top_5_expenses.append(
+        chart_slice_items: List[TopExpenseItem] = []
+        for label, amt in chart_slices_raw:
+            chart_slice_items.append(
                 TopExpenseItem(
                     label=label,
                     jar_slug=cat_slug_map.get(label, ""),
@@ -724,8 +790,10 @@ class AnalyticsEngine:
                 )
             )
 
+        top_5_expenses: List[TopExpenseItem] = list(chart_slice_items[:5])
+
         # Expense Distribution Donut shares exact color map + Others rollup
-        expense_distribution: List[TopExpenseItem] = list(top_5_expenses)
+        expense_distribution: List[TopExpenseItem] = list(chart_slice_items)
         if others_cents > 0:
             expense_distribution.append(
                 TopExpenseItem(
@@ -735,6 +803,43 @@ class AnalyticsEngine:
                     pct_of_expenses=round((others_cents / expense_denom) * 100.0, 1),
                     pct_of_income=round((others_cents / income_denom) * 100.0, 1),
                     color=OTHERS_EXPENSE_COLOR,
+                )
+            )
+
+        category_breakdown: List[CategoryBreakdownItem] = []
+        for label, amt in ranked_expenses:
+            merch_entries = sorted(
+                cat_merchants.get(label, {}).items(),
+                key=lambda kv: (-int(kv[1][1]), str(kv[1][0])),
+            )[:8]
+            top_merch_list = [
+                CategoryMerchantItem(
+                    merchant=str(vals[0]),
+                    normalized_merchant=n_merch,
+                    amount_cents=int(vals[1]),
+                    tx_count=int(vals[2]),
+                )
+                for n_merch, vals in merch_entries
+            ]
+            tx_samples = sorted(
+                cat_tx_items.get(label, []),
+                key=lambda item: (item.tx_date, item.amount_cents, item.id),
+                reverse=True,
+            )[:25]
+            category_breakdown.append(
+                CategoryBreakdownItem(
+                    label=label,
+                    jar_slug=cat_slug_map.get(label, ""),
+                    jar_name=cat_jar_name.get(label, ""),
+                    amount_cents=amt,
+                    tx_count=int(cat_tx_count.get(label, 0)),
+                    avg_monthly_cents=int(round(amt / max(1, canonical_months))),
+                    pct_of_expenses=round((amt / expense_denom) * 100.0, 1) if total_expense_cents > 0 else 0.0,
+                    pct_of_income=round((amt / income_denom) * 100.0, 1) if (total_income_cents > 0 or total_expense_cents > 0) else 0.0,
+                    color=cat_color_map[label],
+                    is_financial_drag=(label in FINANCIAL_DRAG_CATEGORIES),
+                    top_merchants=top_merch_list,
+                    sample_transactions=tx_samples,
                 )
             )
 
@@ -802,8 +907,8 @@ class AnalyticsEngine:
                 )
             )
 
-            # Column 2: Top 5 Expense Categories + Others + Verified Savings / Unallocated Surplus
-            for idx, item in enumerate(top_5_expenses):
+            # Column 2: Expense Slices (up to 10 in category/merchant mode, 5 in jar mode) + Others + Surplus
+            for idx, item in enumerate(chart_slice_items):
                 nid = f"exp:{idx}"
                 sankey_nodes.append(
                     SankeyNode(
@@ -942,15 +1047,18 @@ class AnalyticsEngine:
             period=norm_period,
             start_date=start_iso,
             end_date=end_iso,
+            group_by=eff_group_by,
             total_income_cents=total_income_cents,
             total_expense_cents=total_expense_cents,
             net_surplus_cents=net_surplus_cents,
+            financial_drag_cents=financial_drag_cents,
             savings_rate_pct=savings_rate_pct,
             avg_monthly_surplus_cents=avg_monthly_surplus_cents,
             top_5_expenses=top_5_expenses,
             sankey_nodes=sankey_nodes,
             sankey_links=sankey_links,
             expense_distribution=expense_distribution,
+            category_breakdown=category_breakdown,
             monthly_trends=monthly_trends,
             net_worth_series=net_worth_series,
         )

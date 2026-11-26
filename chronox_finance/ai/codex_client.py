@@ -602,7 +602,7 @@ ChronoX protects users from accidental overdrafts, late bills, and impulsive cap
 2. Five-Jar Allocation Architecture:
    - `bills` (Bills & Essentials — PROTECTED FIREWALL): Covers rent, mortgage, utilities, insurance, minimum debt obligations, and essential recurring commitments. You MUST NEVER propose moving money out of the `bills` jar, funding discretionary goals from the `bills` jar, or redirecting `bills` jar transactions into discretionary jars.
    - `daily` (Daily Living): Flexible essentials including groceries, fuel, public transit, household supplies, and pharmacy needs.
-   - `fun` (Guilt-Free Fun): Intentional discretionary dopamine budget for dining, coffee, entertainment, and hobbies so the user can enjoy purchases without guilt or shame.
+   - `fun` (Dining & Lifestyle): Intentional discretionary budget for dining, coffee, entertainment, clothing, and retail shopping.
    - `safety` (Safety & Debt Shield): Emergency reserve cushion, sinking funds, and accelerated debt paydown allocations.
    - `invest` (ChronoX Invest Vault): Strictly isolated investment and trading capital bucket.
 3. Safe-to-Invest Firewall:
@@ -772,7 +772,14 @@ class CodexResponsesClient:
         base_url: Optional[str] = None,
         model: Optional[str] = None,
         *,
-        provider_name: Literal["openai_codex", "chat_wrapper"] = "openai_codex",
+        provider_name: Literal[
+            "openai_codex",
+            "chat_wrapper",
+            "claude_cli",
+            "opencode_cli",
+            "codex_cli",
+            "agy_cli",
+        ] = "openai_codex",
         wire_api: Literal["responses", "chat_completions"] = "responses",
         enable_static_prefix: bool = True,
         allow_keyless_local: Optional[bool] = None,
@@ -781,9 +788,11 @@ class CodexResponsesClient:
         transport: Optional[httpx.BaseTransport] = None,
     ):
         pname = (provider_name or "openai_codex").strip().lower()
-        if pname not in ("openai_codex", "chat_wrapper"):
+        allowed_names = ("openai_codex", "chat_wrapper", "claude_cli", "opencode_cli", "codex_cli", "agy_cli")
+        if pname not in allowed_names:
             raise ValueError(f"Unsupported provider_name for CodexResponsesClient: {provider_name!r}")
         self.provider_name: str = pname
+        is_wrapper_mode = pname != "openai_codex"
 
         wapi = (wire_api or "responses").strip().lower()
         if wapi not in ("responses", "chat_completions"):
@@ -792,16 +801,16 @@ class CodexResponsesClient:
 
         if api_key is not None:
             resolved_key = api_key.strip()
-        elif pname == "chat_wrapper":
+        elif is_wrapper_mode:
             resolved_key = (os.getenv("CHRONOX_WRAPPER_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
         else:
             resolved_key = (os.getenv("OPENAI_API_KEY") or "").strip()
 
-        default_url = DEFAULT_WRAPPER_BASE_URL if pname == "chat_wrapper" else DEFAULT_OPENAI_BASE_URL
+        default_url = DEFAULT_WRAPPER_BASE_URL if is_wrapper_mode else DEFAULT_OPENAI_BASE_URL
         raw_input_url = (
             base_url
             if base_url is not None
-            else (os.getenv("CHRONOX_WRAPPER_BASE_URL", "") if pname == "chat_wrapper" else default_url)
+            else (os.getenv("CHRONOX_WRAPPER_BASE_URL", "") if is_wrapper_mode else default_url)
         )
         self._explicit_base_url = bool((raw_input_url or "").strip())
         raw_url = (raw_input_url or default_url).strip().split("?", 1)[0].rstrip("/")
@@ -810,7 +819,7 @@ class CodexResponsesClient:
                 raw_url = raw_url[: -len(suffix)]
                 break
 
-        default_model = DEFAULT_WRAPPER_MODEL if pname == "chat_wrapper" else DEFAULT_CODEX_MODEL
+        default_model = DEFAULT_WRAPPER_MODEL if is_wrapper_mode else DEFAULT_CODEX_MODEL
         self.api_key = resolved_key
         self.base_url = validate_external_api_url(raw_url or default_url)
         self.model = (model or default_model).strip()
@@ -818,7 +827,7 @@ class CodexResponsesClient:
         self.allow_keyless_local = (
             bool(allow_keyless_local)
             if allow_keyless_local is not None
-            else (pname == "chat_wrapper")
+            else is_wrapper_mode
         )
         self.timeout_seconds = float(timeout_seconds)
         self.cache_ttl_seconds = int(cache_ttl_seconds)
@@ -827,7 +836,7 @@ class CodexResponsesClient:
 
     @property
     def is_configured(self) -> bool:
-        if self.provider_name == "chat_wrapper":
+        if self.provider_name != "openai_codex":
             if self.api_key:
                 return True
             return bool(self._explicit_base_url and self.allow_keyless_local and is_local_url(self.base_url))

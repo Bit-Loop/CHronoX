@@ -122,7 +122,21 @@ def normalize_derogatory_kind(raw_kind: str) -> str:
         "repo": "repossession",
     }
     canonical = aliases.get(val, val)
-    return canonical if canonical in DEROGATORY_RETENTION_MONTHS else "late_payment"
+    if canonical in DEROGATORY_RETENTION_MONTHS:
+        return canonical
+    if "chapter_7" in val or "ch_7" in val or "ch7" in val:
+        return "bankruptcy_ch7"
+    if "chapter_13" in val or "ch_13" in val or "ch13" in val:
+        return "bankruptcy_ch13"
+    if "charge_off" in val or "chargeoff" in val:
+        return "charge_off"
+    if "collection" in val:
+        return "collection"
+    if "foreclosure" in val:
+        return "foreclosure"
+    if "repossess" in val:
+        return "repossession"
+    return "late_payment"
 
 
 def compute_drop_off_date(kind: str, event_date: str) -> str:
@@ -794,6 +808,37 @@ class OfficialCreditReportImporter:
                 raw_source_format="annual_credit_report_pdf",
             )
 
+        bundle = self.import_portal_text(
+            text,
+            bureau_hint=bureau_hint,
+            source_tag="annual_credit_report_pdf",
+            needs_review=True,
+        )
+        bundle.warnings = warnings + [w for w in bundle.warnings if w not in warnings]
+        bundle.raw_source_format = "annual_credit_report_pdf"
+        return bundle
+
+    def import_portal_text(
+        self,
+        raw_text: str,
+        *,
+        bureau_hint: str = "auto",
+        source_tag: str = "credit_portal_capture",
+        needs_review: bool = True,
+    ) -> CreditImportBundle:
+        """
+        Parse plain-text or PDF-extracted text from Experian.com, Credit Karma
+        (TransUnion + Equifax VantageScore 3.0), or AnnualCreditReport.com into a
+        normalized `CreditImportBundle`.
+        """
+        # Strip HTML tags if raw HTML was passed, preserving line breaks
+        if "<html" in raw_text.lower() or "<div" in raw_text.lower():
+            cleaned_html = re.sub(r"<(script|style)[^>]*>[\s\S]*?</\1>", " ", raw_text, flags=re.IGNORECASE)
+            text = re.sub(r"<[^>]+>", "\n", cleaned_html)
+        else:
+            text = raw_text
+
+        warnings: List[str] = []
         detected_bureau = self._detect_bureau(text, bureau_hint)
         pull_match = _PDF_PULL_DATE_RE.search(text)
         pulled_date = (
@@ -802,28 +847,16 @@ class OfficialCreditReportImporter:
             else None
         ) or date.today().isoformat()
 
-        reports: List[CreditReportRecord] = []
-        score_match = _PDF_SCORE_RE.search(text)
-        if score_match:
-            reports.append(
-                CreditReportRecord(
-                    bureau=detected_bureau,
-                    model=_normalize_model(score_match.group(1)),
-                    score=int(score_match.group(2)),
-                    pulled_date=pulled_date,
-                    source="annual_credit_report_pdf",
-                    needs_review=True,
-                )
-            )
-        else:
+        reports = self._extract_portal_scores(text, detected_bureau, pulled_date, source_tag, needs_review)
+        if not reports:
             reports.append(
                 CreditReportRecord(
                     bureau=detected_bureau,
                     model="other",
                     score=None,
                     pulled_date=pulled_date,
-                    source="annual_credit_report_pdf",
-                    needs_review=True,
+                    source=source_tag,
+                    needs_review=needs_review,
                 )
             )
             warnings.append(
@@ -832,16 +865,538 @@ class OfficialCreditReportImporter:
             )
 
         tradelines, inquiries, derogatories = self._parse_pdf_sections(text, detected_bureau)
+        p_tl, p_inq, p_der = self._parse_modern_portal_blocks(text, detected_bureau, source_tag)
+
+        # Merge modern Experian / Credit Karma blocks, disambiguating multi-loan servicers
+        seen_tl_pairs = {(t.name.strip().lower(), t.balance_cents) for t in tradelines}
+        name_counts: Dict[str, int] = {}
+        for t in tradelines:
+            k = t.name.strip().lower()
+            name_counts[k] = name_counts.get(k, 0) + 1
+        for t in p_tl:
+            base_low = t.name.strip().lower()
+            if (base_low, t.balance_cents) in seen_tl_pairs and name_counts.get(base_low, 0) == 1:
+                continue
+            cnt = name_counts.get(base_low, 0) + 1
+            name_counts[base_low] = cnt
+            if cnt > 1:
+                t.name = f"{t.name} #{cnt}"[:80]
+            tradelines.append(t)
+            seen_tl_pairs.add((base_low, t.balance_cents))
+
+        if p_inq and not inquiries:
+            inquiries.extend(p_inq)
+        else:
+            seen_inq = {(i.lender.strip().lower(), i.bureau, i.inquiry_date) for i in inquiries}
+            for i in p_inq:
+                key = (i.lender.strip().lower(), i.bureau, i.inquiry_date)
+                if key not in seen_inq:
+                    inquiries.append(i)
+                    seen_inq.add(key)
+
+        seen_der = {(d.kind, (d.creditor or d.lender).strip().lower(), d.opened_date) for d in derogatories}
+        for d in p_der:
+            key = (d.kind, (d.creditor or d.lender).strip().lower(), d.opened_date)
+            if key not in seen_der:
+                derogatories.append(d)
+                seen_der.add(key)
+
         return CreditImportBundle(
             provider=self.provider_name,
-            needs_review=True,  # Mandatory review screen per Gate 1 #53
+            needs_review=needs_review,
             reports=reports,
             tradelines=tradelines,
             inquiries=inquiries,
             derogatories=derogatories,
             warnings=warnings,
-            raw_source_format="annual_credit_report_pdf",
+            raw_source_format=source_tag,
         )
+
+    def _extract_portal_scores(
+        self,
+        text: str,
+        default_bureau: str,
+        pulled_date: str,
+        source_tag: str,
+        needs_review: bool,
+    ) -> List[CreditReportRecord]:
+        reports: List[CreditReportRecord] = []
+        seen: set[Tuple[str, str, int]] = set()
+
+        def add_score(bureau: str, model: str, val: int) -> None:
+            if not (300 <= val <= 850):
+                return
+            b_norm = _normalize_bureau(bureau) or default_bureau
+            m_norm = _normalize_model(model)
+            if (b_norm, m_norm, val) in seen:
+                return
+            seen.add((b_norm, m_norm, val))
+            reports.append(
+                CreditReportRecord(
+                    bureau=b_norm,
+                    model=m_norm,
+                    score=val,
+                    pulled_date=pulled_date,
+                    source=source_tag,
+                    needs_review=needs_review,
+                )
+            )
+
+        # 1. Credit Karma dual-bureau blocks (neutralize "3.0" / "+5 pts" / dates first so digits don't block)
+        scrubbed_head = re.sub(
+            r"VantageScore\s*®?\s*3(?:\.0)?", "VantageScore", text[:25000], flags=re.IGNORECASE
+        )
+        scrubbed_head = re.sub(
+            r"FICO\s*®?\s*(?:Score\s*)?(?:8|9|10T?)", "FICOScore", scrubbed_head, flags=re.IGNORECASE
+        )
+        scrubbed_head = re.sub(r"[+-]\s*\d+\s*(?:pts?|points?)", " ", scrubbed_head, flags=re.IGNORECASE)
+
+        ck_fw_re = re.compile(
+            r"\b(TransUnion|Trans\s+Union|Equifax|Experian)\b[\s\S]{0,140}?"
+            r"(?<![\$0-9.,])\b([3-8]\d{2})\b(?![0-9%])",
+            re.IGNORECASE,
+        )
+        ck_rv_re = re.compile(
+            r"(?<![\$0-9.,])\b([3-8]\d{2})\b(?![0-9%])[\s\S]{0,120}?"
+            r"\b(TransUnion|Trans\s+Union|Equifax)\b",
+            re.IGNORECASE,
+        )
+        is_ck = "credit karma" in text.lower() or "vantagescore" in text.lower() or (
+            "transunion" in text[:8000].lower() and "equifax" in text[:8000].lower()
+        )
+        if is_ck:
+            for m in ck_fw_re.finditer(scrubbed_head):
+                val = int(m.group(2))
+                if val in (300, 579, 669, 739, 799, 850):
+                    continue
+                add_score(m.group(1), "vantagescore3", val)
+            if len(reports) < 2:
+                for m in ck_rv_re.finditer(scrubbed_head):
+                    val = int(m.group(1))
+                    if val in (300, 579, 669, 739, 799, 850):
+                        continue
+                    add_score(m.group(2), "vantagescore3", val)
+
+        # 2. Inline model + score (classic AnnualCreditReport / statements)
+        if not reports:
+            for m in _PDF_SCORE_RE.finditer(text[:5000]):
+                val = int(m.group(2))
+                add_score(default_bureau, m.group(1), val)
+
+        # 3. Multi-line Experian web print ("FICO SCORE 8" ... "As of today" ... "645" ... "Fair")
+        if not reports:
+            exp_ml = re.search(
+                r"(FICO\s*(?:SCORE\s*)?[89]|VantageScore\s*3(?:\.0)?)[\s\S]{0,120}?"
+                r"\n\s*([3-8]\d{2})\s*\n\s*(?:Exceptional|Very\s+Good|Good|Fair|Poor)\b",
+                text[:4000],
+                re.IGNORECASE,
+            )
+            if exp_ml:
+                add_score(default_bureau, exp_ml.group(1), int(exp_ml.group(2)))
+            elif "experian credit report" in text[:1500].lower():
+                exp_num = re.search(
+                    r"\n\s*([3-8]\d{2})\s*\n\s*(?:Exceptional|Very\s+Good|Good|Fair|Poor)\b",
+                    text[:2500],
+                    re.IGNORECASE,
+                )
+                if exp_num:
+                    add_score("experian", "fico8", int(exp_num.group(1)))
+
+        return reports
+
+    def _parse_modern_portal_blocks(
+        self,
+        text: str,
+        default_bureau: str,
+        source_tag: str,
+    ) -> Tuple[List[CreditTradelineRecord], List[CreditInquiryRecord], List[CreditDerogatoryRecord]]:
+        """
+        Parse modern Experian web-print PDFs and Credit Karma account/inquiry/public-record
+        cards where labels and values span adjacent lines without `Account Name:` colons.
+        """
+        tradelines: List[CreditTradelineRecord] = []
+        inquiries: List[CreditInquiryRecord] = []
+        derogatories: List[CreditDerogatoryRecord] = []
+
+        raw_lines = [
+            re.sub(r"[\ue000-\uf8ff®™]+", " ", raw).strip()
+            for raw in text.splitlines()
+        ]
+        lines = [re.sub(r"\s+", " ", ln).strip() for ln in raw_lines if re.sub(r"\s+", " ", ln).strip()]
+
+        noise_prefixes = (
+            "isaiah, you've been pre-approved",
+            "you've been pre-approved",
+            "view offers",
+            "see your offers",
+            "learn more",
+            "link card name",
+            "what's this",
+            "build your credit",
+            "adding another account",
+            "help show lenders",
+            "want to lower your car payment",
+            "autopay helps you compare",
+            "a rate that's right",
+            "on autopay.com",
+            "get started",
+            "late payments stay on your report",
+            "collections can stay on your credit report",
+            "keep in mind, not all inquiries",
+            "your experian credit file",
+            "locking your credit file",
+            "more on creditlock",
+            "chapter 7 bankruptcies remain",
+            "you don't have any tradelines",
+            "connect account",
+            "these lenders have accessed",
+            "these are financial accounts",
+        )
+
+        section = ""
+        current_kind = "credit_card"
+        section_limit_cents = 0
+        pending_balance_cents: Optional[int] = None
+        pending_limit_cents: Optional[int] = None
+        pending_updated_date: Optional[str] = None
+        pending_acct_name: str = ""
+        pending_coll_agency: str = ""
+        pending_orig_creditor: str = ""
+        pending_inq_date: Optional[str] = None
+        pending_inq_lender: str = ""
+        pending_pub_kind: str = ""
+        pending_pub_filed: Optional[str] = None
+        last_added_tl_from_ck: bool = False
+
+        def is_noise(low: str) -> bool:
+            if any(low.startswith(p) for p in noise_prefixes):
+                return True
+            if re.match(r"^(?:\d+\s+closed\s+accounts?|total\s+balance\b|\d+%\s+credit\s+usage)", low):
+                return True
+            if low.startswith("credit used") and "credit limit" not in low:
+                return True
+            if low in ("|", "6%", "30%", "2", "faqs", "services", "tools", "support"):
+                return True
+            return False
+
+        for line in lines:
+            low = line.lower()
+            if is_noise(low):
+                continue
+
+            # Major section transitions
+            if low in ("credit cards or credit lines", "credit cards"):
+                section = "accounts"
+                current_kind = "credit_card"
+                section_limit_cents = 0
+                pending_balance_cents = None
+                continue
+            if low in ("auto loans or leases", "auto loans"):
+                section = "accounts"
+                current_kind = "auto_loan"
+                section_limit_cents = 0
+                pending_balance_cents = None
+                continue
+            if low == "student loans":
+                section = "accounts"
+                current_kind = "student_loan"
+                section_limit_cents = 0
+                pending_balance_cents = None
+                continue
+            if low in ("personal loans", "other loans"):
+                section = "accounts"
+                current_kind = "personal_loan"
+                section_limit_cents = 0
+                pending_balance_cents = None
+                pending_acct_name = ""
+                continue
+            if low in ("mortgages", "home loans", "real estate loans"):
+                section = "accounts"
+                current_kind = "mortgage"
+                section_limit_cents = 0
+                pending_balance_cents = None
+                pending_acct_name = ""
+                continue
+            if low in ("other accounts", "rent and utilities"):
+                section = "other_accounts"
+                current_kind = "personal_loan"
+                pending_balance_cents = None
+                pending_acct_name = ""
+                continue
+            if low in ("self-reported accounts", "personal information"):
+                section = "ignore"
+                pending_balance_cents = None
+                pending_acct_name = ""
+                continue
+            if re.match(r"^(?:\d+\s+)?collections?$", low):
+                section = "collections"
+                pending_balance_cents = None
+                pending_coll_agency = ""
+                pending_orig_creditor = ""
+                continue
+            if re.match(r"^(?:\d+\s+)?(?:hard\s+)?inquiries$", low):
+                section = "inquiries"
+                pending_inq_date = None
+                pending_inq_lender = ""
+                continue
+            if re.match(r"^(?:\d+\s+)?public\s+records?$", low):
+                section = "public_records"
+                pending_pub_kind = ""
+                pending_pub_filed = None
+                continue
+            if low in ("faqs", "suggested for your credit", "suggested cards", "advertiser disclosure", "company info"):
+                section = "done"
+                break
+            if line == "+":
+                continue
+
+            if section in ("accounts", "other_accounts"):
+                if low == "closed" and last_added_tl_from_ck and tradelines:
+                    tradelines.pop()
+                    last_added_tl_from_ck = False
+                    continue
+                if low in ("in good standing", "needs attention") or low.startswith("show closed"):
+                    last_added_tl_from_ck = False
+                    continue
+
+                lim_m = re.search(r"credit\s+limit\s*[:\-]?\s*\$\s*([0-9,]+(?:\.[0-9]{2})?)", line, re.IGNORECASE)
+                if lim_m:
+                    parsed_lim = decimal_to_cents(lim_m.group(1))
+                    section_limit_cents = parsed_lim
+                    pending_limit_cents = parsed_lim
+                    if "credit used" in low or low.startswith("credit limit"):
+                        continue
+
+                bal_m = re.match(
+                    r"^(?:(?:current|reported|account)\s+)?(?:balance\s*[:\-]?\s*)?\$\s*([0-9,]+(?:\.[0-9]{2})?)$",
+                    line,
+                    re.IGNORECASE,
+                )
+                if bal_m:
+                    val_cents = decimal_to_cents(bal_m.group(1))
+                    if pending_acct_name:
+                        pot_neg = "potentially negative" in pending_acct_name.lower()
+                        clean_name = re.sub(
+                            r"\s*POTENTIALLY\s+NEGATIVE\s*$", "", pending_acct_name, flags=re.IGNORECASE
+                        ).strip()
+                        lim_val = pending_limit_cents if pending_limit_cents is not None else (
+                            section_limit_cents if current_kind == "credit_card" else 0
+                        )
+                        tradelines.append(
+                            CreditTradelineRecord(
+                                name=sanitize_untrusted_text(clean_name, max_len=80),
+                                issuer=sanitize_untrusted_text(clean_name, max_len=60),
+                                kind=current_kind,
+                                balance_cents=val_cents,
+                                credit_limit_cents=lim_val,
+                                statement_closing_day=_day_from_iso(pending_updated_date, 15),
+                                source=source_tag,
+                                apr_provided=False,
+                                closing_day_provided=bool(pending_updated_date),
+                                due_day_provided=False,
+                            )
+                        )
+                        if pot_neg:
+                            derogatories.append(
+                                CreditDerogatoryRecord(
+                                    kind="late_30",
+                                    opened_date=pending_updated_date or date.today().isoformat(),
+                                    creditor=clean_name,
+                                    bureau=default_bureau,
+                                    amount_cents=val_cents,
+                                    active=True,
+                                )
+                            )
+                        pending_acct_name = ""
+                        pending_limit_cents = None
+                        pending_updated_date = None
+                        section_limit_cents = 0
+                        last_added_tl_from_ck = True
+                    elif line.lower().startswith("balance") or current_kind != "":
+                        pending_balance_cents = val_cents
+                        last_added_tl_from_ck = False
+                    continue
+
+                upd_m = re.match(r"^(?:balance\s+updated|last\s+reported|reported)\s*[:\-]?\s*(.+)$", line, re.IGNORECASE)
+                if upd_m:
+                    pending_updated_date = _parse_flexible_date(upd_m.group(1))
+                    continue
+
+                # Creditor name line (supports both ALL-CAPS Experian and Title-Case Credit Karma names)
+                is_creditor_candidate = (
+                    re.match(r"^[A-Za-z0-9][A-Za-z0-9&'.,/\- ]{2,65}$", line)
+                    and not re.search(r"\b(balance|limit|usage|utilization|payment|opened|updated|reported|closed|open|on\s+time|remarks|details|overview|factors|score|offers|recommended|apply|credit\s+karma|transunion|equifax|experian)\b", low)
+                    and not re.match(r"^\d", line)
+                )
+                if is_creditor_candidate:
+                    if pending_balance_cents is not None:
+                        pot_neg = "potentially negative" in low
+                        clean_name = re.sub(r"\s*POTENTIALLY\s+NEGATIVE\s*$", "", line, flags=re.IGNORECASE).strip()
+                        lim_val = pending_limit_cents if pending_limit_cents is not None else (
+                            section_limit_cents if current_kind == "credit_card" else 0
+                        )
+                        tradelines.append(
+                            CreditTradelineRecord(
+                                name=sanitize_untrusted_text(clean_name, max_len=80),
+                                issuer=sanitize_untrusted_text(clean_name, max_len=60),
+                                kind=current_kind,
+                                balance_cents=pending_balance_cents,
+                                credit_limit_cents=lim_val,
+                                statement_closing_day=_day_from_iso(pending_updated_date, 15),
+                                source=source_tag,
+                                apr_provided=False,
+                                closing_day_provided=bool(pending_updated_date),
+                                due_day_provided=False,
+                            )
+                        )
+                        if pot_neg and pending_updated_date:
+                            derogatories.append(
+                                CreditDerogatoryRecord(
+                                    kind="late_30",
+                                    opened_date=pending_updated_date,
+                                    creditor=clean_name,
+                                    bureau=default_bureau,
+                                    amount_cents=pending_balance_cents,
+                                    active=True,
+                                )
+                            )
+                        pending_balance_cents = None
+                        pending_limit_cents = None
+                        pending_updated_date = None
+                        section_limit_cents = 0
+                    else:
+                        pending_acct_name = line.strip()
+
+            elif section == "collections":
+                if low.startswith(("if you've fallen behind", "needs attention")):
+                    continue
+                orig_m = re.match(r"^original\s+creditor\s*[:\-]?\s*(.+)$", line, re.IGNORECASE)
+                if orig_m:
+                    pending_orig_creditor = orig_m.group(1).strip()
+                    continue
+                bal_m = re.match(r"^(?:balance\s*[:\-]?\s*)?\$\s*([0-9,]+(?:\.[0-9]{2})?)$", line, re.IGNORECASE)
+                if bal_m:
+                    val_c = decimal_to_cents(bal_m.group(1))
+                    if pending_coll_agency:
+                        label = f"{pending_coll_agency} (Orig: {pending_orig_creditor})" if pending_orig_creditor else pending_coll_agency
+                        derogatories.append(
+                            CreditDerogatoryRecord(
+                                kind="collection",
+                                opened_date=pending_updated_date or date.today().isoformat(),
+                                creditor=label[:80],
+                                bureau=default_bureau,
+                                amount_cents=val_c,
+                                active=True,
+                            )
+                        )
+                        pending_coll_agency = ""
+                        pending_orig_creditor = ""
+                        pending_updated_date = None
+                    else:
+                        pending_balance_cents = val_c
+                    continue
+                upd_m = re.match(r"^(?:balance\s+updated|reported|opened(?:\s+date)?|date\s+opened)\s*[:\-]?\s*(.+)$", line, re.IGNORECASE)
+                if upd_m:
+                    pending_updated_date = _parse_flexible_date(upd_m.group(1))
+                    continue
+                if re.match(r"^[A-Z0-9][A-Z0-9&'.,/\- ]{2,70}$", line):
+                    agency = line.strip()
+                    if pending_balance_cents is not None:
+                        label = f"{agency} (Orig: {pending_orig_creditor})" if pending_orig_creditor else agency
+                        ev_dt = pending_updated_date or date.today().isoformat()
+                        derogatories.append(
+                            CreditDerogatoryRecord(
+                                kind="collection",
+                                opened_date=ev_dt,
+                                creditor=label[:80],
+                                bureau=default_bureau,
+                                amount_cents=pending_balance_cents,
+                                active=True,
+                            )
+                        )
+                        pending_balance_cents = None
+                        pending_orig_creditor = ""
+                        pending_updated_date = None
+                    else:
+                        pending_coll_agency = agency
+
+            elif section == "inquiries":
+                if low.startswith(("when you apply", "removal date", "credit unions and finance", "banks", "auto finance")):
+                    continue
+                inq_dt_m = re.match(r"^(?:inquiry(?:\s+date)?|date)\s*[:\-]?\s*(.+)$", line, re.IGNORECASE)
+                if inq_dt_m:
+                    parsed_dt = _parse_flexible_date(inq_dt_m.group(1))
+                    if parsed_dt and pending_inq_lender:
+                        inquiries.append(
+                            CreditInquiryRecord(
+                                lender=pending_inq_lender,
+                                bureau=default_bureau,
+                                inquiry_date=parsed_dt,
+                                inquiry_type="hard",
+                            )
+                        )
+                        pending_inq_lender = ""
+                    else:
+                        pending_inq_date = parsed_dt
+                    continue
+                if re.match(r"^[A-Z0-9][A-Z0-9&'.,/\- ]{2,70}$", line):
+                    if pending_inq_date:
+                        inquiries.append(
+                            CreditInquiryRecord(
+                                lender=line.strip(),
+                                bureau=default_bureau,
+                                inquiry_date=pending_inq_date,
+                                inquiry_type="hard",
+                            )
+                        )
+                        pending_inq_date = None
+                    else:
+                        pending_inq_lender = line.strip()
+
+            elif section == "public_records":
+                if low.startswith(("things like bankruptcies", "latest status date")) or line.startswith("$"):
+                    continue
+                rec_m = re.match(r"^(?:record\s+type\s*[:\-]?\s*)?(chapter\s*(?:7|13)\s*bankruptcy.*)$", line, re.IGNORECASE)
+                if not rec_m:
+                    rec_m = re.match(r"^record\s+type\s*[:\-]?\s*(.+)$", line, re.IGNORECASE)
+                if rec_m:
+                    if pending_pub_filed and pending_pub_kind:
+                        # trailing "Chapter 7 bankruptcy discharged" description line on CK
+                        continue
+                    pending_pub_kind = rec_m.group(1).strip()
+                    continue
+                fil_m = re.match(r"^(?:original\s+filing\s+date|filing\s+date|date\s+filed)\s*[:\-]?\s*(.+)$", line, re.IGNORECASE)
+                direct_dt = _parse_flexible_date(fil_m.group(1) if fil_m else line)
+                if direct_dt:
+                    pending_pub_filed = direct_dt
+                    # Credit Karma often omits court name on summary; emit immediately if kind already known
+                    if pending_pub_kind and "chapter" in pending_pub_kind.lower() and ":" in pending_pub_kind:
+                        derogatories.append(
+                            CreditDerogatoryRecord(
+                                kind=pending_pub_kind,
+                                opened_date=pending_pub_filed,
+                                creditor="US Bankruptcy Court",
+                                bureau=default_bureau,
+                                active=True,
+                            )
+                        )
+                        pending_pub_kind = ""
+                        pending_pub_filed = None
+                    continue
+                if pending_pub_filed and re.match(r"^[A-Z0-9][A-Z0-9&'.,/\- ]{2,70}$", line):
+                    derogatories.append(
+                        CreditDerogatoryRecord(
+                            kind=pending_pub_kind or "bankruptcy_ch7",
+                            opened_date=pending_pub_filed,
+                            creditor=line.strip(),
+                            bureau=default_bureau,
+                            active=True,
+                        )
+                    )
+                    pending_pub_kind = ""
+                    pending_pub_filed = None
+
+        return tradelines, inquiries, derogatories
 
     def _detect_bureau(self, text: str, bureau_hint: str) -> str:
         hint = _normalize_bureau(bureau_hint)

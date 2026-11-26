@@ -127,6 +127,10 @@
             <span>Master Passcode</span>
             <input id="vault-unlock-pwd" type="password" autocomplete="current-password" placeholder="Enter your passcode" required />
           </label>
+          <label class="checkbox-row small">
+            <input id="vault-unlock-remember-7d" type="checkbox" checked />
+            <span>Keep unlocked for 7 days on this device</span>
+          </label>
           <button type="submit" class="btn btn-primary btn-block">Unlock ChronoX</button>
           <p id="vault-unlock-error" class="error-text hidden" role="alert"></p>
         </form>
@@ -761,6 +765,11 @@
             <h2>Cash Flow</h2>
           </div>
           <div class="row-gap wrap">
+            <div id="analytics-groupby-switcher" class="segmented segmented-sm" role="group" aria-label="Group cash flow by">
+              <button type="button" class="seg-btn active" data-analytics-groupby="category" aria-pressed="true">Categories</button>
+              <button type="button" class="seg-btn" data-analytics-groupby="jar" aria-pressed="false">Envelopes</button>
+              <button type="button" class="seg-btn" data-analytics-groupby="merchant" aria-pressed="false">Merchants</button>
+            </div>
             <div id="analytics-period-switcher" class="segmented segmented-sm" role="group" aria-label="Cash flow time period">
               <button type="button" class="seg-btn" data-analytics-period="30d" aria-pressed="false">30D</button>
               <button type="button" class="seg-btn" data-analytics-period="90d" aria-pressed="false">90D</button>
@@ -769,6 +778,7 @@
             </div>
             <span id="analytics-month-chip" class="pill pill-blue hidden"></span>
             <button id="btn-analytics-clear-month" type="button" class="btn btn-ghost btn-xs hidden">Clear Month</button>
+            <button id="btn-analytics-reclassify" type="button" class="btn btn-soft btn-sm" title="Re-run smart category &amp; merchant classification across ledger">Reclassify Ledger</button>
             <button id="btn-analytics-export-numbers" type="button" class="btn btn-soft btn-sm">Export Apple Numbers (.xlsx)</button>
             <button id="btn-analytics-export-csv-pack" type="button" class="btn btn-ghost btn-sm">Export CSV Pack (.zip)</button>
             <button id="btn-analytics-refresh" type="button" class="btn btn-ghost btn-sm">Refresh</button>
@@ -795,8 +805,8 @@
       <section id="analytics-charts-grid" class="two-col section-block">
         <div id="analytics-donut-card" class="card">
           <div class="section-head">
-            <h3>Spending by Category</h3>
-            <span class="muted small">Hover or tap a slice to inspect</span>
+            <h3 id="analytics-donut-heading">Spending by Category</h3>
+            <span class="muted small">Click any slice to drill down</span>
           </div>
           <div id="analytics-donut-wrap" class="svg-stage svg-stage-donut"></div>
           <div id="analytics-donut-legend" class="donut-legend-grid"></div>
@@ -812,6 +822,23 @@
           <div id="analytics-trend-scrub" class="quant-scrub-bar"></div>
           <div id="analytics-trend-wrap" class="svg-stage svg-stage-trend"></div>
         </div>
+      </section>
+
+      <!-- Full Category / Merchant Breakdown & 1-Click Recategorization Drilldown -->
+      <section id="analytics-breakdown-card" class="card section-block">
+        <div class="section-head">
+          <div>
+            <span class="eyebrow">Full Ledger Breakdown</span>
+            <h3 id="analytics-breakdown-title">Spending Breakdown by Category</h3>
+            <span class="muted small">Click any category, Sankey flow, or Donut slice to inspect transactions and save merchant rules.</span>
+          </div>
+          <div class="row-gap wrap">
+            <span id="analytics-drag-badge" class="pill pill-danger hidden"></span>
+            <button id="btn-analytics-open-bridge" type="button" class="btn btn-soft btn-xs hidden">View Paydown Bridge →</button>
+            <span id="analytics-breakdown-count" class="pill pill-soft"></span>
+          </div>
+        </div>
+        <div id="analytics-breakdown-body" class="category-breakdown-list"></div>
       </section>
 
       <!-- Interactive Balance Forecast & Net Worth Timeline -->
@@ -1162,12 +1189,12 @@
                   <option value="spinwheel">Spinwheel (Equifax Score + Liabilities)</option>
                   <option value="array">Array (Experian / Equifax / TransUnion)</option>
                   <option value="crs">CRS Credit API (Experian / Equifax / TransUnion)</option>
-                  <option value="custom">Custom Credit Bridge URL</option>
+                  <option value="custom">Custom Credit Bridge URL (Local / HTTPS)</option>
                 </select>
               </label>
               <label class="field">
                 <span>Display Name (optional)</span>
-                <input id="capi-label" type="text" placeholder="e.g. Equifax Live Pull" maxlength="100" />
+                <input id="capi-label" type="text" placeholder="e.g. Credit Karma + Experian Bridge" maxlength="100" />
               </label>
             </div>
 
@@ -1262,6 +1289,19 @@
           </div>
           <div id="credit-azeo-list" class="stack-sm"></div>
         </div>
+      </section>
+
+      <!-- Financial Drag & Utilization Paydown Bridge -->
+      <section id="credit-drag-bridge-card" class="card section-block">
+        <div class="section-head">
+          <div>
+            <span class="eyebrow">Cash Flow × Credit Bridge</span>
+            <h2>Financial Drag &amp; Utilization Paydown Bridge</h2>
+            <p class="muted small">Connects real ledger interest, FX/ATM fees, and EWA reborrowing churn directly to FICO 8 / 10T &amp; VantageScore utilization cliffs.</p>
+          </div>
+          <span id="credit-drag-bridge-status" class="pill pill-soft">Loading...</span>
+        </div>
+        <div id="credit-drag-bridge-wrap" class="stack-sm"></div>
       </section>
 
       <!-- Debt Payoff Plans -->
@@ -1973,13 +2013,13 @@
               <div id="codex-test-result" class="notice-bar hidden" aria-live="polite"></div>
             </div>
 
-            <!-- Custom Gateway (Ollama / LiteLLM / OpenRouter) -->
+            <!-- Custom Gateway (OMC Wrapper / Ollama / LiteLLM / OpenRouter) -->
             <div class="subpanel stack-sm">
               <div class="item-row">
-                <h3>Custom Local Gateway</h3>
+                <h3>Custom Local Gateway &amp; Agent Wrapper</h3>
                 <span id="wrapper-key-status-badge" class="pill pill-soft">Optional</span>
               </div>
-              <p class="muted small">Connect Ollama, LiteLLM, or another OpenAI-compatible local gateway.</p>
+              <p class="muted small">Connect OMC Provider Wrapper (127.0.0.1:8788/v1), Ollama, LiteLLM, or any OpenAI-compatible gateway. Used by Custom Gateway and any agent switched to Wrapper mode above.</p>
               <form id="wrapper-settings-form" class="stack-sm">
                 <label class="field">
                   <span>Access Key (optional for local servers)</span>
@@ -1988,19 +2028,19 @@
                 <div class="row-gap wrap">
                   <label class="field grow">
                     <span>Gateway URL</span>
-                    <input id="set-wrapper-url" type="url" placeholder="http://127.0.0.1:4000/v1" />
+                    <input id="set-wrapper-url" type="url" placeholder="http://127.0.0.1:8788/v1" />
                   </label>
                   <label class="field">
                     <span>API Style</span>
                     <select id="set-wrapper-wire-api">
-                      <option value="responses">Responses</option>
                       <option value="chat_completions">Chat Completions</option>
+                      <option value="responses">Responses</option>
                     </select>
                   </label>
                 </div>
                 <label class="field">
-                  <span>Model Name</span>
-                  <input id="set-wrapper-model" type="text" placeholder="e.g. qwen2.5 or gpt-4o-mini" />
+                  <span>Default Gateway Model</span>
+                  <input id="set-wrapper-model" type="text" placeholder="e.g. codex:default, agy:gemini-3.8-flash-low, qwen2.5" />
                 </label>
                 <label class="checkbox-row">
                   <input id="set-codex-cli-enabled" type="checkbox" />
@@ -2009,6 +2049,8 @@
                 <div class="row-gap wrap">
                   <button type="submit" class="btn btn-primary btn-sm">Save Gateway</button>
                   <button id="btn-test-wrapper" type="button" class="btn btn-soft btn-sm">Test Gateway</button>
+                  <button id="btn-preset-omc-wrapper" type="button" class="btn btn-ghost btn-xs">Use OMC :8788</button>
+                  <button id="btn-clear-wrapper-key" type="button" class="btn btn-ghost btn-xs">Clear Key</button>
                 </div>
               </form>
               <div id="wrapper-test-result" class="notice-bar hidden" aria-live="polite"></div>
@@ -2054,6 +2096,10 @@
                 <input id="set-expected-paycheck" type="number" step="10" min="0" value="0" placeholder="0 (auto-detect)" />
               </label>
             </div>
+            <label class="checkbox-row">
+              <input id="set-reserve-open-ewa" type="checkbox" checked />
+              <span>Shield unsettled cash advances (Dave, Brigit, EarnIn) in Safe-to-Spend</span>
+            </label>
             <button type="submit" class="btn btn-primary btn-sm">Save Preferences</button>
           </form>
         </div>
@@ -2102,10 +2148,11 @@
             <div class="row-gap wrap">
               <button type="submit" class="btn btn-soft btn-sm">Change Passcode</button>
               <label class="field-inline">
-                <span class="muted small">Auto-lock (min):</span>
-                <input id="set-auto-lock-minutes" type="number" min="1" max="480" value="30" class="input-xs" />
+                <span class="muted small">Auto-lock (min, 0=off):</span>
+                <input id="set-auto-lock-minutes" type="number" min="0" max="10080" value="30" class="input-xs" />
               </label>
               <button id="btn-save-auto-lock" type="button" class="btn btn-ghost btn-sm">Save Timeout</button>
+              <button id="btn-vault-lease-7d" type="button" class="btn btn-primary btn-sm">Keep Unlocked 7d</button>
             </div>
           </form>
         </div>

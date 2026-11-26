@@ -80,6 +80,7 @@ from chronox_finance.models import (
     ProfileSettingsUpdate,
     QuickAddRequest,
     RebalanceTransferRequest,
+    ReclassifyTransactionsRequest,
     RecurringBillCreate,
     RuleCreate,
     RuleGroupCreate,
@@ -94,6 +95,7 @@ from chronox_finance.models import (
     TransactionTagsRequest,
     TransactionUpdate,
     VaultChangePasswordRequest,
+    VaultLeaseRequest,
     VaultRecoverRequest,
     VaultSetupRequest,
     VaultUnlockRequest,
@@ -541,6 +543,14 @@ def create_app(
     def auth_status(request: Request, response: Response):
         token = request.cookies.get(SESSION_COOKIE_NAME, "")
         is_auth = (not enforce_vault_lock and svc.secrets.is_unlocked()) or svc.auth.is_authenticated(token)
+        if (
+            enforce_vault_lock
+            and not is_auth
+            and svc.secrets.has_active_session_lease()
+            and request.headers.get("sec-fetch-site") != "cross-site"
+        ):
+            _set_auth_cookie_and_csrf(response, request)
+            is_auth = True
         status = svc.get_vault_status(authenticated=is_auth)
         if status.csrf_token:
             response.headers[CSRF_HEADER_NAME] = status.csrf_token
@@ -559,7 +569,7 @@ def create_app(
                 "Vault not initialized — create a master password first.",
                 vault_state="needs_setup",
             )
-        if not svc.unlock_vault(req.password):
+        if not svc.unlock_vault(req.password, remember_days=req.remember_days):
             raise HTTPException(status_code=401, detail="Incorrect master password.")
         csrf_tok = _set_auth_cookie_and_csrf(response, request)
         status = svc.get_vault_status(authenticated=True)
@@ -568,6 +578,22 @@ def create_app(
             "authenticated": True,
             "onboarding_completed": status.onboarding_completed,
             "csrf_token": csrf_tok,
+            "status": status.model_dump(),
+        }
+
+    @v1.post("/auth/lease", tags=["Vault & Auth"], dependencies=[Depends(require_auth)])
+    def auth_grant_lease(
+        request: Request,
+        response: Response,
+        req: Annotated[Optional[VaultLeaseRequest], Body()] = None,
+    ) -> Dict[str, Any]:
+        effective = req or VaultLeaseRequest()
+        status = svc.grant_vault_lease(days=effective.days)
+        csrf_tok = _set_auth_cookie_and_csrf(response, request)
+        return {
+            "ok": True,
+            "csrf_token": csrf_tok,
+            "lease_expires_at": status.lease_expires_at,
             "status": status.model_dump(),
         }
 
@@ -717,6 +743,10 @@ def create_app(
     @v1.post("/transactions", tags=["Transactions"], dependencies=[Depends(require_auth)])
     def create_transaction(req: TransactionCreate):
         return svc.create_transaction(req)
+
+    @v1.post("/transactions/reclassify", tags=["Transactions"], dependencies=[Depends(require_auth)])
+    def reclassify_transactions(req: Optional[ReclassifyTransactionsRequest] = None):
+        return svc.reclassify_transactions(req)
 
     @v1.patch("/transactions/{tx_id}", tags=["Transactions"], dependencies=[Depends(require_auth)])
     def update_transaction(tx_id: int, req: TransactionUpdate):
@@ -1084,6 +1114,18 @@ def create_app(
         return svc.get_credit_report(
             extra_monthly_budget_cents=max(0, min(50_000_000, extra_monthly_cents)),
             include_authorized_user=inc_au,
+            include_sandbox=include_sandbox,
+        )
+
+    @v1.get("/credit/drag-bridge", tags=["Credit"], dependencies=[Depends(require_auth)])
+    def get_credit_drag_bridge(
+        extra_monthly_cents: int = 25_000,
+        lookback_days: int = 365,
+        include_sandbox: bool = False,
+    ):
+        return svc.get_drag_utilization_bridge(
+            extra_monthly_budget_cents=max(0, min(50_000_000, extra_monthly_cents)),
+            lookback_days=max(30, min(730, lookback_days)),
             include_sandbox=include_sandbox,
         )
 

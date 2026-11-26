@@ -658,6 +658,24 @@ class OpenCodeCLIClient(_BaseLocalCLIClient):
                     timeout=effective_timeout,
                     stdin_text=combined_prompt if is_real_runtime else None,
                 )
+                if (
+                    proc.returncode != 0
+                    and "--archived" in cmd
+                    and "unrecognized flag" in ((proc.stderr or "") + (proc.stdout or "")).lower()
+                    and "--archived" in ((proc.stderr or "") + (proc.stdout or "")).lower()
+                ):
+                    fallback_cmd = [binary, "run", "--standalone", "--format", "json"]
+                    if target_model:
+                        fallback_cmd.extend(["--model", target_model])
+                    if not is_real_runtime:
+                        fallback_cmd.append(combined_prompt)
+                    proc = run_isolated_cli_subprocess(
+                        fallback_cmd,
+                        cwd=empty_cwd,
+                        env=self._sanitized_env(binary),
+                        timeout=effective_timeout,
+                        stdin_text=combined_prompt if is_real_runtime else None,
+                    )
         except subprocess.TimeoutExpired as exc:
             timeout_msg = f"OpenCode CLI timed out after {effective_timeout:.0f}s."
             self._notify_auth_failure(timeout_msg)
@@ -775,6 +793,12 @@ class ClaudeCLIClient(_BaseLocalCLIClient):
                     "family": "claude",
                     "protocol": "claude_cli",
                     "note": "Balanced Claude Sonnet financial reasoning",
+                },
+                {
+                    "id": "opus",
+                    "family": "claude",
+                    "protocol": "claude_cli",
+                    "note": "Highest-capability Claude Opus analysis",
                 },
             ],
         }
@@ -962,22 +986,93 @@ class AntigravityCLIClient(_BaseLocalCLIClient):
 
     def list_models(self, force_refresh: bool = False) -> Dict[str, Any]:
         binary = self._resolve_binary()
+        curated: List[Dict[str, str]] = [
+            {
+                "id": DEFAULT_AGY_CLI_MODEL,
+                "family": "gemini",
+                "protocol": "agy_cli",
+                "note": "Fast low-effort Gemini Flash route (recommended for interactive coaching)",
+            },
+            {
+                "id": "gemini-3.8-flash-medium",
+                "family": "gemini",
+                "protocol": "agy_cli",
+                "note": "Gemini 3.8 Flash (Medium)",
+            },
+            {
+                "id": "gemini-4-neon-medium",
+                "family": "gemini",
+                "protocol": "agy_cli",
+                "note": "Gemini 4 Neon (Medium)",
+            },
+            {
+                "id": "gemini-4-neon-high",
+                "family": "gemini",
+                "protocol": "agy_cli",
+                "note": "Gemini 4 Neon (High)",
+            },
+            {
+                "id": "claude-sonnet-5-5-medium",
+                "family": "claude",
+                "protocol": "agy_cli",
+                "note": "Claude Sonnet 5.5 via Antigravity",
+            },
+            {
+                "id": "claude-opus-5-5-medium",
+                "family": "claude",
+                "protocol": "agy_cli",
+                "note": "Claude Opus 5.5 via Antigravity",
+            },
+        ]
+        models: List[Dict[str, str]] = list(curated)
+        source = "agy_cli_local" if (self.enabled and binary) else "curated_fallback"
+        if self.enabled and binary and subprocess.run is _REAL_SUBPROCESS_RUN:
+            cache_key = f"agy_models:{binary}"
+            cached_models = None if force_refresh else self._probe_cache.get(cache_key)
+            if isinstance(cached_models, list) and cached_models:
+                models = list(cached_models)
+            else:
+                try:
+                    with tempfile.TemporaryDirectory(prefix="chronox_agy_models_") as empty_cwd:
+                        proc = subprocess.run(  # noqa: S603
+                            [binary, "models"],
+                            cwd=empty_cwd,
+                            stdin=subprocess.DEVNULL,
+                            capture_output=True,
+                            text=True,
+                            timeout=6.0,
+                            env=self._sanitized_env(binary),
+                            check=False,
+                        )
+                    if proc.returncode == 0 and proc.stdout:
+                        parsed: List[Dict[str, str]] = []
+                        seen: set[str] = set()
+                        for line in proc.stdout.splitlines():
+                            stripped = line.strip()
+                            if not stripped or stripped.lower().startswith("fetching"):
+                                continue
+                            parts = stripped.split("\t", 1)
+                            mid = parts[0].strip()
+                            if not mid or mid in seen or not _SAFE_CLI_MODEL_RE.match(mid):
+                                continue
+                            seen.add(mid)
+                            label = parts[1].strip() if len(parts) > 1 else mid
+                            fam = "claude" if mid.startswith("claude") else ("gpt" if mid.startswith("gpt") else "gemini")
+                            parsed.append({"id": mid, "family": fam, "protocol": "agy_cli", "note": label})
+                        if parsed:
+                            models = parsed
+                            self._probe_cache.set(cache_key, list(parsed), ttl_seconds=300)
+                except Exception as exc:
+                    logger.debug("Antigravity live model listing skipped: %s", exc)
         return {
             "live": bool(self.enabled and binary),
-            "source": "agy_cli_local" if (self.enabled and binary) else "curated_fallback",
+            "source": source,
             "provider": self.provider_name,
             "binary_found": bool(binary),
             "binary_path": binary or "",
             "enabled": self.enabled,
             "notice": None if (self.enabled and binary) else "Install Antigravity CLI (`agy`) for zero-config local AI.",
-            "models": [
-                {
-                    "id": DEFAULT_AGY_CLI_MODEL,
-                    "family": "gemini",
-                    "protocol": "agy_cli",
-                    "note": "Fast low-effort Gemini Flash route (recommended for interactive coaching)",
-                },
-            ],
+            "models": models,
         }
 
     def chat_completion(
@@ -1510,8 +1605,60 @@ LOCAL_HTTP_GATEWAY_PROBES: Tuple[Tuple[int, str], ...] = (
     (1234, "LM Studio"),
     (4000, "LiteLLM"),
     (8000, "vLLM / Local Server"),
+    (8788, "OMC Provider Wrapper"),
 )
 DEFAULT_LOCAL_HTTP_GATEWAY_CACHE_TTL_SECONDS = 60
+_WRAPPER_HEALTH_CACHE = _TTLCache(max_items=16)
+
+
+def probe_wrapper_provider_health(
+    base_url: str,
+    *,
+    force_refresh: bool = False,
+    timeout_seconds: float = 0.45,
+    transport: Optional[httpx.BaseTransport] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Query `<origin>/health` on a local chat wrapper (e.g. OMC Provider Wrapper on :8788)
+    to discover per-agent readiness (`codex`, `claude`, `opencode`, `agy`).
+    Returns `{}` if the endpoint is unreachable or not an OMC-style wrapper.
+    """
+    raw = (base_url or "").strip().rstrip("/")
+    if not raw:
+        return {}
+    origin = raw[:-3] if raw.endswith("/v1") else raw
+    cache_key = f"wrap_health:{origin}"
+    if transport is None and not force_refresh:
+        cached = _WRAPPER_HEALTH_CACHE.get(cache_key)
+        if isinstance(cached, dict):
+            return dict(cached)
+
+    probe_timeout = max(0.05, min(3.0, float(timeout_seconds)))
+    client_kwargs: Dict[str, Any] = {"timeout": probe_timeout, "follow_redirects": False}
+    if transport is not None:
+        client_kwargs["transport"] = transport
+
+    result: Dict[str, Dict[str, Any]] = {}
+    try:
+        with httpx.Client(**client_kwargs) as client:
+            resp = client.get(f"{origin}/health")
+            if resp.status_code == 200:
+                payload = resp.json()
+                providers = payload.get("providers") if isinstance(payload, dict) else None
+                if isinstance(providers, dict):
+                    for k, v in providers.items():
+                        if isinstance(v, dict):
+                            result[str(k).strip().lower()] = {
+                                "available": bool(v.get("available")),
+                                "reason_code": str(v.get("reason_code") or ""),
+                                "version": str(v.get("version") or ""),
+                            }
+    except Exception as exc:
+        logger.debug("Wrapper health probe skipped for %s: %s", origin, exc)
+
+    if transport is None:
+        _WRAPPER_HEALTH_CACHE.set(cache_key, dict(result), ttl_seconds=30)
+    return result
 
 
 @dataclass(frozen=True)
@@ -1673,6 +1820,7 @@ __all__ = [
     "get_cli_search_dirs",
     "get_default_local_cli_registry",
     "is_cli_auth_error",
+    "probe_wrapper_provider_health",
     "resolve_cli_binary",
     "sanitize_cli_prompt",
 ]

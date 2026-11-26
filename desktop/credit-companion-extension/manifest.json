@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "ChronoX Credit Companion",
+  "version": "1.1.0",
+  "description": "Zero-config local bridge syncing Credit Karma (TransUnion + Equifax) and Experian into ChronoX Finance.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAshVthZf2ONLgvSQVh3Am6yauYkNew0bQm80Fl3FZ4IE1OJ006URqOiDMnznQurKtUNkkrkisJgJgKrk8mVwPZBtjd25AkAwHQih3hbOzfQmfd7G3f0h19nkETwmZUuTH5fo+BfDMXov/jggXDzsp/mzpn5AicmGgpBxgR+7qvclrZYnoSziqlPTi/a/XoYn+YzKdXc+wIUSCIIodD4/1BNcIV7ngT1HWXq+MnRrWQViDh9UUG77KInvoJhXMFKmzk8E3te/NFd0UKFLNoKyNDi+6cJ6ohtVg3NaplkGKNpXDgs/NDYhhRmwILpI38BEjMm9sPxSvqG6gRuG7Gj+3OQIDAQAB",
+  "permissions": [
+    "nativeMessaging",
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://*.creditkarma.com/*",
+    "https://*.experian.com/*",
+    "http://127.0.0.1:8749/*"
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "action": {
+    "default_title": "ChronoX Credit Companion",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.creditkarma.com/*",
+        "https://creditkarma.com/*",
+        "https://usa.experian.com/*"
+      ],
+      "js": [
+        "extractor.js",
+        "content_script.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

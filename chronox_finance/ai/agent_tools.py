@@ -118,6 +118,8 @@ _JAR_SLUG_ALIASES: Dict[str, str] = {
     "fun": "fun",
     "guilt_free": "fun",
     "guilt-free": "fun",
+    "lifestyle": "fun",
+    "dining & lifestyle": "fun",
     "dining": "fun",
     "coffee": "fun",
     "entertainment": "fun",

@@ -101,7 +101,7 @@ DEFAULT_JARS: List[Dict[str, Any]] = [
     },
     {
         "slug": "fun",
-        "name": "Guilt-Free Fun",
+        "name": "Dining & Lifestyle",
         "kind": JarKind.FUN.value,
         "icon": "bolt",
         "color": "#fbbf24",
@@ -676,6 +676,14 @@ def _ensure_additive_columns(conn: sqlite3.Connection) -> None:
             ("payday_user_configured", "INTEGER NOT NULL DEFAULT 0"),
             ("local_cli_auto_detect", "INTEGER NOT NULL DEFAULT 1"),
             ("safe_invest_cap_cents", "INTEGER"),
+            ("claude_cli_model", "TEXT NOT NULL DEFAULT ''"),
+            ("opencode_cli_model", "TEXT NOT NULL DEFAULT ''"),
+            ("agy_cli_model", "TEXT NOT NULL DEFAULT ''"),
+            ("claude_cli_use_wrapper", "INTEGER NOT NULL DEFAULT 0"),
+            ("opencode_cli_use_wrapper", "INTEGER NOT NULL DEFAULT 0"),
+            ("codex_cli_use_wrapper", "INTEGER NOT NULL DEFAULT 0"),
+            ("agy_cli_use_wrapper", "INTEGER NOT NULL DEFAULT 0"),
+            ("reserve_open_ewa_advances", "INTEGER NOT NULL DEFAULT 1"),
         ],
     )
     conn.execute(
@@ -963,6 +971,11 @@ class FinanceStorage:
                             now,
                         ),
                     )
+            else:
+                conn.execute(
+                    "UPDATE jars SET name = 'Dining & Lifestyle', updated_at = ? WHERE slug = 'fun' AND name = 'Guilt-Free Fun'",
+                    (now,),
+                )
 
             acct_count = conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
             if acct_count == 0:
@@ -1035,6 +1048,7 @@ class FinanceStorage:
             "payday_user_configured",
             "calm_mode",
             "auto_rebalance_enabled",
+            "reserve_open_ewa_advances",
             "onboarding_completed",
             "vault_salt_kek",
             "vault_auto_lock_minutes",
@@ -1053,6 +1067,13 @@ class FinanceStorage:
             "wrapper_wire_api",
             "codex_cli_enabled",
             "codex_cli_model",
+            "claude_cli_model",
+            "opencode_cli_model",
+            "agy_cli_model",
+            "claude_cli_use_wrapper",
+            "opencode_cli_use_wrapper",
+            "codex_cli_use_wrapper",
+            "agy_cli_use_wrapper",
             "local_cli_auto_detect",
             "safe_invest_cap_cents",
             "email_scanner_enabled",
@@ -1072,8 +1093,13 @@ class FinanceStorage:
         for bool_col in (
             "calm_mode",
             "auto_rebalance_enabled",
+            "reserve_open_ewa_advances",
             "onboarding_completed",
             "codex_cli_enabled",
+            "claude_cli_use_wrapper",
+            "opencode_cli_use_wrapper",
+            "codex_cli_use_wrapper",
+            "agy_cli_use_wrapper",
             "local_cli_auto_detect",
             "email_scanner_enabled",
             "income_configured",

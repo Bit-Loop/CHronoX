@@ -424,6 +424,7 @@ class LocalSecretStore:
             self.enc_path = path.with_suffix(".enc")
             self.legacy_path = path
         self.store_path = self.enc_path
+        self.lease_path = self.enc_path.with_name(f"{self.enc_path.stem}.lease.json")
         self._kdf_iterations = max(10_000, int(kdf_iterations))
         self._lock = threading.RLock()
         self._dek: Optional[bytes] = None
@@ -431,10 +432,91 @@ class LocalSecretStore:
         self._ephemeral_data: Dict[str, str] = {}
         self._signing_key: str = secrets.token_urlsafe(48)
         self._csrf_token: str = secrets.token_urlsafe(32)
+        self._lease_expires_at: Optional[int] = None
         self._last_activity: float = time.monotonic()
         self.enc_path.parent.mkdir(parents=True, exist_ok=True)
+        self._restore_session_lease_if_valid()
 
     # --- Vault Lifecycle & State ---
+
+    def _restore_session_lease_if_valid(self) -> None:
+        """Restore an explicit opt-in local session lease (`0600`) if unexpired and valid."""
+        with self._lock:
+            if not self.lease_path.exists() or not self.enc_path.exists():
+                return
+            try:
+                raw = json.loads(self.lease_path.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict) or raw.get("version") != 1:
+                    self.lease_path.unlink(missing_ok=True)
+                    return
+                exp = int(raw.get("expires_at", 0))
+                if exp <= int(time.time()):
+                    self.lease_path.unlink(missing_ok=True)
+                    return
+                dek = _b64d(str(raw["dek_b64"]))
+                if len(dek) != DEK_BYTES:
+                    self.lease_path.unlink(missing_ok=True)
+                    return
+                envelope = self._read_envelope()
+                self._decrypt_payload_with_dek(envelope, dek)
+                signing_key = str(raw.get("signing_key") or "").strip()
+                csrf_token = str(raw.get("csrf_token") or "").strip()
+                self._dek = dek
+                self._ephemeral_mode = False
+                if signing_key:
+                    self._signing_key = signing_key
+                if csrf_token:
+                    self._csrf_token = csrf_token
+                self._lease_expires_at = exp
+                self._last_activity = time.monotonic()
+            except Exception:
+                self.lease_path.unlink(missing_ok=True)
+
+    def grant_session_lease(self, ttl_seconds: int = SESSION_TTL_SECONDS) -> int:
+        """
+        Persist an explicit opt-in local machine session lease (`0600`) for `ttl_seconds`
+        (up to 7 days) so local dev/TDD restarts remain unlocked until expiry or `lock()`.
+        """
+        bounded_ttl = max(60, min(int(ttl_seconds), SESSION_TTL_SECONDS))
+        with self._lock:
+            if self._dek is None or self._ephemeral_mode or not self.enc_path.exists():
+                raise VaultLockedError("Vault must be unlocked to grant a session lease")
+            exp = int(time.time()) + bounded_ttl
+            lease_obj = {
+                "version": 1,
+                "dek_b64": _b64e(self._dek),
+                "signing_key": self._signing_key,
+                "csrf_token": self._csrf_token,
+                "expires_at": exp,
+            }
+            _atomic_write_fsync(
+                self.lease_path,
+                json.dumps(lease_obj, indent=2, sort_keys=True).encode("utf-8"),
+            )
+            self._lease_expires_at = exp
+            self._last_activity = time.monotonic()
+            return exp
+
+    def revoke_session_lease(self) -> None:
+        """Delete any persisted local session lease from disk immediately."""
+        with self._lock:
+            self._lease_expires_at = None
+            if self.lease_path.exists():
+                self.lease_path.unlink(missing_ok=True)
+
+    def get_session_lease_expires_at(self) -> Optional[int]:
+        """Return UTC epoch timestamp when the active session lease expires, or None."""
+        with self._lock:
+            if self._lease_expires_at is None:
+                return None
+            if self._lease_expires_at <= int(time.time()):
+                self.revoke_session_lease()
+                return None
+            return self._lease_expires_at
+
+    def has_active_session_lease(self) -> bool:
+        with self._lock:
+            return self._dek is not None and self.get_session_lease_expires_at() is not None
 
     def is_initialized(self) -> bool:
         with self._lock:
@@ -462,10 +544,14 @@ class LocalSecretStore:
 
     def check_idle_lock(self, auto_lock_minutes: int) -> bool:
         """Lock vault if idle beyond `auto_lock_minutes` (0 disables idle auto-lock)."""
-        if auto_lock_minutes <= 0:
-            return False
         with self._lock:
             if self._dek is None:
+                return False
+            # If an explicit multi-day session lease was active and has now expired, enforce lock
+            if self._lease_expires_at is not None and self._lease_expires_at <= int(time.time()):
+                self.lock()
+                return True
+            if auto_lock_minutes <= 0:
                 return False
             if (time.monotonic() - self._last_activity) >= float(auto_lock_minutes) * 60.0:
                 self.lock()
@@ -739,6 +825,7 @@ class LocalSecretStore:
                 verify_recovery_canonical=verify_rec,
             )
 
+            self.revoke_session_lease()
             self._dek = dek
             self._ephemeral_mode = False
             self._signing_key = secrets.token_urlsafe(48)
@@ -774,6 +861,7 @@ class LocalSecretStore:
                 verify_password=new_password,
             )
 
+            self.revoke_session_lease()
             self._dek = dek
             self._signing_key = secrets.token_urlsafe(48)
             self._csrf_token = secrets.token_urlsafe(32)
@@ -781,10 +869,12 @@ class LocalSecretStore:
 
     def lock(self) -> None:
         """
-        Lock the vault, drop in-memory DEK reference (best-effort — Python cannot
-        guarantee immediate physical RAM wipe), and rotate signing & CSRF keys.
+        Lock the vault, revoke any persisted session lease, drop in-memory DEK reference
+        (best-effort — Python cannot guarantee immediate physical RAM wipe), and rotate
+        signing & CSRF keys.
         """
         with self._lock:
+            self.revoke_session_lease()
             self._dek = None
             self._ephemeral_data.clear()
             self._signing_key = secrets.token_urlsafe(48)

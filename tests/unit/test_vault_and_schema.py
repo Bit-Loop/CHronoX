@@ -706,3 +706,64 @@ def test_new_v2_tables_crud_and_sanitized_backup_roundtrip():
     assert len(storage2.list_scenarios()) == 1
     storage.close()
     storage2.close()
+
+
+def test_opt_in_7day_session_lease_across_restarts_and_lock_revocation(tmp_path: Path):
+    from fastapi.testclient import TestClient
+
+    from chronox_finance.api import create_app
+    from chronox_finance.security import CSRF_HEADER_NAME
+    from chronox_finance.service import FinanceService
+
+    db_file = tmp_path / "lease.sqlite3"
+    sec_file = tmp_path / "secrets.enc"
+    svc1 = FinanceService(db_path=db_file, secret_store_path=sec_file, kdf_iterations=20_000)
+    try:
+        app1 = create_app(db_path=db_file, service=svc1, enforce_vault_lock=True)
+        client1 = TestClient(app1)
+
+        setup_r = client1.post("/api/v1/auth/setup", json={"password": "WeekLongDev!2026"})
+        assert setup_r.status_code == 200
+        csrf = setup_r.json()["csrf_token"]
+
+        # Default setup does NOT write a session lease file
+        assert not svc1.secrets.lease_path.exists()
+
+        # Explicitly grant 7-day lease via /api/v1/auth/lease
+        lease_r = client1.post(
+            "/api/v1/auth/lease",
+            json={"days": 7},
+            headers={CSRF_HEADER_NAME: csrf},
+        )
+        assert lease_r.status_code == 200
+        assert svc1.secrets.lease_path.exists()
+        assert lease_r.json()["status"]["auto_lock_minutes"] == 10080
+        svc1.secrets.set("test_key", "persisted-across-tdd-restart")
+    finally:
+        svc1.close()
+
+    # Simulate process/Electron restart on a brand-new FinanceService instance:
+    svc2 = FinanceService(db_path=db_file, secret_store_path=sec_file, kdf_iterations=20_000)
+    try:
+        assert svc2.secrets.vault_state() == "unlocked"
+        assert svc2.secrets.has_active_session_lease() is True
+        assert svc2.secrets.get("test_key") == "persisted-across-tdd-restart"
+
+        # Fresh browser/Electron window hitting GET /api/v1/auth/status auto-authenticates
+        app2 = create_app(db_path=db_file, service=svc2, enforce_vault_lock=True)
+        client2 = TestClient(app2)
+        st_r = client2.get("/api/v1/auth/status")
+        assert st_r.status_code == 200
+        assert st_r.json()["authenticated"] is True
+        assert client2.get("/api/v1/dashboard").status_code == 200
+
+        # Explicit Lock immediately wipes lease file and locks vault
+        out_r = client2.post(
+            "/api/v1/auth/logout",
+            headers={CSRF_HEADER_NAME: st_r.json()["csrf_token"]},
+        )
+        assert out_r.status_code == 200
+        assert not svc2.secrets.lease_path.exists()
+        assert svc2.secrets.vault_state() == "locked"
+    finally:
+        svc2.close()

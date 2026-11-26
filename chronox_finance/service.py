@@ -59,12 +59,14 @@ from chronox_finance.ai.gemini_client import (
 )
 from chronox_finance.ai.harness import FinancialAIHarness
 from chronox_finance.ai.local_cli_clients import (
+    _SAFE_CLI_MODEL_RE,
     LOCAL_CLI_PRIORITY,
     LOCAL_CLI_SPECS,
     LocalCLIRegistry,
     LocalHTTPGatewayInfo,
     detect_local_http_gateways,
     get_default_local_cli_registry,
+    probe_wrapper_provider_health,
 )
 from chronox_finance.ai.opencode_client import (
     DEFAULT_OPENCODE_GO_BASE_URL,
@@ -109,7 +111,11 @@ from chronox_finance.engines.analytics import (
     simulate_scenario as run_scenario_simulation,
 )
 from chronox_finance.engines.autobudget import AutoBudgetEngine, AutoBudgetResult, current_cycle_ym
-from chronox_finance.engines.categorizer import TransactionCategorizer, normalize_merchant
+from chronox_finance.engines.categorizer import (
+    TransactionCategorizer,
+    is_raw_provider_category,
+    normalize_merchant,
+)
 from chronox_finance.engines.credit_debt import CreditDebtOptimizer
 from chronox_finance.engines.exporter import (
     ExportArtifact,
@@ -170,6 +176,7 @@ from chronox_finance.models import (
     CreditReportCreate,
     CreditReportOut,
     DashboardResponse,
+    DragUtilizationBridge,
     EmailConfigOut,
     EmailConfigUpdate,
     EmailQueueItem,
@@ -207,6 +214,8 @@ from chronox_finance.models import (
     QuantForecastReport,
     QuickAddRequest,
     RebalanceTransferRequest,
+    ReclassifyTransactionsOut,
+    ReclassifyTransactionsRequest,
     RecurringBillCreate,
     RuleCreate,
     RuleGroupCreate,
@@ -534,6 +543,7 @@ class FinanceService:
             authenticated=bool(authenticated and unlocked),
             onboarding_completed=bool(settings.get("onboarding_completed", 0)),
             auto_lock_minutes=int(settings.get("vault_auto_lock_minutes", 30)),
+            lease_expires_at=self.secrets.get_session_lease_expires_at() if unlocked else None,
             csrf_token=self.secrets.get_csrf_token(),
             recovery_configured=self.secrets.is_initialized(),
             db_encrypted_at_rest=False,
@@ -552,13 +562,31 @@ class FinanceService:
             migrated_legacy_secrets=bool(res["migrated_legacy_secrets"]),
         )
 
-    def unlock_vault(self, password: str) -> bool:
+    def unlock_vault(self, password: str, *, remember_days: int = 0) -> bool:
         ok = self.secrets.unlock(password)
         if ok:
             self._plaid_stop_event.clear()
-            self.storage.log_budget_event("security", "Local vault unlocked")
+            if remember_days > 0:
+                bounded_days = max(1, min(7, int(remember_days)))
+                self.secrets.grant_session_lease(ttl_seconds=bounded_days * 86400)
+                self.storage.update_settings({"vault_auto_lock_minutes": bounded_days * 1440})
+                self.storage.log_budget_event(
+                    "security", f"Local vault unlocked with {bounded_days}-day local session lease"
+                )
+            else:
+                self.storage.log_budget_event("security", "Local vault unlocked")
             self._resume_plaid_background_syncs_if_any()
         return ok
+
+    def grant_vault_lease(self, days: int = 7) -> VaultStatus:
+        self._require_vault_unlocked()
+        bounded_days = max(1, min(7, int(days)))
+        self.secrets.grant_session_lease(ttl_seconds=bounded_days * 86400)
+        self.storage.update_settings({"vault_auto_lock_minutes": bounded_days * 1440})
+        self.storage.log_budget_event(
+            "security", f"Granted {bounded_days}-day local vault session lease"
+        )
+        return self.get_vault_status(authenticated=True)
 
     def recover_vault(self, req: VaultRecoverRequest) -> VaultRecoverResponse:
         new_rec = self.secrets.recover(
@@ -761,19 +789,79 @@ class FinanceService:
         s = settings if settings is not None else self.storage.get_settings()
         return bool(s.get("local_cli_auto_detect", 1))
 
+    def _resolve_wrapper_base_url(self, settings: Optional[Dict[str, Any]] = None) -> str:
+        s = settings if settings is not None else self.storage.get_settings()
+        return (s.get("wrapper_base_url") or os.getenv("CHRONOX_WRAPPER_BASE_URL") or "").strip()
+
+    def _local_cli_model_setting(self, provider_id: str, settings: Dict[str, Any]) -> str:
+        key_map = {
+            "claude_cli": "claude_cli_model",
+            "opencode_cli": "opencode_cli_model",
+            "codex_cli": "codex_cli_model",
+            "agy_cli": "agy_cli_model",
+        }
+        col = key_map.get(provider_id, "")
+        return str(settings.get(col) or "").strip() if col else ""
+
+    def _local_cli_use_wrapper_setting(self, provider_id: str, settings: Dict[str, Any]) -> bool:
+        key_map = {
+            "claude_cli": "claude_cli_use_wrapper",
+            "opencode_cli": "opencode_cli_use_wrapper",
+            "codex_cli": "codex_cli_use_wrapper",
+            "agy_cli": "agy_cli_use_wrapper",
+        }
+        col = key_map.get(provider_id, "")
+        return bool(settings.get(col, 0)) if col else False
+
+    @staticmethod
+    def _wrapper_prefix_for_agent(provider_id: str) -> str:
+        return {
+            "claude_cli": "claude",
+            "opencode_cli": "opencode",
+            "codex_cli": "codex",
+            "agy_cli": "agy",
+        }.get(provider_id, "")
+
+    def _format_agent_wrapper_model(self, provider_id: str, raw_model: str) -> str:
+        prefix = self._wrapper_prefix_for_agent(provider_id)
+        cleaned = (raw_model or "").strip()
+        if not prefix:
+            return cleaned or DEFAULT_WRAPPER_MODEL
+        lower = cleaned.lower()
+        if any(lower.startswith(f"{p}:") for p in ("codex", "claude", "opencode", "agy", "antigravity")):
+            return cleaned
+        if not cleaned:
+            spec_default = str(LOCAL_CLI_SPECS.get(provider_id, {}).get("default_model") or "").strip()
+            cleaned = spec_default or "default"
+        return f"{prefix}:{cleaned}"
+
     def _build_local_cli_client(
         self,
         provider_id: str,
         *,
         enabled: bool = True,
         settings: Optional[Dict[str, Any]] = None,
+        force_direct_cli: bool = False,
     ) -> LLMClient:
         s = settings if settings is not None else self.storage.get_settings()
-        model_override: Optional[str] = None
-        if provider_id == "codex_cli":
-            raw_m = str(s.get("codex_cli_model") or "").strip()
-            if raw_m:
-                model_override = raw_m
+        raw_m = self._local_cli_model_setting(provider_id, s)
+        model_override: Optional[str] = raw_m or None
+
+        if not force_direct_cli and enabled and self._local_cli_use_wrapper_setting(provider_id, s):
+            raw_base = self._resolve_wrapper_base_url(s)
+            if raw_base:
+                wire = str(s.get("wrapper_wire_api") or "chat_completions").strip().lower()
+                if wire not in ("responses", "chat_completions"):
+                    wire = "chat_completions"
+                return CodexResponsesClient(
+                    api_key=self._resolve_wrapper_api_key(),
+                    base_url=raw_base,
+                    model=self._format_agent_wrapper_model(provider_id, raw_m),
+                    provider_name=provider_id,
+                    wire_api=wire,  # type: ignore[arg-type]
+                    transport=self._wrapper_transport,
+                )
+
         return self._local_cli_registry.build_client(
             provider_id,
             model=model_override,
@@ -825,14 +913,29 @@ class FinanceService:
                 ordered.append(auto_gw)
 
         if self._is_local_cli_auto_detect_enabled(settings):
-            custom_codex_model = str(settings.get("codex_cli_model") or "").strip()
+            seen_cli_pids: set[str] = set()
             for cli_client in self._local_cli_registry.get_failover_clients(
                 run_auth_probe=False, include_cooldown=False
             ):
-                if getattr(cli_client, "provider_name", "") == "codex_cli" and custom_codex_model:
-                    cli_client = self._build_local_cli_client("codex_cli", enabled=True, settings=settings)
+                pid = str(getattr(cli_client, "provider_name", "") or "")
+                if pid in LOCAL_CLI_SPECS:
+                    seen_cli_pids.add(pid)
+                    has_custom_model = bool(self._local_cli_model_setting(pid, settings))
+                    has_wrapper = bool(
+                        self._local_cli_use_wrapper_setting(pid, settings)
+                        and self._resolve_wrapper_base_url(settings)
+                    )
+                    if has_custom_model or has_wrapper:
+                        cli_client = self._build_local_cli_client(pid, enabled=True, settings=settings)
                 if cli_client.is_configured:
                     ordered.append(cli_client)
+            # Also include any agent explicitly routed via wrapper whose direct CLI wasn't installed
+            if self._resolve_wrapper_base_url(settings):
+                for pid in LOCAL_CLI_PRIORITY:
+                    if pid not in seen_cli_pids and self._local_cli_use_wrapper_setting(pid, settings):
+                        w_client = self._build_local_cli_client(pid, enabled=True, settings=settings)
+                        if w_client.is_configured:
+                            ordered.append(w_client)
         elif bool(settings.get("codex_cli_enabled", 0)):
             if not self._local_cli_registry.is_auth_failed("codex_cli"):
                 c = self._build_local_cli_client("codex_cli", enabled=True, settings=settings)
@@ -913,7 +1016,7 @@ class FinanceService:
         return labels.get((provider_id or "none").strip().lower(), provider_id or "Local Quant Engine")
 
     def get_local_clis(self, *, probe: bool = False) -> Dict[str, Any]:
-        """Discover installed local AI CLIs and report active auto-detection state."""
+        """Discover installed local AI CLIs and report active auto-detection & wrapper state."""
         settings = self.storage.get_settings()
         auto_detect = self._is_local_cli_auto_detect_enabled(settings)
         statuses = self._local_cli_registry.list_detected_clis(
@@ -923,21 +1026,79 @@ class FinanceService:
         )
         active = self.resolve_active_provider()
         active_label = self._provider_display_label(active)
+        wrapper_url = self._resolve_wrapper_base_url(settings)
+        wrapper_health = (
+            probe_wrapper_provider_health(
+                wrapper_url,
+                force_refresh=bool(probe),
+                transport=self._wrapper_transport,
+            )
+            if wrapper_url
+            else {}
+        )
         clis: List[Dict[str, Any]] = []
         for st in statuses:
             d = st.to_dict()
+            pid = str(d["provider_id"])
+            prefix = self._wrapper_prefix_for_agent(pid)
+            selected_model = self._local_cli_model_setting(pid, settings)
+            use_wrapper = self._local_cli_use_wrapper_setting(pid, settings)
+            w_info = wrapper_health.get(prefix, {}) if prefix else {}
+            wrapper_ready = bool(wrapper_url and (w_info.get("available") if w_info else True))
+            transport = "wrapper" if (use_wrapper and wrapper_url) else "cli"
+
+            available_models: List[Dict[str, str]] = []
+            try:
+                direct_cli = self._build_local_cli_client(pid, enabled=True, settings=settings, force_direct_cli=True)
+                raw_models = direct_cli.list_models(force_refresh=bool(probe)).get("models") or []
+                available_models = [
+                    {
+                        "id": str(m.get("id") or ""),
+                        "note": str(m.get("note") or m.get("family") or m.get("id") or "Default"),
+                    }
+                    for m in raw_models
+                    if isinstance(m, dict)
+                ]
+            except Exception:
+                available_models = []
+
+            installed = bool(d["installed"]) or (transport == "wrapper" and bool(wrapper_url))
+            auth_ready = d["auth_ready"]
+            status_detail = d["status_detail"]
+            if transport == "wrapper":
+                routed_model = self._format_agent_wrapper_model(pid, selected_model)
+                if w_info:
+                    auth_ready = bool(w_info.get("available"))
+                    if auth_ready:
+                        status_detail = f"Via Wrapper ({wrapper_url}) · {routed_model}"
+                    else:
+                        reason = w_info.get("reason_code") or "wrapper provider unavailable"
+                        status_detail = f"Wrapper auth needed ({reason}) · {wrapper_url}"
+                else:
+                    auth_ready = True if wrapper_url else False
+                    status_detail = f"Via Wrapper ({wrapper_url}) · {routed_model}"
+            elif selected_model and installed and status_detail.startswith("Installed"):
+                status_detail = f"{status_detail} · model {selected_model}"
+
             clis.append(
                 {
-                    "provider_id": d["provider_id"],
+                    "provider_id": pid,
                     "display_name": d["display_name"],
-                    "installed": bool(d["installed"]),
-                    "auth_ready": d["auth_ready"],
-                    "binary_path": d["binary_path"],
+                    "installed": installed,
+                    "auth_ready": auth_ready,
+                    "binary_path": wrapper_url if transport == "wrapper" else d["binary_path"],
                     "version": d["version"],
-                    "status_detail": d["status_detail"],
-                    "is_active": bool(d["provider_id"] == active),
+                    "status_detail": status_detail,
+                    "is_active": bool(pid == active),
                     "default_model": d.get("default_model", ""),
-                    "in_cooldown": bool(d.get("in_cooldown", False)),
+                    "selected_model": selected_model,
+                    "use_wrapper": use_wrapper,
+                    "transport": transport,
+                    "wrapper_ready": wrapper_ready,
+                    "wrapper_base_url": wrapper_url,
+                    "wrapper_provider_prefix": prefix,
+                    "available_models": available_models,
+                    "in_cooldown": False if transport == "wrapper" else bool(d.get("in_cooldown", False)),
                 }
             )
         if auto_detect:
@@ -955,6 +1116,13 @@ class FinanceService:
                         "status_detail": f"Auto-detected at {gw_hit.base_url} · {gw_hit.model}",
                         "is_active": bool(active == "chat_wrapper"),
                         "default_model": gw_hit.model,
+                        "selected_model": settings.get("wrapper_model", "") or gw_hit.model,
+                        "use_wrapper": True,
+                        "transport": "wrapper",
+                        "wrapper_ready": True,
+                        "wrapper_base_url": gw_hit.base_url,
+                        "wrapper_provider_prefix": "",
+                        "available_models": [],
                         "in_cooldown": False,
                     },
                 )
@@ -1002,7 +1170,11 @@ class FinanceService:
         gem_model = settings.get("gemini_model", DEFAULT_GEMINI_MODEL)
         codex_model = settings.get("codex_model", DEFAULT_CODEX_MODEL)
         wrap_model = settings.get("wrapper_model", "") or DEFAULT_WRAPPER_MODEL
+        wrap_url = self._resolve_wrapper_base_url(settings) or DEFAULT_WRAPPER_BASE_URL
         cli_model = settings.get("codex_cli_model", "") or DEFAULT_CODEX_CLI_MODEL
+        claude_cli_m = settings.get("claude_cli_model", "") or str(LOCAL_CLI_SPECS["claude_cli"]["default_model"] or "default")
+        opencode_cli_m = settings.get("opencode_cli_model", "") or str(LOCAL_CLI_SPECS["opencode_cli"]["default_model"] or "default")
+        agy_cli_m = settings.get("agy_cli_model", "") or str(LOCAL_CLI_SPECS["agy_cli"]["default_model"] or "gemini-3.8-flash-low")
 
         label_map: Dict[str, Tuple[str, str, str, str]] = {
             "opencode_go": (
@@ -1027,31 +1199,31 @@ class FinanceService:
                 "Durable Chat-Wrapper",
                 wrap_model,
                 mask_secret(wrap_key),
-                settings.get("wrapper_base_url", "") or DEFAULT_WRAPPER_BASE_URL,
+                wrap_url,
             ),
             "codex_cli": (
-                "Codex CLI",
-                cli_model,
-                "",
-                "local://codex-cli",
+                "Codex (Wrapper)" if self._local_cli_use_wrapper_setting("codex_cli", settings) else "Codex CLI",
+                cli_model or "default",
+                mask_secret(wrap_key) if self._local_cli_use_wrapper_setting("codex_cli", settings) else "",
+                wrap_url if self._local_cli_use_wrapper_setting("codex_cli", settings) else "local://codex-cli",
             ),
             "opencode_cli": (
-                "OpenCode CLI",
-                str(LOCAL_CLI_SPECS["opencode_cli"]["default_model"] or "default"),
-                "",
-                "local://opencode-cli",
+                "OpenCode (Wrapper)" if self._local_cli_use_wrapper_setting("opencode_cli", settings) else "OpenCode CLI",
+                opencode_cli_m,
+                mask_secret(wrap_key) if self._local_cli_use_wrapper_setting("opencode_cli", settings) else "",
+                wrap_url if self._local_cli_use_wrapper_setting("opencode_cli", settings) else "local://opencode-cli",
             ),
             "claude_cli": (
-                "Claude Code CLI",
-                str(LOCAL_CLI_SPECS["claude_cli"]["default_model"] or "default"),
-                "",
-                "local://claude-cli",
+                "Claude (Wrapper)" if self._local_cli_use_wrapper_setting("claude_cli", settings) else "Claude Code CLI",
+                claude_cli_m,
+                mask_secret(wrap_key) if self._local_cli_use_wrapper_setting("claude_cli", settings) else "",
+                wrap_url if self._local_cli_use_wrapper_setting("claude_cli", settings) else "local://claude-cli",
             ),
             "agy_cli": (
-                "Antigravity CLI",
-                str(LOCAL_CLI_SPECS["agy_cli"]["default_model"] or "gemini-3.8-flash-low"),
-                "",
-                "local://agy-cli",
+                "Antigravity (Wrapper)" if self._local_cli_use_wrapper_setting("agy_cli", settings) else "Antigravity CLI",
+                agy_cli_m,
+                mask_secret(wrap_key) if self._local_cli_use_wrapper_setting("agy_cli", settings) else "",
+                wrap_url if self._local_cli_use_wrapper_setting("agy_cli", settings) else "local://agy-cli",
             ),
         }
         if active in label_map:
@@ -1808,6 +1980,7 @@ class FinanceService:
         tx_date: str,
         jar_id: Optional[int] = None,
         subcategory: str = "",
+        raw_category: str = "",
         memo: str = "",
         source: str = "manual",
         deduplicate: bool = False,
@@ -1828,9 +2001,13 @@ class FinanceService:
             jars_by_slug = {j["slug"]: j for j in self.storage.list_jars()}
             learned = self.storage.get_merchant_rules()
             jar_id, auto_sub, confidence, needs_review = self.categorizer.categorize(
-                merchant, memo, jars_by_slug, learned
+                merchant,
+                memo,
+                jars_by_slug,
+                learned,
+                raw_category=raw_category or subcategory,
             )
-            if not subcategory:
+            if not subcategory or is_raw_provider_category(subcategory):
                 subcategory = auto_sub
         elif tx_type == TransactionType.INCOME.value:
             jar_id = None
@@ -1988,6 +2165,84 @@ class FinanceService:
 
         self.run_self_updating_sync(reason=f"Updated transaction #{tx_id}")
         return self._to_tx_out(updated)
+
+    def reclassify_transactions(
+        self, req: Optional[ReclassifyTransactionsRequest] = None
+    ) -> ReclassifyTransactionsOut:
+        """
+        Retroactively re-run the PFC + merchant categorizer across unsplit expense
+        transactions while preserving user-learned merchant rules (`merchant_rules`).
+        """
+        preserve_learned = True if req is None else bool(req.preserve_learned)
+        jars_by_slug = {j["slug"]: j for j in self.storage.list_jars()}
+        learned_rules = self.storage.get_merchant_rules() if preserve_learned else {}
+
+        with self.storage.transaction(immediate=True) as conn:
+            split_parent_ids = {
+                int(r[0])
+                for r in conn.execute("SELECT DISTINCT parent_tx_id FROM transaction_splits").fetchall()
+            }
+            expense_rows = conn.execute(
+                "SELECT id, jar_id, amount_cents, merchant, normalized_merchant, subcategory, memo, confidence, needs_review "
+                "FROM transactions WHERE tx_type = 'expense' ORDER BY id ASC"
+            ).fetchall()
+
+            reclassified_count = 0
+            total_scanned = 0
+            by_category: Dict[str, int] = {}
+
+            for r in expense_rows:
+                tx_id = int(r["id"])
+                if tx_id in split_parent_ids:
+                    continue
+                total_scanned += 1
+                merchant = str(r["merchant"] or "")
+                norm = str(r["normalized_merchant"] or "") or normalize_merchant(merchant)
+                memo = str(r["memo"] or "")
+                old_subcat = str(r["subcategory"] or "")
+                old_jar_id = int(r["jar_id"]) if r["jar_id"] is not None else None
+                old_rev = int(r["needs_review"] or 0)
+                amt = int(r["amount_cents"] or 0)
+
+                if preserve_learned and norm in learned_rules:
+                    rule = learned_rules[norm]
+                    target_jar_id = int(rule["jar_id"])
+                    learned_sub = str(rule.get("subcategory") or "")
+                    target_sub = learned_sub or old_subcat or "Learned"
+                    by_category[target_sub] = by_category.get(target_sub, 0) + amt
+                    if old_jar_id != target_jar_id or (learned_sub and old_subcat != learned_sub) or old_rev != 0:
+                        conn.execute(
+                            "UPDATE transactions SET jar_id = ?, subcategory = ?, confidence = 0.99, needs_review = 0 WHERE id = ?",
+                            (target_jar_id, target_sub, tx_id),
+                        )
+                        reclassified_count += 1
+                    continue
+
+                new_jar_id, new_subcat, new_conf, new_rev = self.categorizer.categorize(
+                    merchant,
+                    memo,
+                    jars_by_slug,
+                    learned_rules,
+                    raw_category=old_subcat,
+                )
+                by_category[new_subcat] = by_category.get(new_subcat, 0) + amt
+                new_rev_int = int(bool(new_rev))
+                if new_jar_id != old_jar_id or new_subcat != old_subcat or new_rev_int != old_rev:
+                    conn.execute(
+                        "UPDATE transactions SET jar_id = ?, subcategory = ?, confidence = ?, needs_review = ? WHERE id = ?",
+                        (new_jar_id, new_subcat, float(new_conf), new_rev_int, tx_id),
+                    )
+                    reclassified_count += 1
+
+        if reclassified_count > 0:
+            self.run_self_updating_sync(reason=f"Reclassified {reclassified_count} transactions")
+
+        ordered_by_cat = dict(sorted(by_category.items(), key=lambda kv: kv[1], reverse=True))
+        return ReclassifyTransactionsOut(
+            reclassified_count=reclassified_count,
+            total_scanned=total_scanned,
+            by_category=ordered_by_cat,
+        )
 
     def delete_transaction(self, tx_id: int) -> bool:
         deleted = self.storage.delete_transaction(tx_id)
@@ -3101,6 +3356,7 @@ class FinanceService:
                 merchant=ntx.merchant,
                 memo=ntx.memo,
                 subcategory=ntx.subcategory,
+                raw_category=ntx.raw_category,
                 tx_date=ntx.tx_date,
                 source=source_tag,
                 deduplicate=True,
@@ -3175,7 +3431,22 @@ class FinanceService:
                 "fingerprint": fp,
                 "transfer_direction": ntx.transfer_direction,
             }
-            if ntx.subcategory:
+            if ntx.tx_type == TransactionType.EXPENSE.value and (ntx.raw_category or ntx.subcategory):
+                learned = self.storage.get_merchant_rules()
+                if norm not in learned:
+                    jars_by_slug = {j["slug"]: j for j in self.storage.list_jars()}
+                    jar_id, auto_sub, conf, needs_rev = self.categorizer.categorize(
+                        ntx.merchant,
+                        ntx.memo,
+                        jars_by_slug,
+                        learned,
+                        raw_category=ntx.raw_category or ntx.subcategory,
+                    )
+                    upd["jar_id"] = jar_id
+                    upd["subcategory"] = auto_sub
+                    upd["confidence"] = conf
+                    upd["needs_review"] = int(bool(needs_rev))
+            elif ntx.subcategory:
                 upd["subcategory"] = ntx.subcategory
             after = self.storage.update_transaction(tx_id, upd)
             if after:
@@ -4251,10 +4522,13 @@ class FinanceService:
         *,
         include_authorized_user: bool = True,
         include_sandbox: bool = False,
+        lookback_days: int = 365,
         today: Optional[date] = None,
     ) -> CreditOptimizationReport:
         ref = today or date.today()
         budget = self._compute_budget(today=ref)
+        start_iso = (ref - timedelta(days=max(30, min(730, int(lookback_days))) - 1)).isoformat()
+        recent_txs = self.storage.list_transactions(limit=None, start_date=start_iso)
         return self.credit_optimizer.analyze(
             raw_lines=self.storage.list_credit_lines(active_only=True, include_sandbox=include_sandbox),
             smoothed_monthly_income_cents=budget.smoothed_monthly_income_cents,
@@ -4262,9 +4536,28 @@ class FinanceService:
             credit_reports=self.storage.list_credit_reports(include_sandbox=include_sandbox),
             credit_inquiries=self.storage.list_credit_inquiries(include_sandbox=include_sandbox),
             credit_derogatories=self.storage.list_credit_derogatories(active_only=False, include_sandbox=include_sandbox),
+            transactions=recent_txs,
+            lookback_days=lookback_days,
             include_authorized_user=include_authorized_user,
             today=ref,
         )
+
+    def get_drag_utilization_bridge(
+        self,
+        *,
+        extra_monthly_budget_cents: int = 25_000,
+        lookback_days: int = 365,
+        include_sandbox: bool = False,
+        today: Optional[date] = None,
+    ) -> DragUtilizationBridge:
+        rep = self.get_credit_report(
+            extra_monthly_budget_cents=extra_monthly_budget_cents,
+            include_sandbox=include_sandbox,
+            lookback_days=lookback_days,
+            today=today,
+        )
+        assert rep.drag_bridge is not None
+        return rep.drag_bridge
 
     def create_credit_line(self, req: CreditLineCreate) -> Dict[str, Any]:
         data = req.model_dump()
@@ -7345,7 +7638,10 @@ class FinanceService:
 
     def list_ai_models(self, provider: str = "auto", force_refresh: bool = False) -> Dict[str, Any]:
         target = self._resolve_target_provider(provider)
-        client = self._get_client_by_provider(target, force_enable_local_clis=(target in LOCAL_CLI_SPECS))
+        if target in LOCAL_CLI_SPECS:
+            client = self._build_local_cli_client(target, enabled=True, force_direct_cli=True)
+        else:
+            client = self._get_client_by_provider(target, force_enable_local_clis=False)
         res = dict(client.list_models(force_refresh=force_refresh))
         res.setdefault("provider", target)
         return res
@@ -7354,8 +7650,33 @@ class FinanceService:
         target = self._resolve_target_provider(provider)
         is_local_cli = target in LOCAL_CLI_SPECS
         client = self._get_client_by_provider(target, force_enable_local_clis=is_local_cli)
+        routed_via_wrapper = is_local_cli and isinstance(client, CodexResponsesClient)
         t0 = time.perf_counter()
-        if is_local_cli:
+        if routed_via_wrapper:
+            try:
+                probe = client.chat_completion(
+                    system_prompt="Reply with ONLY the word OK.",
+                    user_prompt="OK",
+                    max_tokens=16,
+                    temperature=0.0,
+                    use_cache=False,
+                    prepend_static_prefix=False,
+                )
+                raw_res: Dict[str, Any] = {
+                    "ok": True,
+                    "provider": target,
+                    "model": probe.model,
+                    "latency_ms": probe.latency_ms,
+                    "message": f"Connected via Wrapper ({client.base_url}) · {probe.model}.",
+                }
+            except Exception as exc:
+                raw_res = {
+                    "ok": False,
+                    "provider": target,
+                    "model": getattr(client, "model", ""),
+                    "message": str(exc),
+                }
+        elif is_local_cli:
             probe_fn: Any = client.test_connection
             try:
                 raw_res = dict(probe_fn(deep=True, force_refresh=True))
@@ -7370,7 +7691,7 @@ class FinanceService:
             or raw_res.get("message")
             or ("Connected and ready" if ok else "Connection check failed")
         )
-        if is_local_cli:
+        if is_local_cli and not routed_via_wrapper:
             if ok:
                 self._local_cli_registry.clear_auth_failure(target, mark_ready=True)
             elif getattr(client, "is_configured", False):
@@ -7422,13 +7743,20 @@ class FinanceService:
             codex_key_configured=bool(codex_key),
             codex_key_masked=mask_secret(codex_key),
             codex_key_source=codex_source,
-            wrapper_base_url=raw.get("wrapper_base_url", ""),
+            wrapper_base_url=self._resolve_wrapper_base_url(raw),
             wrapper_model=raw.get("wrapper_model", ""),
             wrapper_wire_api=raw.get("wrapper_wire_api", "chat_completions"),
             wrapper_key_configured=bool(wrap_key),
             wrapper_key_masked=mask_secret(wrap_key),
             codex_cli_enabled=bool(raw.get("codex_cli_enabled", 0)),
             codex_cli_model=raw.get("codex_cli_model", ""),
+            claude_cli_model=raw.get("claude_cli_model", ""),
+            opencode_cli_model=raw.get("opencode_cli_model", ""),
+            agy_cli_model=raw.get("agy_cli_model", ""),
+            claude_cli_use_wrapper=bool(raw.get("claude_cli_use_wrapper", 0)),
+            opencode_cli_use_wrapper=bool(raw.get("opencode_cli_use_wrapper", 0)),
+            codex_cli_use_wrapper=bool(raw.get("codex_cli_use_wrapper", 0)),
+            agy_cli_use_wrapper=bool(raw.get("agy_cli_use_wrapper", 0)),
             local_cli_auto_detect=self._is_local_cli_auto_detect_enabled(raw),
             requests_used_today=used_today,
             quota_remaining_today=max(0, max_daily - used_today),
@@ -7454,6 +7782,7 @@ class FinanceService:
             expected_paycheck_cents=int(raw.get("expected_paycheck_cents", 0)),
             calm_mode=bool(raw.get("calm_mode", 1)),
             auto_rebalance_enabled=bool(raw.get("auto_rebalance_enabled", 1)),
+            reserve_open_ewa_advances=bool(raw.get("reserve_open_ewa_advances", 1)),
             onboarding_completed=bool(raw.get("onboarding_completed", 0)),
             vault_auto_lock_minutes=int(raw.get("vault_auto_lock_minutes", 30)),
             email_scanner_enabled=bool(raw.get("email_scanner_enabled", 0)),
@@ -7477,13 +7806,20 @@ class FinanceService:
             codex_key_configured=bool(codex_key),
             codex_key_masked=mask_secret(codex_key),
             codex_key_source=codex_source,
-            wrapper_base_url=raw.get("wrapper_base_url", ""),
+            wrapper_base_url=self._resolve_wrapper_base_url(raw),
             wrapper_model=raw.get("wrapper_model", ""),
             wrapper_wire_api=raw.get("wrapper_wire_api", "chat_completions"),
             wrapper_key_configured=bool(wrap_key),
             wrapper_key_masked=mask_secret(wrap_key),
             codex_cli_enabled=bool(raw.get("codex_cli_enabled", 0)),
             codex_cli_model=raw.get("codex_cli_model", ""),
+            claude_cli_model=raw.get("claude_cli_model", ""),
+            opencode_cli_model=raw.get("opencode_cli_model", ""),
+            agy_cli_model=raw.get("agy_cli_model", ""),
+            claude_cli_use_wrapper=bool(raw.get("claude_cli_use_wrapper", 0)),
+            opencode_cli_use_wrapper=bool(raw.get("opencode_cli_use_wrapper", 0)),
+            codex_cli_use_wrapper=bool(raw.get("codex_cli_use_wrapper", 0)),
+            agy_cli_use_wrapper=bool(raw.get("agy_cli_use_wrapper", 0)),
             local_cli_auto_detect=self._is_local_cli_auto_detect_enabled(raw),
             auth_enabled=True,
         )
@@ -7519,11 +7855,23 @@ class FinanceService:
             val = str(data["wrapper_base_url"]).strip()
             data["wrapper_base_url"] = validate_external_api_url(val) if val else ""
 
+        for cli_model_k in ("codex_cli_model", "claude_cli_model", "opencode_cli_model", "agy_cli_model"):
+            if cli_model_k in data:
+                cleaned_m = str(data[cli_model_k]).strip()
+                if cleaned_m and not _SAFE_CLI_MODEL_RE.match(cleaned_m):
+                    raise ValueError(f"Invalid model identifier for {cli_model_k}.")
+                data[cli_model_k] = cleaned_m
+
         for bool_k in (
             "calm_mode",
             "auto_rebalance_enabled",
+            "reserve_open_ewa_advances",
             "onboarding_completed",
             "codex_cli_enabled",
+            "claude_cli_use_wrapper",
+            "opencode_cli_use_wrapper",
+            "codex_cli_use_wrapper",
+            "agy_cli_use_wrapper",
             "local_cli_auto_detect",
             "email_scanner_enabled",
         ):
@@ -7555,6 +7903,7 @@ class FinanceService:
             "expected_paycheck_cents",
             "calm_mode",
             "auto_rebalance_enabled",
+            "reserve_open_ewa_advances",
         }
         if data:
             self.storage.update_settings(data)
