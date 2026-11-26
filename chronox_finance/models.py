@@ -1571,6 +1571,116 @@ class DragUtilizationBridge(BaseModel):
     )
 
 
+class CollectionPlanOut(BaseModel):
+    lender_name: str
+    balance_cents: int
+    biweekly_payment_cents: int
+    monthly_equivalent_cents: int
+    payments_remaining: int
+    payoff_date: str
+    freed_biweekly_cents: int
+    freed_monthly_cents: int
+    pay_for_delete_note: str
+
+
+class CardPaymentTierOut(BaseModel):
+    tier_id: Literal["safe_floor", "optimal_biweekly", "aggressive_sprint"]
+    label: str
+    recommended: bool = False
+    monthly_payment_cents: int
+    biweekly_payment_cents: int
+    monthly_payoff_months: Optional[int] = None
+    monthly_payoff_date: Optional[str] = None
+    monthly_total_interest_cents: int = 0
+    biweekly_payoff_months: Optional[int] = None
+    biweekly_payoff_date: Optional[str] = None
+    biweekly_total_interest_cents: int = 0
+    biweekly_interest_saved_cents: int = 0
+    biweekly_months_saved: int = 0
+    with_cascade_payoff_date: Optional[str] = None
+    rationale: str = ""
+
+
+class OptimalCardPaymentPlan(BaseModel):
+    primary_card_name: Optional[str] = None
+    revolving_balance_cents: int = 0
+    weighted_apr_bps: int = 0
+    statement_close_date: Optional[str] = None
+    recommended_tier_id: str = "optimal_biweekly"
+    recommended_biweekly_cents: int = 0
+    recommended_monthly_cents: int = 0
+    statement_close_alignment_tip: str = ""
+    tiers: List[CardPaymentTierOut] = Field(default_factory=list)
+
+
+class RoadmapStageOut(BaseModel):
+    stage_number: int
+    stage_id: str
+    title: str
+    status: Literal["current", "next", "upcoming", "milestone_700", "clean_scorecard"]
+    target_date: str
+    target_util_pct: Optional[float] = None
+    target_revolving_balance_cents: Optional[int] = None
+    score_band_note: str
+    unlock_criteria: List[str] = Field(default_factory=list)
+    cashflow_shift: str = ""
+
+
+class RoadmapBranchOut(BaseModel):
+    branch_id: Literal["balanced_mission", "credit_sprint", "gear_upfront"]
+    label: str
+    tagline: str
+    recommended: bool = False
+    biweekly_card_payment_cents: int
+    biweekly_wishlist_slice_cents: int
+    stabilization_date: str
+    sub_30_date: Optional[str] = None
+    sub_9_azeo_date: Optional[str] = None
+    zero_balance_date: Optional[str] = None
+    target_700_band_date: Optional[str] = None
+    total_revolving_interest_cents: int
+    interest_delta_vs_sprint_cents: int = 0
+    tradeoff_summary: str
+
+
+class WishlistUnlockOut(BaseModel):
+    goal_id: Optional[int] = None
+    goal_name: str
+    category: str = "general"
+    priority: int = 2
+    target_cents: int
+    saved_cents: int
+    remaining_cents: int
+    per_paycheck_cents: int
+    paychecks_needed: int
+    unlock_date: str
+    status: Literal["funded", "active_priority", "queued_after_stabilization", "queued_after_cliff"]
+    note: str = ""
+
+
+class CreditMissionRoadmap(BaseModel):
+    generated_date: str
+    selected_branch: Literal["balanced_mission", "credit_sprint", "gear_upfront"] = "balanced_mission"
+    current_fico8_score: Optional[int] = None
+    current_vantage3_score: Optional[int] = None
+    target_score_goal: int = 700
+    estimated_monthly_income_cents: int = 0
+    estimated_steady_monthly_spend_cents: int = 0
+    splurge_excluded_cents: int = 0
+    splurge_tx_count: int = 0
+    ewa_exit_pool_target_cents: int = 0
+    ewa_open_advance_cents: int = 0
+    collection_plan: Optional[CollectionPlanOut] = None
+    optimal_card_plan: OptimalCardPaymentPlan
+    branches: List[RoadmapBranchOut] = Field(default_factory=list)
+    stages: List[RoadmapStageOut] = Field(default_factory=list)
+    wishlist_unlocks: List[WishlistUnlockOut] = Field(default_factory=list)
+    methodology_note: str = (
+        "Deterministic day-by-day Average Daily Balance (ADB) bi-weekly amortization + empirical FICO 8 / 9 / 10T "
+        "and VantageScore 3.0 / 4.0 scorecard eligibility stages — exact integer cents, zero fabricated score claims."
+    )
+
+
 class CreditOptimizationReport(BaseModel):
     generated_at: str
     total_revolving_balance_cents: int
@@ -1597,6 +1707,7 @@ class CreditOptimizationReport(BaseModel):
     factor_analysis: Optional[CreditFactorBreakdown] = None
     five_twenty_four: Optional[FiveTwentyFourStatus] = None
     drag_bridge: Optional[DragUtilizationBridge] = None
+    mission_roadmap: Optional[CreditMissionRoadmap] = None
     credit_reports: List[CreditReportOut] = Field(default_factory=list)
     credit_inquiries: List[CreditInquiryOut] = Field(default_factory=list)
     credit_derogatories: List[CreditDerogatoryOut] = Field(default_factory=list)

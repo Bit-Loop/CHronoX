@@ -1695,6 +1695,8 @@ def detect_local_http_gateways(
     Probe standard localhost OpenAI-compatible gateways (`11434`, `1234`, `4000`, `8000`)
     via `GET http://127.0.0.1:<port>/v1/models` with a tight 300ms timeout (cached 60s).
     """
+    if transport is None and os.getenv("CHRONOX_DISABLE_LOCAL_HTTP_PROBE", "").strip().lower() in ("1", "true", "yes"):
+        return []
     cache_key = "local_http_gateways"
     if transport is None and not force_refresh:
         cached = _LOCAL_HTTP_GATEWAY_CACHE.get(cache_key)

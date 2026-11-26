@@ -857,13 +857,13 @@ def test_real_chromium_electron_rendering_desktop_mobile_backup_and_dom_hygiene(
         assert rep["pageErrors"] == []
         assert rep["server5xx"] == []
 
-        # 2. Desktop viewport & sharp industrial card corners + $0 fresh-profile rendering
+        # 2. Desktop viewport & Titanium iOS squircle card corners + $0 fresh-profile rendering
         assert rep["desktopViewport"] == {"w": 1440, "h": 900}
         assert rep["freshCommand"]["dailySafe"] == "$0.00"
         assert rep["freshCommand"]["totalSafe"] == "$0.00"
         assert rep["freshCommand"]["safeInvest"] == "$0.00"
         assert rep["freshCommand"]["jarCount"] == 5
-        assert rep["freshCommand"]["cardBorderRadius"] in ("0px", "2px")
+        assert rep["freshCommand"]["cardBorderRadius"] == "16px"
         for jt in rep["freshCommand"]["jarTexts"]:
             assert "$4,777.14" not in jt
             assert "$0.00" in jt

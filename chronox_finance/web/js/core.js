@@ -1045,7 +1045,18 @@ export async function api(path, options = {}) {
   const headers = Object.assign({}, options.headers || {});
   const isAuthExempt = AUTH_EXEMPT_PATHS.some((p) => path.startsWith(p));
 
-  if (options.body && !(options.body instanceof FormData) && !headers["Content-Type"]) {
+  let reqBody = options.body;
+  if (
+    reqBody &&
+    typeof reqBody === "object" &&
+    !(reqBody instanceof FormData) &&
+    !(reqBody instanceof Blob) &&
+    !(reqBody instanceof ArrayBuffer) &&
+    !(reqBody instanceof URLSearchParams)
+  ) {
+    reqBody = JSON.stringify(reqBody);
+  }
+  if (reqBody && !(reqBody instanceof FormData) && !headers["Content-Type"]) {
     headers["Content-Type"] = "application/json";
   }
 
@@ -1078,6 +1089,7 @@ export async function api(path, options = {}) {
     resp = await fetch(path, {
       credentials: "same-origin",
       ...options,
+      body: reqBody,
       method,
       headers,
       signal: options.signal || (controller ? controller.signal : undefined),

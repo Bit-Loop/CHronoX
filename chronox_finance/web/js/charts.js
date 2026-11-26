@@ -1766,13 +1766,37 @@ function renderCategoryBreakdown(data) {
                 const nextCat = String(catSelect.value || "").trim();
                 await api(`/api/v1/transactions/${tx.id}`, {
                   method: "PATCH",
-                  body: {
+                  body: JSON.stringify({
                     jar_id: nextJarId,
                     subcategory: nextCat,
                     learn_merchant_rule: true,
-                  },
+                  }),
                 });
                 toast(`Saved rule for ${tx.merchant} -> ${nextCat}`);
+                await loadAnalyticsOverview();
+              })
+            );
+
+            const oneTimeBtn = el(
+              "button",
+              {
+                type: "button",
+                class: "btn btn-ghost btn-xs",
+                title: "Exclude birthday / holiday / one-off splurge from steady monthly burn baseline",
+                text: "One-Time",
+              }
+            );
+            oneTimeBtn.addEventListener("click", (ev) =>
+              withBusy(ev.currentTarget, async () => {
+                const existing = Array.isArray(tx.tags)
+                  ? tx.tags.map((t) => (typeof t === "string" ? t : t && t.name)).filter(Boolean)
+                  : [];
+                const merged = Array.from(new Set([...existing, "one-time"]));
+                await api(`/api/v1/transactions/${tx.id}/tags`, {
+                  method: "PUT",
+                  body: JSON.stringify({ tags: merged }),
+                });
+                toast(`Tagged ${tx.merchant} as one-time splurge (excluded from steady baseline).`);
                 await loadAnalyticsOverview();
               })
             );
@@ -1793,7 +1817,7 @@ function renderCategoryBreakdown(data) {
                   : null,
               ]),
               tx.id > 0
-                ? el("div", { class: "cat-drilldown-controls" }, [jarSelect, catSelect, saveBtn])
+                ? el("div", { class: "cat-drilldown-controls" }, [jarSelect, catSelect, saveBtn, oneTimeBtn])
                 : null,
             ]);
           })

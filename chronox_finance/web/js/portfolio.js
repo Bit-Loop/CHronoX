@@ -18,6 +18,7 @@
 import {
   $,
   el,
+  svgEl,
   makeIcon,
   api,
   state,
@@ -51,6 +52,8 @@ const portState = {
   portfolio: null,
   connections: [],
   creditReport: null,
+  missionRoadmap: null,
+  roadmapBranch: "balanced_mission",
   creditApis: null,
   factorModel: "fico8", // "fico8" | "vantage3"
   pendingPdfBundle: null,
@@ -748,10 +751,16 @@ export async function loadCreditReport() {
     const auToggle = $("credit-524-au-toggle");
     const includeAu = auToggle ? auToggle.checked : true;
     const rep = await api(
-      `/api/v1/credit/report?extra_monthly_cents=${extraCents}&include_au=${includeAu ? "true" : "false"}`
+      `/api/v1/credit/report?extra_monthly_cents=${extraCents}&include_au=${includeAu ? "true" : "false"}&branch=${encodeURIComponent(portState.roadmapBranch)}`
     );
     portState.creditReport = rep;
     state.creditReport = rep;
+    if (rep && rep.mission_roadmap) {
+      portState.missionRoadmap = rep.mission_roadmap;
+      if (rep.mission_roadmap.selected_branch) {
+        portState.roadmapBranch = rep.mission_roadmap.selected_branch;
+      }
+    }
     renderCreditReport(rep);
     await loadCreditApis();
     return rep;
@@ -844,7 +853,10 @@ function renderCreditReport(rep) {
   const burnEl = $("cred-interest-burn");
   if (burnEl) burnEl.textContent = `${fmtMoney(rep.monthly_interest_burn_cents || 0)}/mo interest burn`;
 
-  // 2. Credit Factor Analysis
+  // 2. 700+ Credit & Staged Wishlist Mission Roadmap
+  renderMissionRoadmap(rep.mission_roadmap || null, rep);
+
+  // 3. Credit Factor Analysis
   renderFactorAnalysis(rep);
 
   // 3. Chase 5/24 Velocity + Inquiries + Derogatories
@@ -856,6 +868,663 @@ function renderCreditReport(rep) {
   renderDragUtilizationBridge(rep.drag_bridge || null);
   renderDebtStrategies(rep.strategies || []);
   renderCreditLines(rep.credit_lines || []);
+}
+
+function syncBranchSwitcherUi(branchId) {
+  const sw = $("credit-branch-switcher");
+  if (!sw) return;
+  sw.querySelectorAll("button[data-roadmap-branch]").forEach((btn) => {
+    const isAct = btn.dataset.roadmapBranch === branchId;
+    btn.classList.toggle("active", isAct);
+    btn.setAttribute("aria-pressed", isAct ? "true" : "false");
+  });
+}
+
+export async function loadMissionRoadmap(branchId = null) {
+  if (state.vaultStatus !== "unlocked") return null;
+  const nextBranch = branchId || portState.roadmapBranch || "balanced_mission";
+  portState.roadmapBranch = nextBranch;
+  syncBranchSwitcherUi(nextBranch);
+  try {
+    const extraInput = $("debt-extra-input");
+    const extraDollars = Number(extraInput ? extraInput.value : 250) || 250;
+    const extraCents = Math.max(0, Math.round(extraDollars * 100));
+    const roadmap = await api(
+      `/api/v1/credit/roadmap?branch=${encodeURIComponent(nextBranch)}&extra_monthly_cents=${extraCents}`
+    );
+    portState.missionRoadmap = roadmap;
+    if (portState.creditReport) {
+      portState.creditReport.mission_roadmap = roadmap;
+    }
+    renderMissionRoadmap(roadmap, portState.creditReport);
+    return roadmap;
+  } catch (err) {
+    toast(err.message || "Could not switch roadmap branch.", true);
+    return null;
+  }
+}
+
+function fmtShortIso(iso) {
+  if (!iso || String(iso).length < 7) return "--";
+  const parts = String(iso).split("-");
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const yr = parts[0] || "";
+  const mo = months[Math.max(0, Math.min(11, parseInt(parts[1], 10) - 1))] || parts[1];
+  return `${mo} ${yr}`;
+}
+
+function buildBranchingTrajectorySvg(roadmap) {
+  const branches = Array.isArray(roadmap.branches) ? roadmap.branches : [];
+  const selectedId = roadmap.selected_branch || "balanced_mission";
+  const stages = Array.isArray(roadmap.stages) ? roadmap.stages : [];
+  const cleanStage = stages.find((st) => st.status === "clean_scorecard") || stages[stages.length - 1];
+
+  const byId = {};
+  branches.forEach((b) => {
+    byId[b.branch_id] = b;
+  });
+
+  const laneSpecs = [
+    { id: "credit_sprint", label: "Fastest 700+ Sprint", y: 54, stroke: "#10b981" },
+    { id: "balanced_mission", label: "Balanced Mission", y: 118, stroke: "#38bdf8" },
+    { id: "gear_upfront", label: "Full Kit Upfront", y: 182, stroke: "#f59e0b" },
+  ];
+
+  const xBase = 74;
+  const xStab = 258;
+  const xSub30 = 456;
+  const xSub9 = 656;
+  const xClean = 842;
+  const yCenter = 118;
+
+  const svgChildren = [
+    // Subtle flight-deck vertical milestone guides
+    ...[
+      { x: xBase, label: "BASELINE" },
+      { x: xStab, label: "EWA EXIT" },
+      { x: xSub30, label: "<=28.9% CLIFF" },
+      { x: xSub9, label: "<=8.9% (700+ BAND)" },
+      { x: xClean, label: "CLEAN SCORECARD" },
+    ].flatMap((col) => [
+      svgEl("line", {
+        x1: col.x,
+        y1: 24,
+        x2: col.x,
+        y2: 204,
+        stroke: "var(--chart-grid)",
+        "stroke-dasharray": "3 4",
+        "stroke-width": "1",
+      }),
+      svgEl("text", {
+        x: col.x,
+        y: 15,
+        fill: "var(--muted)",
+        "font-family": "var(--font-mono)",
+        "font-size": "9.5",
+        "font-weight": "700",
+        "text-anchor": "middle",
+        text: col.label,
+      }),
+    ]),
+  ];
+
+  // Draw inactive lanes first so the active lane always renders crisply on top
+  const orderedLanes = [
+    ...laneSpecs.filter((l) => l.id !== selectedId),
+    ...laneSpecs.filter((l) => l.id === selectedId),
+  ];
+
+  orderedLanes.forEach((lane) => {
+    const b = byId[lane.id];
+    if (!b) return;
+    const isAct = lane.id === selectedId;
+    const opacity = isAct ? "1" : "0.34";
+    const width = isAct ? "3.2" : "1.8";
+
+    const pathD = [
+      `M ${xBase},${yCenter}`,
+      `C ${xBase + 82},${yCenter} ${xStab - 82},${lane.y} ${xStab},${lane.y}`,
+      `L ${xSub30},${lane.y}`,
+      `L ${xSub9},${lane.y}`,
+      `C ${xSub9 + 82},${lane.y} ${xClean - 82},${yCenter} ${xClean},${yCenter}`,
+    ].join(" ");
+
+    const laneGroup = svgEl("g", {
+      style: "cursor: pointer;",
+      role: "button",
+      tabindex: "0",
+      "aria-label": `Select ${b.label} branch`,
+    });
+    laneGroup.addEventListener("click", () => {
+      if (portState.roadmapBranch !== lane.id) {
+        loadMissionRoadmap(lane.id);
+      }
+    });
+    laneGroup.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        if (portState.roadmapBranch !== lane.id) {
+          loadMissionRoadmap(lane.id);
+        }
+      }
+    });
+
+    laneGroup.appendChild(
+      svgEl("path", {
+        d: pathD,
+        fill: "none",
+        stroke: lane.stroke,
+        "stroke-width": width,
+        "stroke-linecap": "round",
+        "stroke-opacity": opacity,
+      })
+    );
+
+    const nodes = [
+      { x: xStab, y: lane.y, dateStr: fmtShortIso(b.stabilization_date) },
+      { x: xSub30, y: lane.y, dateStr: fmtShortIso(b.sub_30_date) },
+      { x: xSub9, y: lane.y, dateStr: fmtShortIso(b.target_700_band_date || b.sub_9_azeo_date), highlight: true },
+    ];
+    nodes.forEach((nd) => {
+      if (isAct && nd.highlight) {
+        laneGroup.appendChild(
+          svgEl("circle", {
+            cx: nd.x,
+            cy: nd.y,
+            r: "11",
+            fill: lane.stroke,
+            "fill-opacity": "0.20",
+          })
+        );
+      }
+      laneGroup.appendChild(
+        svgEl("circle", {
+          cx: nd.x,
+          cy: nd.y,
+          r: isAct ? (nd.highlight ? "6" : "4.8") : "3.6",
+          fill: isAct ? lane.stroke : "var(--surface)",
+          stroke: lane.stroke,
+          "stroke-width": "2",
+          "stroke-opacity": opacity,
+        })
+      );
+      laneGroup.appendChild(
+        svgEl("text", {
+          x: nd.x,
+          y: nd.y - (isAct ? 11 : 8),
+          fill: isAct ? "var(--text)" : "var(--muted)",
+          "fill-opacity": isAct ? "1" : "0.75",
+          "font-family": "var(--font-mono)",
+          "font-size": isAct ? "10" : "9",
+          "font-weight": isAct ? "700" : "500",
+          "text-anchor": "middle",
+          text: nd.dateStr,
+        })
+      );
+    });
+
+    // Lane label tag on left-middle side
+    laneGroup.appendChild(
+      svgEl("text", {
+        x: xStab,
+        y: lane.y + 17,
+        fill: isAct ? lane.stroke : "var(--muted)",
+        "fill-opacity": isAct ? "1" : "0.75",
+        "font-family": "var(--font-sans)",
+        "font-size": "10",
+        "font-weight": isAct ? "700" : "500",
+        "text-anchor": "middle",
+        text: `${lane.label} (${fmtMoney(b.biweekly_card_payment_cents)}/2wk)`,
+      })
+    );
+
+    svgChildren.push(laneGroup);
+  });
+
+  // Shared Origin (Baseline) & Convergence (Clean Scorecard) Anchor Nodes
+  svgChildren.push(
+    svgEl("circle", { cx: xBase, cy: yCenter, r: "7", fill: "var(--surface)", stroke: "var(--text)", "stroke-width": "2.4" }),
+    svgEl("text", {
+      x: xBase,
+      y: yCenter + 22,
+      fill: "var(--text-soft)",
+      "font-family": "var(--font-mono)",
+      "font-size": "10",
+      "font-weight": "700",
+      "text-anchor": "middle",
+      text: roadmap.current_fico8_score ? `FICO ${roadmap.current_fico8_score}` : "TODAY",
+    }),
+    svgEl("circle", { cx: xClean, cy: yCenter, r: "11", fill: "#38bdf8", "fill-opacity": "0.16" }),
+    svgEl("circle", { cx: xClean, cy: yCenter, r: "6.5", fill: "#38bdf8", stroke: "var(--bg)", "stroke-width": "2" }),
+    svgEl("text", {
+      x: xClean,
+      y: yCenter + 22,
+      fill: "var(--cyan)",
+      "font-family": "var(--font-mono)",
+      "font-size": "10",
+      "font-weight": "700",
+      "text-anchor": "middle",
+      text: cleanStage ? fmtShortIso(cleanStage.target_date) : "740+ BAND",
+    })
+  );
+
+  return svgEl(
+    "svg",
+    {
+      viewBox: "0 0 920 226",
+      role: "img",
+      "aria-label": "Branching 700+ credit trajectory diagram across three paydown paths",
+    },
+    svgChildren
+  );
+}
+
+function renderMissionRoadmap(roadmap, creditReport = null) {
+  const wrap = $("credit-roadmap-wrap");
+  if (!wrap) return;
+
+  if (!roadmap) {
+    wrap.replaceChildren(
+      el("p", {
+        class: "small muted",
+        text: "Add credit cards, bills, or savings goals to build your personalized 700+ branching roadmap.",
+      })
+    );
+    return;
+  }
+
+  syncBranchSwitcherUi(roadmap.selected_branch || "balanced_mission");
+
+  const branches = Array.isArray(roadmap.branches) ? roadmap.branches : [];
+  const activeBranch = branches.find((b) => b.branch_id === roadmap.selected_branch) || branches[0] || null;
+  const plan = roadmap.optimal_card_plan || {};
+  const tiers = Array.isArray(plan.tiers) ? plan.tiers : [];
+  const stages = Array.isArray(roadmap.stages) ? roadmap.stages : [];
+  const unlocks = Array.isArray(roadmap.wishlist_unlocks) ? roadmap.wishlist_unlocks : [];
+  const coll = roadmap.collection_plan || null;
+
+  // 1. Telemetry Summary Strip
+  const scoreParts = [];
+  if (roadmap.current_fico8_score) scoreParts.push(`FICO 8: ${roadmap.current_fico8_score}`);
+  if (roadmap.current_vantage3_score) scoreParts.push(`Vantage 3.0: ${roadmap.current_vantage3_score}`);
+  const scoreLine = scoreParts.length ? scoreParts.join(" · ") : "Import bureau score below";
+
+  const tileScore = el("div", { class: "roadmap-telemetry-tile" }, [
+    el("span", { class: "eyebrow", text: "CURRENT -> TARGET BAND" }),
+    el("div", {
+      class: "roadmap-telemetry-val",
+      style: { color: "var(--primary)" },
+      text: `${roadmap.target_score_goal || 700}+ Eligible`,
+    }),
+    el("div", { class: "small muted tabular-nums", text: scoreLine }),
+    activeBranch && activeBranch.target_700_band_date
+      ? el("span", {
+          class: "pill pill-calm",
+          text: `Target Band: ${fmtShortIso(activeBranch.target_700_band_date)}`,
+        })
+      : null,
+  ]);
+
+  const tileBaseline = el("div", { class: "roadmap-telemetry-tile" }, [
+    el("span", { class: "eyebrow", text: "STEADY MONTHLY BASELINE" }),
+    el("div", {
+      class: "roadmap-telemetry-val",
+      text: `${fmtMoney(roadmap.estimated_monthly_income_cents || 0)}/mo`,
+    }),
+    el("div", {
+      class: "small muted tabular-nums",
+      text: `Steady spend: ${fmtMoney(roadmap.estimated_steady_monthly_spend_cents || 0)}/mo`,
+    }),
+    Number(roadmap.splurge_excluded_cents || 0) > 0
+      ? el("span", {
+          class: "pill pill-blue",
+          text: `One-time splurge excluded: ${fmtMoney(roadmap.splurge_excluded_cents)} (${roadmap.splurge_tx_count || 1})`,
+        })
+      : el("span", { class: "pill pill-soft", text: "Tag birthday/one-off spend in Cash Flow" }),
+  ]);
+
+  const tileStab = el("div", { class: "roadmap-telemetry-tile" }, [
+    el("span", { class: "eyebrow", text: "EWA EXIT STABILIZATION POOL" }),
+    el("div", {
+      class: "roadmap-telemetry-val",
+      style: { color: Number(roadmap.ewa_open_advance_cents || 0) > 0 ? "var(--amber)" : "var(--primary)" },
+      text: fmtMoney(roadmap.ewa_exit_pool_target_cents || 0),
+    }),
+    el("div", {
+      class: "small muted tabular-nums",
+      text:
+        Number(roadmap.ewa_open_advance_cents || 0) > 0
+          ? `Open advances: ${fmtMoney(roadmap.ewa_open_advance_cents)} · Replaces payday apps`
+          : "Replaces data-harvesting cash advance apps",
+    }),
+    activeBranch
+      ? el("span", { class: "pill pill-watch", text: `Funded est.: ${fmtShortIso(activeBranch.stabilization_date)}` })
+      : null,
+  ]);
+
+  const tileColl = el("div", { class: "roadmap-telemetry-tile" }, [
+    el("span", { class: "eyebrow", text: "COLLECTION CASCADE" }),
+    el("div", {
+      class: "roadmap-telemetry-val",
+      style: { color: coll ? "var(--cyan)" : "var(--primary)" },
+      text: coll ? `${fmtMoney(coll.biweekly_payment_cents)}/2wk` : "$0.00",
+    }),
+    el("div", {
+      class: "small muted tabular-nums",
+      text: coll
+        ? `${coll.payments_remaining} payments -> $0 by ${fmtShortIso(coll.payoff_date)}`
+        : "No active bi-weekly collection plan",
+    }),
+    coll
+      ? el("span", {
+          class: "pill pill-blue",
+          text: `Cascades +${fmtMoney(coll.freed_monthly_cents)}/mo to card`,
+        })
+      : el("span", { class: "pill pill-calm", text: "Clean collection ledger" }),
+  ]);
+
+  const telemetryStrip = el("div", { class: "roadmap-telemetry-grid" }, [
+    tileScore,
+    tileBaseline,
+    tileStab,
+    tileColl,
+  ]);
+
+  // 2. Interactive 3-Branch Selector Cards
+  const branchCards = el(
+    "div",
+    { class: "roadmap-branches-grid" },
+    branches.map((b) => {
+      const isSel = b.branch_id === roadmap.selected_branch;
+      const badge = isSel
+        ? el("span", { class: "pill pill-calm" }, [makeIcon("check", "ui-icon-sm"), "Active Path"])
+        : b.recommended
+        ? el("span", { class: "pill pill-blue", text: "Recommended" })
+        : el("span", { class: "pill pill-soft", text: "Compare" });
+
+      const card = el(
+        "button",
+        {
+          type: "button",
+          class: `roadmap-branch-card${isSel ? " is-selected" : ""}`,
+          "data-branch-card": b.branch_id,
+          "aria-pressed": isSel ? "true" : "false",
+        },
+        [
+          el("div", { class: "item-row" }, [
+            el("strong", { text: b.label }),
+            badge,
+          ]),
+          el("div", { class: "small muted", text: b.tagline }),
+          el("div", { class: "roadmap-branch-metrics" }, [
+            el("div", { class: "roadmap-branch-kv" }, [
+              el("span", { class: "roadmap-branch-k", text: "Card / 2wk" }),
+              el("span", { class: "roadmap-branch-v", text: fmtMoney(b.biweekly_card_payment_cents) }),
+            ]),
+            el("div", { class: "roadmap-branch-kv" }, [
+              el("span", { class: "roadmap-branch-k", text: "Wishlist / 2wk" }),
+              el("span", { class: "roadmap-branch-v", text: fmtMoney(b.biweekly_wishlist_slice_cents) }),
+            ]),
+            el("div", { class: "roadmap-branch-kv" }, [
+              el("span", { class: "roadmap-branch-k", text: "700+ Band Est." }),
+              el("span", {
+                class: "roadmap-branch-v",
+                style: { color: "var(--primary)" },
+                text: fmtShortIso(b.target_700_band_date || b.sub_9_azeo_date),
+              }),
+            ]),
+            el("div", { class: "roadmap-branch-kv" }, [
+              el("span", { class: "roadmap-branch-k", text: "Total Interest" }),
+              el("span", {
+                class: "roadmap-branch-v",
+                text:
+                  Number(b.interest_delta_vs_sprint_cents || 0) > 0
+                    ? `${fmtMoney(b.total_revolving_interest_cents)} (+${fmtMoney(b.interest_delta_vs_sprint_cents)})`
+                    : fmtMoney(b.total_revolving_interest_cents),
+              }),
+            ]),
+          ]),
+          el("div", { class: "small muted", text: b.tradeoff_summary }),
+        ]
+      );
+      card.addEventListener("click", () => {
+        if (portState.roadmapBranch !== b.branch_id) {
+          loadMissionRoadmap(b.branch_id);
+        }
+      });
+      return card;
+    })
+  );
+
+  // 3. Pure SVG Branching Trajectory Map
+  const svgStage = el("div", { class: "roadmap-svg-stage" }, [
+    buildBranchingTrajectorySvg(roadmap),
+  ]);
+
+  // 4. Optimal Bi-Weekly vs. Monthly Credit Card Payment Plan + Collection Cascade
+  const revMinCents = (creditReport && Array.isArray(creditReport.credit_lines)
+    ? creditReport.credit_lines
+        .filter((l) => l.kind === "credit_card" && l.balance_cents > 0)
+        .reduce((s, l) => s + Number(l.min_payment_cents || 0), 0)
+    : 0);
+
+  const tierCards = el(
+    "div",
+    { class: "roadmap-tiers-grid" },
+    tiers.map((t) => {
+      const applyBtn = el("button", {
+        type: "button",
+        class: `btn ${t.recommended ? "btn-primary" : "btn-soft"} btn-xs`,
+        text: "Apply to Payoff Plans",
+      });
+      applyBtn.addEventListener("click", () =>
+        withBusy(applyBtn, async () => {
+          const extraInput = $("debt-extra-input");
+          const monthlyEq = Number(t.monthly_payment_cents || 0);
+          const extraCents = Math.max(2500, monthlyEq - revMinCents);
+          if (extraInput) {
+            extraInput.value = String(Math.round(extraCents / 100));
+          }
+          await loadCreditReport();
+          toast(`Applied ${t.label} (${fmtMoney(t.biweekly_payment_cents)}/2wk) to debt payoff plans.`);
+        })
+      );
+
+      return el("article", { class: `roadmap-tier-card${t.recommended ? " is-recommended" : ""}` }, [
+        el("div", { class: "stack-xs" }, [
+          el("div", { class: "item-row" }, [
+            el("strong", { text: t.label }),
+            t.recommended
+              ? el("span", { class: "pill pill-calm" }, [makeIcon("star", "ui-icon-sm"), "Optimal"])
+              : el("span", { class: "pill pill-soft", text: t.tier_id === "safe_floor" ? "Floor" : "Sprint" }),
+          ]),
+          el("div", { class: "roadmap-tier-hero", text: `${fmtMoney(t.biweekly_payment_cents)} / 2wk` }),
+          el("div", {
+            class: "small muted tabular-nums",
+            text: `Monthly eq.: ${fmtMoney(t.monthly_payment_cents)}/mo (26 half-payments/yr = 13 mo/yr)`,
+          }),
+          Number(t.biweekly_interest_saved_cents || 0) > 0
+            ? el("span", {
+                class: "pill pill-calm",
+                text:
+                  Number(t.biweekly_months_saved || 0) > 0
+                    ? `Bi-weekly saves ${fmtMoney(t.biweekly_interest_saved_cents)} & ${t.biweekly_months_saved} mo vs monthly`
+                    : `Bi-weekly saves ${fmtMoney(t.biweekly_interest_saved_cents)} interest vs monthly`,
+              })
+            : null,
+          el("div", {
+            class: "small tabular-nums",
+            text: t.biweekly_payoff_date
+              ? `Payoff: ${fmtShortIso(t.biweekly_payoff_date)} (${t.biweekly_payoff_months} mo)${
+                  t.with_cascade_payoff_date ? ` · With cascade: ${fmtShortIso(t.with_cascade_payoff_date)}` : ""
+                }`
+              : "Increase payment above monthly interest to amortize",
+          }),
+          el("div", { class: "small muted", text: t.rationale }),
+        ]),
+        el("div", { class: "row-gap" }, [applyBtn]),
+      ]);
+    })
+  );
+
+  const cardPlanBlock = el("div", { class: "stack-sm" }, [
+    el("div", { class: "item-row wrap" }, [
+      el("div", {}, [
+        el("h3", { text: "Optimal Credit Card Payment · Bi-Weekly vs. Monthly ADB Math" }),
+        plan.primary_card_name
+          ? el("div", {
+              class: "small muted tabular-nums",
+              text: `${plan.primary_card_name} · ${fmtMoney(plan.revolving_balance_cents || 0)} at ${(Number(plan.weighted_apr_bps || 0) / 100).toFixed(2)}% APR${
+                plan.statement_close_date ? ` · Next close ${plan.statement_close_date}` : ""
+              }`,
+            })
+          : null,
+      ]),
+      plan.recommended_biweekly_cents
+        ? el("span", {
+            class: "pill pill-calm tabular-nums",
+            text: `Recommended: ${fmtMoney(plan.recommended_biweekly_cents)} every 2 weeks`,
+          })
+        : null,
+    ]),
+    tierCards,
+    plan.statement_close_alignment_tip
+      ? el("div", { class: "notice-bar small" }, [
+          makeIcon("clock", "ui-icon-sm"),
+          el("span", { text: plan.statement_close_alignment_tip }),
+        ])
+      : null,
+    coll
+      ? el("div", { class: "roadmap-cascade-banner" }, [
+          el("div", { class: "item-row wrap" }, [
+            el("strong", { text: `Active Bi-Weekly Collection Plan: ${coll.lender_name}` }),
+            el("span", {
+              class: "pill pill-blue tabular-nums",
+              text: `${fmtMoney(coll.biweekly_payment_cents)}/2wk · ${coll.payments_remaining} left -> $0 by ${coll.payoff_date}`,
+            }),
+          ]),
+          el("div", {
+            class: "small tabular-nums",
+            text: `Remaining balance: ${fmtMoney(coll.balance_cents)}. Once settled on ${coll.payoff_date}, automatically roll the freed ${fmtMoney(coll.freed_biweekly_cents)}/2wk (${fmtMoney(coll.freed_monthly_cents)}/mo) directly into your credit card payment.`,
+          }),
+          el("div", { class: "small muted", text: coll.pay_for_delete_note }),
+        ])
+      : null,
+  ]);
+
+  // 5. 6-Stage Progression Timeline
+  const stageStatusMeta = {
+    current: { cls: "pill-watch", cardCls: "is-current", label: "CURRENT" },
+    next: { cls: "pill-blue", cardCls: "is-next", label: "NEXT STAGE" },
+    upcoming: { cls: "pill-soft", cardCls: "", label: "UPCOMING" },
+    milestone_700: { cls: "pill-calm", cardCls: "is-milestone-700", label: "700+ BAND" },
+    clean_scorecard: { cls: "pill-blue", cardCls: "is-clean", label: "CLEAN SCORECARD" },
+  };
+  const stagesSection = el("div", { class: "stack-sm" }, [
+    el("div", { class: "item-row wrap" }, [
+      el("h3", { text: `Staged 700+ Credit Progression (${activeBranch ? activeBranch.label : "Selected Path"})` }),
+      el("span", { class: "small muted", text: "Empirical utilization cliffs & statutory derogatory drop-off milestones" }),
+    ]),
+    el(
+      "div",
+      { class: "roadmap-stages-grid" },
+      stages.map((st) => {
+        const sm = stageStatusMeta[st.status] || stageStatusMeta.upcoming;
+        return el("article", { class: `roadmap-stage-card ${sm.cardCls}` }, [
+          el("div", { class: "item-row" }, [
+            el("span", { class: `pill ${sm.cls}`, text: `STAGE ${st.stage_number} · ${sm.label}` }),
+            el("span", { class: "small muted tabular-nums", text: fmtShortIso(st.target_date) }),
+          ]),
+          el("strong", { text: st.title }),
+          el("div", { class: "small", style: { color: "var(--cyan)" }, text: st.score_band_note }),
+          st.target_util_pct != null && st.target_revolving_balance_cents != null
+            ? el("div", {
+                class: "small muted tabular-nums",
+                text: `Target util <= ${Number(st.target_util_pct).toFixed(1)}% (<= ${fmtMoney(st.target_revolving_balance_cents)})`,
+              })
+            : null,
+          Array.isArray(st.unlock_criteria) && st.unlock_criteria.length
+            ? el(
+                "ul",
+                { class: "roadmap-stage-list" },
+                st.unlock_criteria.map((c) => el("li", { text: c }))
+              )
+            : null,
+          st.cashflow_shift
+            ? el("div", { class: "micro-step", text: `-> ${st.cashflow_shift}` })
+            : null,
+        ]);
+      })
+    ),
+  ]);
+
+  // 6. Staged Stabilization Pool & Wishlist Unlocks
+  const wishStatusMeta = {
+    funded: { cls: "pill-calm", label: "FUNDED" },
+    active_priority: { cls: "pill-calm", label: "ACTIVE PRIORITY" },
+    queued_after_stabilization: { cls: "pill-blue", label: "AFTER STABILIZATION" },
+    queued_after_cliff: { cls: "pill-watch", label: "AFTER CREDIT CLIFF" },
+  };
+  const goGoalsBtn = el("button", { type: "button", class: "btn btn-ghost btn-xs", text: "Manage Goals ->" });
+  goGoalsBtn.addEventListener("click", () => switchTab("goals"));
+
+  const wishlistSection = el("div", { class: "stack-sm" }, [
+    el("div", { class: "item-row wrap" }, [
+      el("div", {}, [
+        el("h3", { text: "Staged Stabilization Pool & Real-World Wishlist Unlocks" }),
+        el("div", {
+          class: "small muted",
+          text: "Paycheck-aligned funding schedule — protects your EWA exit cushion first, then unlocks gear in priority order.",
+        }),
+      ]),
+      goGoalsBtn,
+    ]),
+    unlocks.length
+      ? el(
+          "div",
+          { class: "roadmap-wishlist-grid" },
+          unlocks.map((u) => {
+            const wm = wishStatusMeta[u.status] || wishStatusMeta.queued_after_stabilization;
+            const pct = u.target_cents > 0 ? Math.min(100, Math.round((Number(u.saved_cents || 0) / u.target_cents) * 100)) : 100;
+            return el("article", { class: `roadmap-wish-card${u.status === "active_priority" ? " is-active-prio" : ""}` }, [
+              el("div", { class: "stack-xs" }, [
+                el("div", { class: "item-row" }, [
+                  el("strong", { text: u.goal_name }),
+                  el("span", { class: `pill ${wm.cls}`, text: wm.label }),
+                ]),
+                el("div", { class: "item-row small tabular-nums" }, [
+                  el("span", { text: `${fmtMoney(u.saved_cents)} / ${fmtMoney(u.target_cents)}` }),
+                  el("span", { class: "muted", text: `Tier P${u.priority}` }),
+                ]),
+                el("div", { class: "progress-track" }, [
+                  el("div", {
+                    class: "progress-fill",
+                    style: {
+                      width: `${pct}%`,
+                      backgroundColor: u.category === "emergency" ? "var(--amber)" : "var(--primary)",
+                    },
+                  }),
+                ]),
+              ]),
+              el("div", { class: "stack-xs" }, [
+                el("div", {
+                  class: "small tabular-nums",
+                  style: { fontWeight: "700", color: "var(--cyan)" },
+                  text: `Unlock est.: ${u.unlock_date} (${u.paychecks_needed} paycheck${u.paychecks_needed === 1 ? "" : "s"} @ ${fmtMoney(u.per_paycheck_cents)}/check)`,
+                }),
+                u.note ? el("div", { class: "small muted", text: u.note }) : null,
+              ]),
+            ]);
+          })
+        )
+      : el("p", { class: "small muted", text: "Add goals in the Goals tab to schedule paycheck-aligned unlocks." }),
+  ]);
+
+  const sections = [telemetryStrip, branchCards, svgStage, cardPlanBlock, stagesSection, wishlistSection];
+  if (roadmap.methodology_note) {
+    sections.push(el("p", { class: "muted small", style: { marginTop: "2px" }, text: roadmap.methodology_note }));
+  }
+  wrap.replaceChildren(...sections);
 }
 
 function renderFactorAnalysis(rep) {
@@ -2067,6 +2736,18 @@ export function initPortfolioAndCredit() {
   }
 
   // --- Credit & Debt Handlers ---
+  const branchSwitcher = $("credit-branch-switcher");
+  if (branchSwitcher) {
+    branchSwitcher.addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button[data-roadmap-branch]");
+      if (!btn) return;
+      const nextBranch = btn.dataset.roadmapBranch;
+      if (nextBranch && nextBranch !== portState.roadmapBranch) {
+        loadMissionRoadmap(nextBranch);
+      }
+    });
+  }
+
   const auToggle = $("credit-524-au-toggle");
   if (auToggle) {
     auToggle.addEventListener("change", () => loadCreditReport());

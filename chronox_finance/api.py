@@ -1109,12 +1109,14 @@ def create_app(
         include_au: bool = True,
         include_authorized_user: Optional[bool] = None,
         include_sandbox: bool = False,
+        branch: str = "balanced_mission",
     ):
         inc_au = include_authorized_user if include_authorized_user is not None else include_au
         return svc.get_credit_report(
             extra_monthly_budget_cents=max(0, min(50_000_000, extra_monthly_cents)),
             include_authorized_user=inc_au,
             include_sandbox=include_sandbox,
+            selected_branch=branch,
         )
 
     @v1.get("/credit/drag-bridge", tags=["Credit"], dependencies=[Depends(require_auth)])
@@ -1124,6 +1126,20 @@ def create_app(
         include_sandbox: bool = False,
     ):
         return svc.get_drag_utilization_bridge(
+            extra_monthly_budget_cents=max(0, min(50_000_000, extra_monthly_cents)),
+            lookback_days=max(30, min(730, lookback_days)),
+            include_sandbox=include_sandbox,
+        )
+
+    @v1.get("/credit/roadmap", tags=["Credit"], dependencies=[Depends(require_auth)])
+    def get_credit_roadmap(
+        branch: str = "balanced_mission",
+        extra_monthly_cents: int = 25_000,
+        lookback_days: int = 365,
+        include_sandbox: bool = False,
+    ):
+        return svc.get_credit_roadmap(
+            branch=branch,
             extra_monthly_budget_cents=max(0, min(50_000_000, extra_monthly_cents)),
             lookback_days=max(30, min(730, lookback_days)),
             include_sandbox=include_sandbox,

@@ -36,12 +36,15 @@ from chronox_finance.models import (
     BalanceTransferRequest,
     BalanceTransferResult,
     BridgeActionStepOut,
+    CardPaymentTierOut,
+    CollectionPlanOut,
     CreditAdvisorAlert,
     CreditDerogatoryOut,
     CreditFactorBreakdown,
     CreditFactorItem,
     CreditInquiryOut,
     CreditLineOut,
+    CreditMissionRoadmap,
     CreditOptimizationReport,
     CreditReportOut,
     DebtKind,
@@ -50,7 +53,11 @@ from chronox_finance.models import (
     DragUtilizationBridge,
     EwaAppSummaryOut,
     FiveTwentyFourStatus,
+    OptimalCardPaymentPlan,
+    RoadmapBranchOut,
+    RoadmapStageOut,
     UtilizationMilestoneOut,
+    WishlistUnlockOut,
     utc_now_iso,
 )
 
@@ -668,6 +675,10 @@ class CreditDebtOptimizer:
         credit_inquiries: Optional[Sequence[Any]] = None,
         credit_derogatories: Optional[Sequence[Any]] = None,
         transactions: Optional[Sequence[Any]] = None,
+        recurring_bills: Optional[Sequence[Any]] = None,
+        goals: Optional[Sequence[Any]] = None,
+        payday_cadence_days: int = 14,
+        selected_branch: str = "balanced_mission",
         lookback_days: int = 365,
         include_authorized_user: bool = True,
         today: Optional[date] = None,
@@ -833,6 +844,21 @@ class CreditDebtOptimizer:
             lookback_days=lookback_days,
             today=ref,
         )
+        mission_roadmap = build_credit_and_wishlist_roadmap(
+            credit_lines=enriched,
+            transactions=transactions or (),
+            recurring_bills=recurring_bills or (),
+            goals=goals or (),
+            credit_reports=norm_reports,
+            derogatories=norm_derogs,
+            smoothed_monthly_income_cents=smoothed_monthly_income_cents,
+            payday_cadence_days=payday_cadence_days,
+            extra_monthly_budget_cents=max(0, int(extra_monthly_budget_cents)),
+            selected_branch=selected_branch,
+            lookback_days=lookback_days,
+            drag_bridge=drag_bridge,
+            today=ref,
+        )
 
         return CreditOptimizationReport(
             generated_at=utc_now_iso(),
@@ -860,6 +886,7 @@ class CreditDebtOptimizer:
             factor_analysis=factor_analysis,
             five_twenty_four=five_twenty_four,
             drag_bridge=drag_bridge,
+            mission_roadmap=mission_roadmap,
             credit_reports=norm_reports,
             credit_inquiries=norm_inquiries,
             credit_derogatories=norm_derogs,
@@ -2136,4 +2163,964 @@ def analyze_financial_drag_bridge(
         derogatory_guidance=derog_guidance,
         ordered_action_steps=steps,
     )
+
+
+# ============================================================================
+# Optimal Bi-Weekly Card Paydown, Collection Cascade & Branching 700+ Roadmap
+# ============================================================================
+
+_SPLURGE_TAGS = frozenset({"one-time", "onetime", "birthday", "splurge", "anomaly", "holiday"})
+_COLLECTION_BILL_RE = re.compile(r"\b(collection|recovery|collector|settlement|agency|charge[- ]?off)\b", re.I)
+
+
+def _extract_tx_tags(tx: Any) -> set[str]:
+    raw_tags = _get_field(tx, "tags", None) or ()
+    out: set[str] = set()
+    for t in raw_tags:
+        if isinstance(t, str):
+            out.add(t.strip().lower())
+        elif isinstance(t, dict):
+            name = str(t.get("name", "") or "").strip().lower()
+            if name:
+                out.add(name)
+        else:
+            name = str(getattr(t, "name", "") or "").strip().lower()
+            if name:
+                out.add(name)
+    return out
+
+
+def _simulate_adb_biweekly_trajectory(
+    *,
+    balance_cents: int,
+    limit_cents: int,
+    apr_bps: int,
+    biweekly_payment_cents: int,
+    today: date,
+    delay_days: int = 0,
+    cascade_after_days: Optional[int] = None,
+    cascade_biweekly_bonus_cents: int = 0,
+) -> Dict[str, Any]:
+    """
+    Day-by-day Average Daily Balance (ADB) bi-weekly amortization engine (`DPR = APR / 365`).
+    Posts payments every 14 days (26 payments/yr = 13 monthly equivalents/yr), optionally
+    starting after `delay_days` and cascading `+cascade_biweekly_bonus_cents` once an
+    installment/collection clears at `cascade_after_days`.
+    """
+    bal = max(0, int(balance_cents))
+    lim = max(0, int(limit_cents))
+    pmt_base = max(0, int(biweekly_payment_cents))
+    dpr = max(0, int(apr_bps)) / 10000.0 / 365.0
+    max_days = MAX_AMORTIZATION_MONTHS * 31
+
+    if bal <= 0:
+        iso0 = today.isoformat()
+        return {
+            "amortizes": True,
+            "payoff_days": 0,
+            "payoff_months": 0,
+            "payoff_date": iso0,
+            "payments_count": 0,
+            "total_interest_cents": 0,
+            "cliff_dates": {88.9: iso0, 68.9: iso0, 48.9: iso0, 28.9: iso0, 8.9: iso0, 1.0: iso0},
+        }
+    if pmt_base <= 0:
+        return {
+            "amortizes": False,
+            "payoff_days": None,
+            "payoff_months": None,
+            "payoff_date": None,
+            "payments_count": 0,
+            "total_interest_cents": 0,
+            "cliff_dates": {},
+        }
+
+    cliff_targets: Dict[float, int] = (
+        {pct: (lim * int(round(pct * 10))) // 1000 for pct in (88.9, 68.9, 48.9, 28.9, 8.9, 1.0)}
+        if lim > 0
+        else {}
+    )
+    cliff_dates: Dict[float, str] = {}
+    for pct, tgt in cliff_targets.items():
+        if bal <= tgt:
+            cliff_dates[pct] = today.isoformat()
+
+    total_interest = 0
+    payments_count = 0
+    cycle_bal_sum = 0
+    cycle_start_bal = bal
+    stalled_cycles = 0
+
+    for day in range(1, max_days + 1):
+        # Post bi-weekly payment every 14 days once any upfront delay passes
+        if day > delay_days and (day - delay_days) % 14 == 0:
+            bonus = (
+                max(0, int(cascade_biweekly_bonus_cents))
+                if (cascade_after_days is not None and day >= cascade_after_days)
+                else 0
+            )
+            pmt_now = pmt_base + bonus
+            if pmt_now > 0:
+                bal = max(0, bal - pmt_now)
+                payments_count += 1
+                day_iso = (today + timedelta(days=day)).isoformat()
+                for pct, tgt in cliff_targets.items():
+                    if pct not in cliff_dates and bal <= tgt:
+                        cliff_dates[pct] = day_iso
+
+        cycle_bal_sum += bal
+
+        # Post accrued cycle interest every 30 days or immediately upon reaching $0
+        if day % 30 == 0 or bal == 0:
+            cycle_int = int(round(cycle_bal_sum * dpr)) if dpr > 0 else 0
+            total_interest += cycle_int
+            bal += cycle_int
+            cycle_bal_sum = 0
+
+            # If payment cleared principal + residual interest on this cycle, finish cleanly
+            if bal == 0:
+                payoff_dt = (today + timedelta(days=day)).isoformat()
+                for pct in cliff_targets:
+                    cliff_dates.setdefault(pct, payoff_dt)
+                return {
+                    "amortizes": True,
+                    "payoff_days": day,
+                    "payoff_months": max(1, int(math.ceil(day / 30.4375))),
+                    "payoff_date": payoff_dt,
+                    "payments_count": payments_count,
+                    "total_interest_cents": total_interest,
+                    "cliff_dates": cliff_dates,
+                }
+
+            # Detect non-amortizing stall (only after any initial delay AND any pending cascade have started)
+            post_delay_and_cascade = day > delay_days + 30 and (
+                cascade_after_days is None or day >= cascade_after_days + 30
+            )
+            if post_delay_and_cascade:
+                if bal >= cycle_start_bal:
+                    stalled_cycles += 1
+                    if stalled_cycles >= 2:
+                        return {
+                            "amortizes": False,
+                            "payoff_days": None,
+                            "payoff_months": None,
+                            "payoff_date": None,
+                            "payments_count": payments_count,
+                            "total_interest_cents": total_interest,
+                            "cliff_dates": cliff_dates,
+                        }
+                else:
+                    stalled_cycles = 0
+            cycle_start_bal = bal
+
+    return {
+        "amortizes": False,
+        "payoff_days": None,
+        "payoff_months": None,
+        "payoff_date": None,
+        "payments_count": payments_count,
+        "total_interest_cents": total_interest,
+        "cliff_dates": cliff_dates,
+    }
+
+
+def simulate_biweekly_vs_monthly_payoff(
+    *,
+    balance_cents: int,
+    apr_bps: int,
+    monthly_payment_cents: int,
+    biweekly_payment_cents: Optional[int] = None,
+    today: Optional[date] = None,
+) -> Dict[str, Any]:
+    """
+    Exact side-by-side comparison of Monthly (12x/yr) vs. Bi-Weekly (26x/yr, day-by-day ADB)
+    revolving payoff in integer cents.
+    """
+    ref = today or date.today()
+    bal0 = max(0, int(balance_cents))
+    pmt_mo = max(0, int(monthly_payment_cents))
+    pmt_bw = max(0, int(biweekly_payment_cents)) if biweekly_payment_cents is not None else (pmt_mo // 2)
+
+    if bal0 <= 0:
+        iso0 = ref.isoformat()
+        return {
+            "amortizes": True,
+            "monthly_payment_cents": pmt_mo,
+            "biweekly_payment_cents": pmt_bw,
+            "monthly_payoff_months": 0,
+            "monthly_payoff_date": iso0,
+            "monthly_total_interest_cents": 0,
+            "biweekly_payoff_months": 0,
+            "biweekly_payoff_date": iso0,
+            "biweekly_total_interest_cents": 0,
+            "biweekly_interest_saved_cents": 0,
+            "biweekly_months_saved": 0,
+        }
+
+    # 1. Standard Monthly (12 payments/yr on cycle end)
+    bal_m = bal0
+    int_m = 0
+    months_m: Optional[int] = 0
+    rate_m = max(0, int(apr_bps)) / 10000.0 / 12.0
+    if pmt_mo <= 0:
+        months_m = None
+    else:
+        for m in range(1, MAX_AMORTIZATION_MONTHS + 1):
+            mo_int = int(round(bal_m * rate_m)) if rate_m > 0 else 0
+            if pmt_mo <= mo_int:
+                months_m = None
+                break
+            int_m += mo_int
+            bal_m = max(0, bal_m + mo_int - pmt_mo)
+            if bal_m == 0:
+                months_m = m
+                break
+        if bal_m > 0:
+            months_m = None
+
+    # 2. Bi-Weekly ADB (26 half-payments/yr = 13 monthly eq. + lower Average Daily Balance)
+    bw_res = _simulate_adb_biweekly_trajectory(
+        balance_cents=bal0,
+        limit_cents=0,
+        apr_bps=apr_bps,
+        biweekly_payment_cents=pmt_bw,
+        today=ref,
+    )
+
+    amortizes = months_m is not None and bw_res["amortizes"]
+    int_bw = int(bw_res["total_interest_cents"])
+    months_bw = bw_res["payoff_months"]
+    saved_int = max(0, int_m - int_bw) if amortizes else 0
+    saved_mo = (
+        max(0, int(months_m) - int(months_bw))
+        if (months_m is not None and months_bw is not None)
+        else 0
+    )
+
+    return {
+        "amortizes": amortizes,
+        "monthly_payment_cents": pmt_mo,
+        "biweekly_payment_cents": pmt_bw,
+        "monthly_payoff_months": months_m,
+        "monthly_payoff_date": _add_months_date(ref, months_m).isoformat() if months_m is not None else None,
+        "monthly_total_interest_cents": int_m if months_m is not None else 0,
+        "biweekly_payoff_months": months_bw,
+        "biweekly_payoff_date": bw_res["payoff_date"],
+        "biweekly_total_interest_cents": int_bw if bw_res["amortizes"] else 0,
+        "biweekly_interest_saved_cents": saved_int,
+        "biweekly_months_saved": saved_mo,
+    }
+
+
+def _detect_biweekly_collection_plan(
+    *,
+    credit_lines: Sequence[Any],
+    recurring_bills: Sequence[Any],
+    derogatories: Sequence[Any],
+    today: date,
+) -> Optional[CollectionPlanOut]:
+    """Detect active collection balance + bi-weekly payment plan (e.g. $75 bi-weekly collection settlement)."""
+    coll_bill: Optional[Any] = None
+    for b in recurring_bills or ():
+        if not bool(_get_field(b, "active", True)):
+            continue
+        bname = str(_get_field(b, "name", "") or "")
+        cad = str(_get_field(b, "cadence", "monthly") or "monthly").lower()
+        if _COLLECTION_BILL_RE.search(bname) and cad == "biweekly":
+            coll_bill = b
+            break
+
+    coll_line: Optional[Any] = None
+    for ln in credit_lines or ():
+        if not bool(_get_field(ln, "active", True)):
+            continue
+        lname = str(_get_field(ln, "name", "") or "")
+        bal = max(0, int(_get_field(ln, "balance_cents", 0) or 0))
+        if bal <= 0:
+            continue
+        if _COLLECTION_BILL_RE.search(lname):
+            coll_line = ln
+            break
+
+    if coll_line is None:
+        for dg in derogatories or ():
+            if not bool(_get_field(dg, "active", True)):
+                continue
+            if str(_get_field(dg, "kind", "")).lower() == "collection":
+                lender = str(_get_field(dg, "lender", "") or "Collection Account")
+                bal_m = _match_line_balance_for_lender(lender, credit_lines)
+                if bal_m > 0:
+                    coll_line = {"name": lender, "balance_cents": bal_m, "min_payment_cents": 0}
+                    break
+
+    if coll_bill is None and coll_line is None:
+        return None
+
+    lender_name = (
+        str(_get_field(coll_line, "name", ""))
+        if coll_line is not None
+        else str(_get_field(coll_bill, "name", "Collection Account"))
+    )
+    balance_cents = max(0, int(_get_field(coll_line, "balance_cents", 0) or 0)) if coll_line is not None else 0
+    if coll_bill is not None:
+        bw_pmt = max(100, int(_get_field(coll_bill, "amount_cents", 7_500) or 7_500))
+    else:
+        cfg_min = max(0, int(_get_field(coll_line, "min_payment_cents", 0) or 0))
+        bw_pmt = max(2_500, int(round(cfg_min * 12.0 / 26.0))) if cfg_min > 0 else 7_500
+
+    if balance_cents <= 0:
+        return None
+
+    payments_rem = max(1, int(math.ceil(balance_cents / bw_pmt)))
+    payoff_date = (today + timedelta(days=payments_rem * 14)).isoformat()
+    mo_eq = int(round(bw_pmt * 26.0 / 12.0))
+
+    return CollectionPlanOut(
+        lender_name=lender_name,
+        balance_cents=balance_cents,
+        biweekly_payment_cents=bw_pmt,
+        monthly_equivalent_cents=mo_eq,
+        payments_remaining=payments_rem,
+        payoff_date=payoff_date,
+        freed_biweekly_cents=bw_pmt,
+        freed_monthly_cents=mo_eq,
+        pay_for_delete_note=(
+            f"At ${bw_pmt / 100:,.2f} bi-weekly, {lender_name} reaches $0 in {payments_rem} payments ({payoff_date}). "
+            f"Request written Pay-for-Delete before the final payment so FICO 8 drops it too; FICO 9/10T & "
+            f"VantageScore 3.0/4.0 ignore paid collections automatically at $0, freeing ${mo_eq / 100:,.2f}/mo to cascade into card principal."
+        ),
+    )
+
+
+def build_credit_and_wishlist_roadmap(
+    *,
+    credit_lines: Sequence[Any],
+    transactions: Sequence[Any] = (),
+    recurring_bills: Sequence[Any] = (),
+    goals: Sequence[Any] = (),
+    credit_reports: Sequence[Any] = (),
+    derogatories: Sequence[Any] = (),
+    smoothed_monthly_income_cents: int = 0,
+    payday_cadence_days: int = 14,
+    extra_monthly_budget_cents: int = 25_000,
+    selected_branch: str = "balanced_mission",
+    lookback_days: int = 365,
+    drag_bridge: Optional[DragUtilizationBridge] = None,
+    today: Optional[date] = None,
+) -> CreditMissionRoadmap:
+    """
+    End-to-End Credit 700+ Branching Roadmap, Optimal Bi-Weekly Card Plan & Staged Wishlist Engine.
+
+    Combines:
+    - Exact day-by-day Average Daily Balance bi-weekly vs. monthly revolving card amortization
+    - Automatic collection payment payoff & freed-cashflow cascade (e.g. $75 bi-weekly -> card)
+    - One-time splurge / birthday anomaly filtering (`one-time` / `birthday` / `splurge` tags)
+    - 3 branching trajectories (`balanced_mission`, `credit_sprint`, `gear_upfront`)
+    - 6 empirical credit stages toward 700+ eligibility and Clean Scorecard graduation
+    - Exact paycheck-aligned wishlist unlock dates (EWA Stabilization Pool -> Priority Tier 1 -> Tier 2 -> Tier 3)
+    """
+    ref = today or date.today()
+    eff_branch: str = (selected_branch or "balanced_mission").strip().lower()
+    if eff_branch not in ("balanced_mission", "credit_sprint", "gear_upfront"):
+        eff_branch = "balanced_mission"
+
+    bridge = drag_bridge or analyze_financial_drag_bridge(
+        credit_lines=credit_lines,
+        transactions=transactions,
+        derogatories=derogatories,
+        extra_monthly_budget_cents=extra_monthly_budget_cents,
+        lookback_days=lookback_days,
+        today=ref,
+    )
+
+    # 1. Latest actual bureau scores (FICO 8 & VantageScore 3.0)
+    curr_fico8: Optional[int] = None
+    curr_vantage3: Optional[int] = None
+    for r in credit_reports or ():
+        model = str(_get_field(r, "model", "fico8") or "fico8").lower()
+        sc = int(_get_field(r, "score", 0) or 0)
+        if sc < 300:
+            continue
+        if model == "fico8" and curr_fico8 is None:
+            curr_fico8 = sc
+        elif model == "vantage3" and curr_vantage3 is None:
+            curr_vantage3 = sc
+
+    # 2. Steady-state income & splurge-adjusted 90d monthly spend baseline
+    recent90_iso = (ref - timedelta(days=89)).isoformat()
+    ref_iso = ref.isoformat()
+    splurge_excluded = 0
+    splurge_count = 0
+    steady_90d_expense = 0
+    income_90d = 0
+    for tx in transactions or ():
+        tx_date_str = str(_get_field(tx, "tx_date", "") or "")[:10]
+        if len(tx_date_str) < 10 or not (recent90_iso <= tx_date_str <= ref_iso):
+            continue
+        amt = max(0, int(_get_field(tx, "amount_cents", 0) or 0))
+        if amt <= 0:
+            continue
+        ttype_raw = _get_field(tx, "tx_type", "expense")
+        ttype = str(ttype_raw.value if hasattr(ttype_raw, "value") else (ttype_raw or "expense")).strip().lower()
+        merchant = str(_get_field(tx, "merchant", "") or "")
+        if _match_ewa_app(merchant) is not None:
+            continue  # Exclude recycled EWA churn from steady-state income/spend baseline
+        if ttype == "income":
+            income_90d += amt
+        elif ttype == "expense":
+            tags = _extract_tx_tags(tx)
+            if tags & _SPLURGE_TAGS:
+                splurge_excluded += amt
+                splurge_count += 1
+            else:
+                steady_90d_expense += amt
+
+    est_monthly_income = max(int(smoothed_monthly_income_cents or 0), int(round(income_90d / 3.0)))
+    est_steady_spend = int(round(steady_90d_expense / 3.0))
+
+    # 3. Collection bi-weekly plan & cascade schedule
+    coll_plan = _detect_biweekly_collection_plan(
+        credit_lines=credit_lines,
+        recurring_bills=recurring_bills,
+        derogatories=derogatories,
+        today=ref,
+    )
+    cascade_days = (coll_plan.payments_remaining * 14) if coll_plan is not None else None
+    cascade_bw_bonus = coll_plan.freed_biweekly_cents if coll_plan is not None else 0
+
+    # 4. Optimal 3-tier Credit Card Payment Plan (Safe Floor | Optimal Bi-Weekly | Aggressive Sprint)
+    rev_bal = bridge.revolving_balance_cents
+    rev_lim = bridge.revolving_limit_cents
+    weighted_apr = bridge.weighted_revolving_apr_bps
+    min_amort_mo = max(bridge.min_amortizing_revolving_payment_cents, 5_000) if rev_bal > 0 else 0
+    rev_mins_mo = max(0, bridge.baseline_monthly_payment_cents - max(0, int(extra_monthly_budget_cents)))
+
+    # Round cleanly to nearest $5 (500 cents) so real-world bank autopay amounts feel natural
+    def _round5(cents: int) -> int:
+        return max(500, int(round(cents / 500.0)) * 500) if cents > 0 else 0
+
+    if rev_bal > 0:
+        safe_floor_bw = _round5(max(int(math.ceil(min_amort_mo / 2.0)), int(math.ceil(rev_mins_mo / 2.0)) + 2_500))
+        # Optimal bi-weekly balances strong principal velocity (~14-18% of monthly paycheck) with EWA/wishlist room
+        income_target_bw = _round5(int(round(est_monthly_income * 0.085))) if est_monthly_income > 0 else 20_000
+        optimal_bw = max(
+            safe_floor_bw + 5_000,
+            min(45_000, max(income_target_bw, _round5((rev_mins_mo + max(25_000, extra_monthly_budget_cents)) // 2))),
+        )
+        # Reclaimed fees boost optimal/sprint velocity naturally
+        reclaim_bw = int(round(bridge.reclaimable_monthly_cents * 12.0 / 26.0))
+        aggressive_bw = max(optimal_bw + 7_500, _round5(optimal_bw + max(7_500, reclaim_bw + 5_000)))
+    else:
+        safe_floor_bw = 0
+        optimal_bw = 0
+        aggressive_bw = 0
+
+    tier_specs = [
+        (
+            "safe_floor",
+            "Safe Floor",
+            False,
+            safe_floor_bw,
+            "Clears monthly interest plus steady principal while preserving maximum checking liquidity during stabilization.",
+        ),
+        (
+            "optimal_biweekly",
+            "Optimal Bi-Weekly",
+            True,
+            optimal_bw,
+            "Syncs every payday (26x/yr = 13 monthly payments/yr), cuts Average Daily Balance interest, and leaves room for your Stabilization Pool & Tier 1 gear.",
+        ),
+        (
+            "aggressive_sprint",
+            "Aggressive Sprint",
+            False,
+            aggressive_bw,
+            "Deploys maximum bi-weekly surplus toward revolving principal to clear utilization cliffs and restore your 25-day grace period earliest.",
+        ),
+    ]
+
+    tiers_out: List[CardPaymentTierOut] = []
+    for tid, tlabel, is_rec, bw_c, rationale in tier_specs:
+        mo_c = bw_c * 2
+        cmp = simulate_biweekly_vs_monthly_payoff(
+            balance_cents=rev_bal,
+            apr_bps=weighted_apr,
+            monthly_payment_cents=mo_c,
+            biweekly_payment_cents=bw_c,
+            today=ref,
+        )
+        casc_sim = _simulate_adb_biweekly_trajectory(
+            balance_cents=rev_bal,
+            limit_cents=rev_lim,
+            apr_bps=weighted_apr,
+            biweekly_payment_cents=bw_c,
+            today=ref,
+            cascade_after_days=cascade_days,
+            cascade_biweekly_bonus_cents=cascade_bw_bonus,
+        )
+        tiers_out.append(
+            CardPaymentTierOut(
+                tier_id=tid,  # type: ignore[arg-type]
+                label=tlabel,
+                recommended=is_rec,
+                monthly_payment_cents=mo_c,
+                biweekly_payment_cents=bw_c,
+                monthly_payoff_months=cmp["monthly_payoff_months"],
+                monthly_payoff_date=cmp["monthly_payoff_date"],
+                monthly_total_interest_cents=cmp["monthly_total_interest_cents"],
+                biweekly_payoff_months=cmp["biweekly_payoff_months"],
+                biweekly_payoff_date=cmp["biweekly_payoff_date"],
+                biweekly_total_interest_cents=cmp["biweekly_total_interest_cents"],
+                biweekly_interest_saved_cents=cmp["biweekly_interest_saved_cents"],
+                biweekly_months_saved=cmp["biweekly_months_saved"],
+                with_cascade_payoff_date=casc_sim["payoff_date"],
+                rationale=rationale,
+            )
+        )
+
+    close_tip = (
+        f"Schedule your second bi-weekly payment at least 3 days before {bridge.primary_target_close_date} "
+        f"statement close so bureaus record the lowest utilization snapshot."
+        if bridge.primary_target_close_date
+        else "Align bi-weekly payments 3 days before statement close to lock in lower reported utilization."
+    )
+    optimal_card_plan = OptimalCardPaymentPlan(
+        primary_card_name=bridge.primary_target_card_name,
+        revolving_balance_cents=rev_bal,
+        weighted_apr_bps=weighted_apr,
+        statement_close_date=bridge.primary_target_close_date,
+        recommended_tier_id="optimal_biweekly",
+        recommended_biweekly_cents=optimal_bw,
+        recommended_monthly_cents=optimal_bw * 2,
+        statement_close_alignment_tip=close_tip,
+        tiers=tiers_out,
+    )
+
+    # 5. Staged Active Goals / Wishlist Inspection (Stabilization Pool + Gear Tiers)
+    active_goals = [
+        g
+        for g in (goals or ())
+        if str(_get_field(g, "status", "active") or "active").lower() == "active"
+        and _get_field(g, "deleted_at", None) is None
+    ]
+    active_goals.sort(
+        key=lambda g: (
+            0
+            if (
+                str(_get_field(g, "category", "")).lower() == "emergency"
+                or "stabiliz" in str(_get_field(g, "name", "")).lower()
+                or "ewa" in str(_get_field(g, "name", "")).lower()
+            )
+            else 1,
+            int(_get_field(g, "priority", 2) or 2),
+            int(_get_field(g, "priority_order", 0) or 0),
+            int(_get_field(g, "id", 0) or 0),
+        )
+    )
+    gear_total_remaining = sum(
+        max(0, int(_get_field(g, "target_cents", 0) or 0) - int(_get_field(g, "saved_cents", 0) or 0))
+        for g in active_goals
+        if not (
+            str(_get_field(g, "category", "")).lower() == "emergency"
+            or "stabiliz" in str(_get_field(g, "name", "")).lower()
+            or "ewa" in str(_get_field(g, "name", "")).lower()
+        )
+    )
+    if gear_total_remaining <= 0:
+        gear_total_remaining = 50_000  # Reference $500 kit comparison when no gadget goals exist yet
+
+    ewa_pool_target = max(bridge.ewa_exit_buffer_target_cents, 50_000 if bridge.ewa_cycle_count > 0 else 0)
+    for g in active_goals:
+        if (
+            str(_get_field(g, "category", "")).lower() == "emergency"
+            or "stabiliz" in str(_get_field(g, "name", "")).lower()
+        ):
+            ewa_pool_target = max(
+                ewa_pool_target,
+                max(0, int(_get_field(g, "target_cents", 0) or 0) - int(_get_field(g, "saved_cents", 0) or 0)),
+            )
+            break
+
+    # 6. Compute All 3 Branching Trajectories Over Time (Exact ADB + Collection Cascade)
+    wishlist_slice_balanced = 6_000  # $60/paycheck (~$130/mo) controlled sinking slice
+    stab_slice_balanced = 12_500  # $125/paycheck toward Stabilization Pool
+    stab_paychecks_bal = max(1, int(math.ceil(ewa_pool_target / stab_slice_balanced))) if ewa_pool_target > 0 else 0
+    stab_date_bal = (ref + timedelta(days=stab_paychecks_bal * 14)).isoformat()
+
+    stab_paychecks_sprint = max(1, int(math.ceil(ewa_pool_target / 17_500))) if ewa_pool_target > 0 else 0
+    stab_date_sprint = (ref + timedelta(days=stab_paychecks_sprint * 14)).isoformat()
+
+    # Upfront gear delays stabilization + first card paydown cycles by exact time to absorb full gadget cost
+    upfront_delay_cycles = max(2, int(math.ceil(gear_total_remaining / max(10_000, optimal_bw))))
+    upfront_delay_days = upfront_delay_cycles * 14
+    stab_date_upfront = (ref + timedelta(days=upfront_delay_days + stab_paychecks_bal * 14)).isoformat()
+
+    sim_sprint = _simulate_adb_biweekly_trajectory(
+        balance_cents=rev_bal,
+        limit_cents=rev_lim,
+        apr_bps=weighted_apr,
+        biweekly_payment_cents=aggressive_bw,
+        today=ref,
+        cascade_after_days=cascade_days,
+        cascade_biweekly_bonus_cents=cascade_bw_bonus,
+    )
+    sim_balanced = _simulate_adb_biweekly_trajectory(
+        balance_cents=rev_bal,
+        limit_cents=rev_lim,
+        apr_bps=weighted_apr,
+        biweekly_payment_cents=optimal_bw,
+        today=ref,
+        cascade_after_days=cascade_days,
+        cascade_biweekly_bonus_cents=cascade_bw_bonus,
+    )
+    sim_upfront = _simulate_adb_biweekly_trajectory(
+        balance_cents=rev_bal,
+        limit_cents=rev_lim,
+        apr_bps=weighted_apr,
+        biweekly_payment_cents=optimal_bw,
+        today=ref,
+        delay_days=upfront_delay_days,
+        cascade_after_days=cascade_days,
+        cascade_biweekly_bonus_cents=cascade_bw_bonus,
+    )
+
+    sprint_int = int(sim_sprint["total_interest_cents"])
+    bal_int = int(sim_balanced["total_interest_cents"])
+    up_int = int(sim_upfront["total_interest_cents"])
+
+    def _target_700_date(sim_d: Dict[str, Any]) -> Optional[str]:
+        sub9 = sim_d["cliff_dates"].get(8.9)
+        if coll_plan is not None and sub9:
+            return max(sub9, coll_plan.payoff_date)
+        return sub9 or sim_d["payoff_date"]
+
+    balanced_tagline = (
+        f"Stabilize first, fund Priority 1 wishlist safely, cascade ${coll_plan.biweekly_payment_cents / 100:,.0f}/2wk collection into card"
+        if coll_plan is not None
+        else "Stabilize first, fund Priority 1 wishlist safely, and hold optimal bi-weekly card payments"
+    )
+    branches_out: List[RoadmapBranchOut] = [
+        RoadmapBranchOut(
+            branch_id="balanced_mission",
+            label="Balanced Mission Plan",
+            tagline=balanced_tagline,
+            recommended=True,
+            biweekly_card_payment_cents=optimal_bw,
+            biweekly_wishlist_slice_cents=wishlist_slice_balanced,
+            stabilization_date=stab_date_bal,
+            sub_30_date=sim_balanced["cliff_dates"].get(28.9),
+            sub_9_azeo_date=sim_balanced["cliff_dates"].get(8.9),
+            zero_balance_date=sim_balanced["payoff_date"],
+            target_700_band_date=_target_700_date(sim_balanced),
+            total_revolving_interest_cents=bal_int,
+            interest_delta_vs_sprint_cents=max(0, bal_int - sprint_int),
+            tradeoff_summary=(
+                f"Keeps ${optimal_bw / 100:,.2f} bi-weekly attacking principal while carving ${wishlist_slice_balanced / 100:,.2f}/paycheck "
+                f"to unlock your top-priority gear without re-entering EWA payday apps."
+            ),
+        ),
+        RoadmapBranchOut(
+            branch_id="credit_sprint",
+            label="Fastest 700+ Credit Sprint",
+            tagline="Pause gear purchases until <8.9% AZEO — minimum interest & earliest 700+ band",
+            recommended=False,
+            biweekly_card_payment_cents=aggressive_bw,
+            biweekly_wishlist_slice_cents=0,
+            stabilization_date=stab_date_sprint,
+            sub_30_date=sim_sprint["cliff_dates"].get(28.9),
+            sub_9_azeo_date=sim_sprint["cliff_dates"].get(8.9),
+            zero_balance_date=sim_sprint["payoff_date"],
+            target_700_band_date=_target_700_date(sim_sprint),
+            total_revolving_interest_cents=sprint_int,
+            interest_delta_vs_sprint_cents=0,
+            tradeoff_summary=(
+                f"Sends ${aggressive_bw / 100:,.2f} bi-weekly straight to principal, saving "
+                f"${max(0, bal_int - sprint_int) / 100:,.2f} vs. Balanced and hitting <8.9% AZEO fastest; buy full gear kit cash afterward."
+            ),
+        ),
+        RoadmapBranchOut(
+            branch_id="gear_upfront",
+            label="Full Kit Upfront (Tradeoff)",
+            tagline="Buy entire wishlist immediately — exposes exact interest & timeline delay",
+            recommended=False,
+            biweekly_card_payment_cents=optimal_bw,
+            biweekly_wishlist_slice_cents=gear_total_remaining,
+            stabilization_date=stab_date_upfront,
+            sub_30_date=sim_upfront["cliff_dates"].get(28.9),
+            sub_9_azeo_date=sim_upfront["cliff_dates"].get(8.9),
+            zero_balance_date=sim_upfront["payoff_date"],
+            target_700_band_date=_target_700_date(sim_upfront),
+            total_revolving_interest_cents=up_int,
+            interest_delta_vs_sprint_cents=max(0, up_int - sprint_int),
+            tradeoff_summary=(
+                f"Diverting ${gear_total_remaining / 100:,.2f} upfront delays stabilization by {upfront_delay_cycles} paychecks "
+                f"and adds ${max(0, up_int - bal_int) / 100:,.2f} in extra revolving interest vs. Balanced Mission."
+            ),
+        ),
+    ]
+
+    active_sim = (
+        sim_sprint
+        if eff_branch == "credit_sprint"
+        else (sim_upfront if eff_branch == "gear_upfront" else sim_balanced)
+    )
+    active_branch = next(b for b in branches_out if b.branch_id == eff_branch)
+
+    # 7. Build 6 Ordered Stages for the Selected Branch (Zero Fabricated Score-Delta Claims!)
+    ch7_drop: Optional[str] = None
+    for dg in derogatories or ():
+        if bool(_get_field(dg, "active", True)) and str(_get_field(dg, "kind", "")).lower() == "bankruptcy_ch7":
+            ch7_drop = str(_get_field(dg, "drops_off", "") or "")[:10] or None
+            break
+
+    past_due_bal = sum(
+        max(0, int(_get_field(ln, "balance_cents", 0) or 0))
+        for ln in (credit_lines or ())
+        if "past due" in str(_get_field(ln, "name", "") or "").lower()
+    )
+
+    score_now_str = (
+        f"EX FICO 8: {curr_fico8} · TU Vantage 3.0: {curr_vantage3}"
+        if (curr_fico8 and curr_vantage3)
+        else (f"Current Score: {curr_fico8 or curr_vantage3}" if (curr_fico8 or curr_vantage3) else "Current Baseline")
+    )
+
+    stages_out: List[RoadmapStageOut] = [
+        RoadmapStageOut(
+            stage_number=0,
+            stage_id="stage_0_baseline",
+            title="Current Baseline",
+            status="current",
+            target_date=ref.isoformat(),
+            target_util_pct=bridge.current_utilization_pct,
+            target_revolving_balance_cents=rev_bal,
+            score_band_note=f"{score_now_str} · Utilization {bridge.current_utilization_pct:.1f}%",
+            unlock_criteria=[
+                f"Revolving balance ${rev_bal / 100:,.2f} / ${rev_lim / 100:,.2f}",
+                f"Open EWA advances shielded: ${bridge.ewa_estimated_open_advance_cents / 100:,.2f}",
+            ],
+            cashflow_shift=f"Active interest burn: ${bridge.live_monthly_revolving_interest_cents / 100:,.2f}/mo",
+        ),
+        RoadmapStageOut(
+            stage_number=1,
+            stage_id="stage_1_stabilize",
+            title="Stabilize Cash Flow & Delete EWA Apps",
+            status="next",
+            target_date=active_branch.stabilization_date,
+            target_util_pct=88.9 if bridge.current_utilization_pct > 88.9 else bridge.current_utilization_pct,
+            target_revolving_balance_cents=(rev_lim * 889) // 1000 if rev_lim > 0 else rev_bal,
+            score_band_note="Stabilized Cash Flow · Exit Maxed-Out Band (<88.9%)",
+            unlock_criteria=[
+                f"Cover ${bridge.ewa_estimated_open_advance_cents / 100:,.2f} unsettled EWA debits & fund ${ewa_pool_target / 100:,.2f} Stabilization Pool",
+                "Revoke bank access on data-harvesting EWA apps (Dave, Brigit, Klover) & stop card cash advances",
+                (
+                    f"Clear ${past_due_bal / 100:,.2f} past-due telecom balance before collection referral"
+                    if past_due_bal > 0
+                    else "Confirm 100% autopay coverage across all active accounts"
+                ),
+            ],
+            cashflow_shift=f"Start ${active_branch.biweekly_card_payment_cents / 100:,.2f} bi-weekly card autopay",
+        ),
+        RoadmapStageOut(
+            stage_number=2,
+            stage_id="stage_2_collection_cascade",
+            title="Collection $0 + Freed-Cashflow Cascade",
+            status="upcoming",
+            target_date=coll_plan.payoff_date if coll_plan is not None else (active_sim["cliff_dates"].get(68.9) or _add_months_date(ref, 5).isoformat()),
+            target_util_pct=68.9 if bridge.current_utilization_pct > 68.9 else bridge.current_utilization_pct,
+            target_revolving_balance_cents=(rev_lim * 689) // 1000 if rev_lim > 0 else 0,
+            score_band_note="FICO 9 / 10T & VantageScore 3.0/4.0 Ignore Paid Collection at $0",
+            unlock_criteria=[
+                (
+                    f"Finish {coll_plan.payments_remaining} bi-weekly ${coll_plan.biweekly_payment_cents / 100:,.2f} payments on {coll_plan.lender_name} + request written Pay-for-Delete"
+                    if coll_plan is not None
+                    else "Clear High-Drag 68.9% utilization cliff before statement close"
+                ),
+                "Roll freed collection payment directly into bi-weekly revolving principal",
+            ],
+            cashflow_shift=(
+                f"+${coll_plan.freed_biweekly_cents / 100:,.2f} bi-weekly (+${coll_plan.freed_monthly_cents / 100:,.2f}/mo) cascaded into card"
+                if coll_plan is not None
+                else "Compound monthly interest reduction accelerates principal"
+            ),
+        ),
+        RoadmapStageOut(
+            stage_number=3,
+            stage_id="stage_3_sub30",
+            title="Sub-30% Standard Cliff (<28.9%) & Trended Deleveraging",
+            status="upcoming",
+            target_date=active_branch.sub_30_date or _add_months_date(ref, 12).isoformat(),
+            target_util_pct=28.9,
+            target_revolving_balance_cents=(rev_lim * 289) // 1000 if rev_lim > 0 else 0,
+            score_band_note="Good Utilization Band · VantageScore 3.0/4.0 & FICO 9 Approaching 700+",
+            unlock_criteria=[
+                f"Drive revolving balance <= ${((rev_lim * 289) // 1000) / 100:,.2f} (3 days before statement close)",
+                "Maintain 100% on-time streak + zero new hard inquiries for clean 24-month FICO 10T downward slope",
+            ],
+            cashflow_shift="Monthly revolving interest cut by >70% vs. baseline",
+        ),
+        RoadmapStageOut(
+            stage_number=4,
+            stage_id="stage_4_700_azeo",
+            title="Peak <8.9% AZEO + $0 Grace Period Restored (700+ Target)",
+            status="milestone_700",
+            target_date=active_branch.target_700_band_date or _add_months_date(ref, 18).isoformat(),
+            target_util_pct=8.9,
+            target_revolving_balance_cents=(rev_lim * 89) // 1000 if rev_lim > 0 else 0,
+            score_band_note="700+ Profile Eligibility Band (VantageScore 3.0/4.0, FICO 9/10T & Upper FICO 8 Public-Record Tier)",
+            unlock_criteria=[
+                f"Pay card to $0.00 ({active_branch.zero_balance_date or 'target date'}) to restore 25-day purchase grace period and stop 1% overseas debit FX fees",
+                f"Run AZEO: report 1%–4.9% (${((rev_lim * 25) // 1000) / 100:,.2f}) on 1 card at statement close, autopay in full on due date",
+            ],
+            cashflow_shift=f"+${bridge.live_monthly_revolving_interest_cents / 100:,.2f}/mo interest burn permanently eliminated",
+        ),
+    ]
+
+    if ch7_drop:
+        stages_out.append(
+            RoadmapStageOut(
+                stage_number=5,
+                stage_id="stage_5_clean_scorecard",
+                title="Statutory Ch. 7 Drop-Off & Clean Scorecard Graduation",
+                status="clean_scorecard",
+                target_date=ch7_drop,
+                target_util_pct=4.9,
+                target_revolving_balance_cents=(rev_lim * 49) // 1000 if rev_lim > 0 else 0,
+                score_band_note="Clean Thick-File FICO 8 Scorecard (Prime 740+ Band Eligible with <8.9% AZEO)",
+                unlock_criteria=[
+                    f"Chapter 7 public record ages off under FCRA (+10y) on {ch7_drop}",
+                    "Keep oldest revolving account open with tiny recurring autopay + <8.9% AZEO",
+                ],
+                cashflow_shift="Eligible for prime auto refinancing & zero-annual-fee credit limit increases",
+            )
+        )
+
+    # 8. Staged Wishlist Unlock Schedule (Sequential Bi-Weekly Paycheck Funding)
+    wishlist_unlocks: List[WishlistUnlockOut] = []
+    cursor_date = ref
+    if eff_branch == "credit_sprint":
+        # Sprint defers non-stabilization gear until <8.9% AZEO milestone
+        gear_start_date = (
+            date.fromisoformat(active_branch.sub_9_azeo_date)
+            if active_branch.sub_9_azeo_date
+            else _add_months_date(ref, 12)
+        )
+    else:
+        gear_start_date = ref
+
+    for g in active_goals:
+        gid = _get_field(g, "id", None)
+        gname = str(_get_field(g, "name", "Goal") or "Goal")
+        gcat = str(_get_field(g, "category", "general") or "general").lower()
+        gprio = int(_get_field(g, "priority", 2) or 2)
+        gtgt = max(0, int(_get_field(g, "target_cents", 0) or 0))
+        gsav = max(0, int(_get_field(g, "saved_cents", 0) or 0))
+        grem = max(0, gtgt - gsav)
+        is_stab = gcat == "emergency" or "stabiliz" in gname.lower() or "ewa" in gname.lower()
+
+        if grem == 0:
+            wishlist_unlocks.append(
+                WishlistUnlockOut(
+                    goal_id=int(gid) if gid is not None else None,
+                    goal_name=gname,
+                    category=gcat,
+                    priority=gprio,
+                    target_cents=gtgt,
+                    saved_cents=gsav,
+                    remaining_cents=0,
+                    per_paycheck_cents=0,
+                    paychecks_needed=0,
+                    unlock_date=ref.isoformat(),
+                    status="funded",
+                    note="Fully funded and ready.",
+                )
+            )
+            continue
+
+        if is_stab:
+            per_chk = 17_500 if eff_branch == "credit_sprint" else stab_slice_balanced
+            start_dt = (ref + timedelta(days=upfront_delay_days)) if eff_branch == "gear_upfront" else ref
+            p_needed = max(1, int(math.ceil(grem / per_chk)))
+            unlock_dt = start_dt + timedelta(days=p_needed * 14)
+            cursor_date = max(cursor_date, unlock_dt)
+            wishlist_unlocks.append(
+                WishlistUnlockOut(
+                    goal_id=int(gid) if gid is not None else None,
+                    goal_name=gname,
+                    category=gcat,
+                    priority=gprio,
+                    target_cents=gtgt,
+                    saved_cents=gsav,
+                    remaining_cents=grem,
+                    per_paycheck_cents=per_chk,
+                    paychecks_needed=p_needed,
+                    unlock_date=unlock_dt.isoformat(),
+                    status="active_priority",
+                    note="Priority #1 foundation: eliminates reliance on data-harvesting EWA paycheck apps permanently.",
+                )
+            )
+        else:
+            if eff_branch == "gear_upfront":
+                per_chk = grem
+                p_needed = 1
+                unlock_dt = ref
+                status_str = "active_priority"
+                note = "Funded immediately upfront (adds interest & delays stabilization — see branch comparison)."
+            elif eff_branch == "credit_sprint":
+                per_chk = max(15_000, optimal_bw)
+                start_dt = max(cursor_date, gear_start_date)
+                p_needed = max(1, int(math.ceil(grem / per_chk)))
+                unlock_dt = start_dt + timedelta(days=p_needed * 14)
+                cursor_date = unlock_dt
+                status_str = "queued_after_cliff"
+                note = "Queued in cash after <8.9% AZEO sprint clears revolving interest."
+            else:
+                # Balanced Mission: fund sequentially right after Stabilization Pool using controlled paycheck slice
+                per_chk = wishlist_slice_balanced
+                p_needed = max(1, int(math.ceil(grem / per_chk)))
+                unlock_dt = cursor_date + timedelta(days=p_needed * 14)
+                cursor_date = unlock_dt
+                status_str = "queued_after_stabilization" if gprio <= 1 else "queued_after_cliff"
+                note = (
+                    f"Tier 1 core gear: ${per_chk / 100:,.2f}/paycheck right after Stabilization Pool ({p_needed} paychecks, zero credit-card debt added)."
+                    if gprio <= 1
+                    else f"Tier {gprio} upgrade: unlocks sequentially via ${per_chk / 100:,.2f}/paycheck sinking slice once prior tier completes."
+                )
+
+            wishlist_unlocks.append(
+                WishlistUnlockOut(
+                    goal_id=int(gid) if gid is not None else None,
+                    goal_name=gname,
+                    category=gcat,
+                    priority=gprio,
+                    target_cents=gtgt,
+                    saved_cents=gsav,
+                    remaining_cents=grem,
+                    per_paycheck_cents=per_chk,
+                    paychecks_needed=p_needed,
+                    unlock_date=unlock_dt.isoformat(),
+                    status=status_str,  # type: ignore[arg-type]
+                    note=note,
+                )
+            )
+
+    return CreditMissionRoadmap(
+        generated_date=ref.isoformat(),
+        selected_branch=eff_branch,  # type: ignore[arg-type]
+        current_fico8_score=curr_fico8,
+        current_vantage3_score=curr_vantage3,
+        target_score_goal=700,
+        estimated_monthly_income_cents=est_monthly_income,
+        estimated_steady_monthly_spend_cents=est_steady_spend,
+        splurge_excluded_cents=splurge_excluded,
+        splurge_tx_count=splurge_count,
+        ewa_exit_pool_target_cents=ewa_pool_target,
+        ewa_open_advance_cents=bridge.ewa_estimated_open_advance_cents,
+        collection_plan=coll_plan,
+        optimal_card_plan=optimal_card_plan,
+        branches=branches_out,
+        stages=stages_out,
+        wishlist_unlocks=wishlist_unlocks,
+    )
+
 

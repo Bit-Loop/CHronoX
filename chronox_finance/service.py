@@ -172,6 +172,7 @@ from chronox_finance.models import (
     CreditInquiryOut,
     CreditLineCreate,
     CreditLineUpdate,
+    CreditMissionRoadmap,
     CreditOptimizationReport,
     CreditReportCreate,
     CreditReportOut,
@@ -4522,13 +4523,15 @@ class FinanceService:
         *,
         include_authorized_user: bool = True,
         include_sandbox: bool = False,
+        selected_branch: str = "balanced_mission",
         lookback_days: int = 365,
         today: Optional[date] = None,
     ) -> CreditOptimizationReport:
         ref = today or date.today()
+        settings = self.storage.get_settings()
         budget = self._compute_budget(today=ref)
         start_iso = (ref - timedelta(days=max(30, min(730, int(lookback_days))) - 1)).isoformat()
-        recent_txs = self.storage.list_transactions(limit=None, start_date=start_iso)
+        recent_txs = self.storage.list_transactions(limit=None, start_date=start_iso, include_tags=True)
         return self.credit_optimizer.analyze(
             raw_lines=self.storage.list_credit_lines(active_only=True, include_sandbox=include_sandbox),
             smoothed_monthly_income_cents=budget.smoothed_monthly_income_cents,
@@ -4537,10 +4540,33 @@ class FinanceService:
             credit_inquiries=self.storage.list_credit_inquiries(include_sandbox=include_sandbox),
             credit_derogatories=self.storage.list_credit_derogatories(active_only=False, include_sandbox=include_sandbox),
             transactions=recent_txs,
+            recurring_bills=self.storage.list_recurring_bills(active_only=True),
+            goals=self.storage.list_goals(include_completed=False),
+            payday_cadence_days=int(settings.get("payday_cadence_days", 14) or 14),
+            selected_branch=selected_branch,
             lookback_days=lookback_days,
             include_authorized_user=include_authorized_user,
             today=ref,
         )
+
+    def get_credit_roadmap(
+        self,
+        *,
+        branch: str = "balanced_mission",
+        extra_monthly_budget_cents: int = 25_000,
+        lookback_days: int = 365,
+        include_sandbox: bool = False,
+        today: Optional[date] = None,
+    ) -> CreditMissionRoadmap:
+        rep = self.get_credit_report(
+            extra_monthly_budget_cents=extra_monthly_budget_cents,
+            include_sandbox=include_sandbox,
+            selected_branch=branch,
+            lookback_days=lookback_days,
+            today=today,
+        )
+        assert rep.mission_roadmap is not None
+        return rep.mission_roadmap
 
     def get_drag_utilization_bridge(
         self,
