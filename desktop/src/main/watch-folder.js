@@ -7,7 +7,7 @@ const path = require("path");
 
 const SUPPORTED_EXTS = new Set([".csv", ".tsv", ".ofx", ".qfx", ".qif", ".json", ".pdf"]);
 const IGNORED_SUFFIXES = [".crdownload", ".part", ".tmp", ".download", ".partial"];
-const MAX_FILE_BYTES = 5 * 1024 * 1024;
+const MAX_FILE_BYTES = 25 * 1024 * 1024;
 const DEBOUNCE_MS = 1200;
 
 /**
@@ -227,6 +227,27 @@ class WatchFolderController {
         return { ok: false, error: this._lastError };
       }
 
+      const importedCount = Number(resp.data.imported_count || 0);
+      const duplicateCount = Number(resp.data.duplicate_count || 0);
+      const pendingSkipped = Number(resp.data.pending_skipped || 0);
+      const totalParsed =
+        resp.data.total_parsed != null
+          ? Number(resp.data.total_parsed)
+          : importedCount + duplicateCount;
+      const warnings = Array.isArray(resp.data.warnings) ? resp.data.warnings : [];
+
+      if (
+        resp.data.parse_failed === true ||
+        (totalParsed === 0 && importedCount === 0 && duplicateCount === 0 && pendingSkipped === 0)
+      ) {
+        const warnMsg =
+          warnings[0] ||
+          "Statement contained zero readable transaction rows; file left in watch folder.";
+        this._lastError = `${filename}: ${warnMsg}`;
+        this.onLog("warn", this._lastError);
+        return { ok: false, error: this._lastError };
+      }
+
       // Archive the processed file cleanly into `<watchFolder>/Imported/`
       const importedDir = path.join(this.folderPath, "Imported");
       fs.mkdirSync(importedDir, { recursive: true });
@@ -239,8 +260,6 @@ class WatchFolderController {
         fs.unlinkSync(filePath);
       }
 
-      const importedCount = Number(resp.data.imported_count || 0);
-      const duplicateCount = Number(resp.data.duplicate_count || 0);
       const detectedInstitution = String(resp.data.detected_institution || "generic");
       const formatDetected = String(resp.data.format_detected || "statement").toUpperCase();
 

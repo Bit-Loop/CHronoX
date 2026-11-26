@@ -289,10 +289,16 @@ class AccountCreate(BaseModel):
     balance_cents: int = Field(0, ge=-100_000_000_00, le=100_000_000_00)
     institution: str = Field("", max_length=80)
     is_liquid: bool = True
+    currency: str = Field("USD", min_length=3, max_length=12)
+    available_cents: Optional[int] = Field(None, ge=-100_000_000_00, le=100_000_000_00)
+    credit_limit_cents: Optional[int] = Field(None, ge=0, le=100_000_000_00)
+    mask: str = Field("", max_length=16)
 
 
 class AccountOut(AccountCreate):
     id: int
+    connection_id: Optional[int] = None
+    external_id: str = ""
     created_at: str
     updated_at: str
 
@@ -319,6 +325,8 @@ class JarState(BaseModel):
     target_pct: float
     monthly_target_cents: int
     auto_allocated_cents: int
+    funded_cents: int = 0
+    projected_allocation_cents: int = 0
     rollover_cents: int
     spent_cents: int
     available_cents: int
@@ -328,6 +336,7 @@ class JarState(BaseModel):
     is_locked: bool
     rollover_enabled: bool
     rollover_cap_cents: Optional[int] = None
+    needs_setup: bool = False
     calm_note: str
 
 
@@ -387,6 +396,7 @@ class TransactionCreate(BaseModel):
     memo: str = Field("", max_length=300)
     tx_date: str = Field(default_factory=lambda: date.today().isoformat())
     source: str = Field("manual", max_length=40)
+    transfer_direction: Optional[Literal["out", "in"]] = None
 
     @field_validator("tx_date")
     @classmethod
@@ -765,7 +775,7 @@ class ProfileSettings(BaseModel):
     default_cooling_hours: int = Field(48, ge=1, le=720)
     payday_cadence_days: int = Field(14, ge=7, le=31)
     next_payday_date: Optional[str] = None
-    expected_paycheck_cents: int = Field(220_000, ge=0, le=50_000_000)
+    expected_paycheck_cents: int = Field(0, ge=0, le=50_000_000)
     calm_mode: bool = True
     auto_rebalance_enabled: bool = True
     onboarding_completed: bool = False
@@ -862,6 +872,10 @@ class ConnectionOut(BaseModel):
     last_synced_at: Optional[str] = None
     history_days_requested: int = 730
     needs_relink_for_730d: bool = False
+    backfill_status: str = "complete"
+    imported_start_date: Optional[str] = None
+    imported_end_date: Optional[str] = None
+    last_error: str = ""
     created_at: str = ""
     updated_at: str = ""
 
@@ -869,7 +883,7 @@ class ConnectionOut(BaseModel):
 class PlaidConfigRequest(BaseModel):
     client_id: str = Field(..., min_length=4, max_length=128)
     secret: str = Field(..., min_length=4, max_length=256)
-    env: Literal["sandbox", "production"] = "sandbox"
+    env: Literal["sandbox", "production"] = "production"
 
 
 class PlaidLinkTokenRequest(BaseModel):
@@ -917,6 +931,15 @@ class BrokerSchwabConnectRequest(BaseModel):
     client_secret: str = Field(..., min_length=4, max_length=256)
     redirect_uri: str = Field("https://127.0.0.1:8787/api/v1/brokers/schwab/callback", max_length=256)
     label: str = Field("Charles Schwab", max_length=100)
+    start_callback_listener: bool = True
+
+
+class BrokerSchwabCompleteRequest(BaseModel):
+    callback_url_or_code: Optional[str] = Field(None, max_length=2048)
+    redirect_url: Optional[str] = Field(None, max_length=2048)
+    code: Optional[str] = Field(None, max_length=2048)
+    state: Optional[str] = Field(None, max_length=256)
+    redirect_uri: Optional[str] = Field(None, max_length=256)
 
 
 class EmailConfigUpdate(BaseModel):
@@ -1069,7 +1092,7 @@ class RuleTestResult(BaseModel):
     samples: List[RuleTestMatchSample] = Field(default_factory=list)
 
 
-# --- Credit Reports, Inquiries, Derogatories & Factor Simulator Models ---
+# --- Credit Reports, Inquiries, Derogatories & Factor Analysis Models ---
 
 
 class CreditReportCreate(BaseModel):
@@ -1147,7 +1170,7 @@ class CreditDerogatoryOut(BaseModel):
 
 class CreditAPIConnectRequest(BaseModel):
     vendor: CreditAPIVendor
-    env: Literal["sandbox", "production"] = "sandbox"
+    env: Literal["sandbox", "production"] = "production"
     label: str = Field("", max_length=100)
     api_key: Optional[str] = Field(None, max_length=2048)       # Write-only; sealed in secrets.enc
     api_secret: Optional[str] = Field(None, max_length=2048)    # Write-only; sealed in secrets.enc
@@ -1188,7 +1211,7 @@ class CreditAPIConnectionOut(BaseModel):
     vendor: CreditAPIVendor
     provider: str
     institution: str
-    env: str = "sandbox"
+    env: str = "production"
     status: Literal["active", "needs_reauth", "relink_required", "error", "paused_locked"] = "active"
     api_key_masked: str = ""
     has_credentials: bool = False
@@ -1196,6 +1219,7 @@ class CreditAPIConnectionOut(BaseModel):
     has_report_key: bool = False
     bureau: str = "equifax"
     api_base_url: str = ""
+    last_error: str = ""
     last_synced_at: Optional[str] = None
     created_at: str = ""
     updated_at: str = ""
@@ -1213,24 +1237,16 @@ class CreditFactorItem(BaseModel):
     weight_pct: int
     status: Literal["optimal", "good", "fair", "drag"]
     summary: str
-    estimated_delta_range: str = ""
-
-
-class CreditSimulatedAction(BaseModel):
-    action: str
-    delta_min_pts: int
-    delta_max_pts: int
-    explanation: str
+    guidance: str = ""
 
 
 class CreditFactorBreakdown(BaseModel):
     disclaimer: str = (
-        "Directional factor simulator only — not an official FICO or VantageScore calculation."
+        "Weighted factor analysis from tracked accounts, inquiries, and history — not an official bureau score."
     )
     latest_actual_scores: List[CreditReportOut] = Field(default_factory=list)
     fico8_factors: List[CreditFactorItem] = Field(default_factory=list)
     vantage3_factors: List[CreditFactorItem] = Field(default_factory=list)
-    simulated_actions: List[CreditSimulatedAction] = Field(default_factory=list)
 
 
 class FiveTwentyFourStatus(BaseModel):
@@ -1253,7 +1269,7 @@ class CreditLineCreate(BaseModel):
     kind: DebtKind = DebtKind.CREDIT_CARD
     balance_cents: int = Field(0, ge=0, le=100_000_000_00)
     credit_limit_cents: int = Field(0, ge=0, le=100_000_000_00)
-    apr_bps: int = Field(2499, ge=0, le=10000)  # basis points: 2499 = 24.99% APR
+    apr_bps: int = Field(0, ge=0, le=10000)  # basis points: 0 = 0.00% / unset APR
     min_payment_cents: int = Field(0, ge=0, le=50_000_000)
     statement_closing_day: int = Field(15, ge=1, le=31)
     payment_due_day: int = Field(10, ge=1, le=31)
@@ -1384,7 +1400,7 @@ class CreditOptimizationReport(BaseModel):
     strategies: List[DebtStrategyResult]
     recommended_strategy: str
     alerts: List[CreditAdvisorAlert]
-    factor_simulator: Optional[CreditFactorBreakdown] = None
+    factor_analysis: Optional[CreditFactorBreakdown] = None
     five_twenty_four: Optional[FiveTwentyFourStatus] = None
     credit_reports: List[CreditReportOut] = Field(default_factory=list)
     credit_inquiries: List[CreditInquiryOut] = Field(default_factory=list)
@@ -1394,6 +1410,7 @@ class CreditOptimizationReport(BaseModel):
 class BalanceTransferRequest(BaseModel):
     balance_cents: int = Field(..., gt=0, le=100_000_000_00)
     current_apr_bps: int = Field(..., ge=0, le=10000)
+    post_promo_apr_bps: Optional[int] = Field(None, ge=0, le=10000)
     transfer_fee_bps: int = Field(300, ge=0, le=1500)  # 300 = 3.00%
     promo_months: int = Field(15, ge=3, le=36)
     monthly_payment_cents: int = Field(..., gt=0, le=50_000_000)
@@ -1407,6 +1424,10 @@ class BalanceTransferResult(BaseModel):
     net_savings_cents: int
     required_monthly_to_clear_promo_cents: int
     clears_before_promo_ends: bool
+    post_promo_apr_bps: int = 0
+    current_payoff_possible: bool = True
+    transfer_payoff_possible: bool = True
+    min_amortizing_payment_cents: int = 0
     explanation: str
 
 
@@ -1416,11 +1437,13 @@ class BalanceTransferResult(BaseModel):
 class HoldingCreate(BaseModel):
     account_id: Optional[int] = None
     connection_id: Optional[int] = None
+    external_account_id: str = Field("", max_length=128)
     symbol: str = Field(..., min_length=1, max_length=24)
     name: str = Field("", max_length=100)
     asset_class: AssetClass = "equity"
     quantity_e8: int = Field(..., ge=0)
-    cost_basis_cents: int = Field(0, ge=0)
+    cost_basis_cents: Optional[int] = Field(None, ge=0)
+    cost_basis_known: Optional[bool] = None
     price_e8: int = Field(0, ge=0)
     source: str = Field("manual", max_length=40)
 
@@ -1435,6 +1458,7 @@ class HoldingUpdate(BaseModel):
     asset_class: Optional[AssetClass] = None
     quantity_e8: Optional[int] = Field(None, ge=0)
     cost_basis_cents: Optional[int] = Field(None, ge=0)
+    cost_basis_known: Optional[bool] = None
     price_e8: Optional[int] = Field(None, ge=0)
     source: Optional[str] = Field(None, max_length=40)
 
@@ -1443,16 +1467,19 @@ class HoldingOut(BaseModel):
     id: int
     account_id: Optional[int] = None
     connection_id: Optional[int] = None
+    external_account_id: str = ""
     symbol: str
     name: str = ""
     asset_class: AssetClass
     quantity_e8: int
     cost_basis_cents: int
+    cost_basis_known: bool = True
     price_e8: int
     market_value_cents: int
     unrealized_pnl_cents: int = 0
     unrealized_pnl_pct: float = 0.0
     source: str
+    created_at: str = ""
     updated_at: str
 
 
@@ -1472,6 +1499,11 @@ class PortfolioSummary(BaseModel):
     generated_at: str = Field(default_factory=utc_now_iso)
     total_value_cents: int = 0
     total_cost_basis_cents: int = 0
+    known_cost_basis_value_cents: int = 0
+    unknown_cost_basis_value_cents: int = 0
+    known_cost_basis_holdings_count: int = 0
+    unknown_cost_basis_holdings_count: int = 0
+    cost_basis_coverage_pct: float = 100.0
     unrealized_pnl_cents: int = 0
     unrealized_pnl_pct: float = 0.0
     allocations: List[PortfolioAllocationItem] = Field(default_factory=list)

@@ -389,6 +389,7 @@ class CoinbaseConnector:
             else:
                 price_e8 = (self.fetch_spot_price_e8(currency) if fetch_prices else None) or 0
 
+            mkt_cents = compute_market_value_cents(qty_e8, price_e8)
             holdings.append(
                 NormalizedHolding(
                     symbol=currency,
@@ -396,8 +397,9 @@ class CoinbaseConnector:
                     asset_class=asset_class,
                     quantity_e8=qty_e8,
                     price_e8=price_e8,
-                    cost_basis_cents=0,
-                    market_value_cents=compute_market_value_cents(qty_e8, price_e8),
+                    cost_basis_cents=mkt_cents if is_cash else 0,
+                    cost_basis_known=bool(is_cash),
+                    market_value_cents=mkt_cents,
                     external_account_id=str(acct.get("uuid") or ""),
                     currency="USD",
                     source=self.provider_name,
@@ -712,6 +714,7 @@ class RobinhoodCryptoConnector:
                     quantity_e8=qty_e8,
                     price_e8=price_e8,
                     cost_basis_cents=0,
+                    cost_basis_known=False,
                     market_value_cents=compute_market_value_cents(qty_e8, price_e8),
                     external_account_id=str(row.get("account_number") or ""),
                     currency="USD",
@@ -1043,7 +1046,8 @@ class SchwabConnector:
                 else:
                     price_e8 = decimal_to_e8(avg_price_dec)
 
-                cost_basis_cents = decimal_to_cents(avg_price_dec * abs(net_qty))
+                has_avg = pos.get("averagePrice") is not None and avg_price_dec > 0
+                cost_basis_cents = decimal_to_cents(avg_price_dec * abs(net_qty)) if has_avg else 0
                 holdings.append(
                     NormalizedHolding(
                         symbol=symbol,
@@ -1052,6 +1056,7 @@ class SchwabConnector:
                         quantity_e8=qty_e8,
                         price_e8=price_e8,
                         cost_basis_cents=cost_basis_cents,
+                        cost_basis_known=bool(has_avg),
                         market_value_cents=compute_market_value_cents(qty_e8, price_e8),
                         external_account_id=acct_id,
                         currency="USD",
@@ -1072,6 +1077,7 @@ class SchwabConnector:
                         quantity_e8=cash_e8,
                         price_e8=SCALE_E8,
                         cost_basis_cents=decimal_to_cents(cash_dec),
+                        cost_basis_known=True,
                         market_value_cents=compute_market_value_cents(cash_e8, SCALE_E8),
                         external_account_id=acct_id,
                         currency="USD",
@@ -1137,6 +1143,7 @@ _AVG_COST_COLS = ("average cost", "avg cost", "average price", "avg price", "cos
 _TOTAL_COST_COLS = ("cost basis", "total cost", "cost basis total", "book cost")
 _MKT_VAL_COLS = ("market value", "current value", "total value", "equity", "value")
 _CLASS_COLS = ("asset class", "type", "security type", "category")
+_ACCT_COLS = ("account number", "account name", "account", "account id")
 _CRYPTO_HINTS = frozenset({"BTC", "ETH", "SOL", "DOGE", "SHIB", "AVAX", "LINK", "ADA", "XRP", "LTC", "MATIC", "UNI"})
 
 
@@ -1204,6 +1211,7 @@ def parse_holdings_csv(
     total_cost_col = _pick_col(headers, _TOTAL_COST_COLS)
     mkt_val_col = _pick_col(headers, _MKT_VAL_COLS)
     class_col = _pick_col(headers, _CLASS_COLS)
+    acct_col = _pick_col(headers, _ACCT_COLS)
 
     if not sym_col or not qty_col:
         return HoldingsCSVResult(
@@ -1259,19 +1267,31 @@ def parse_holdings_csv(
         if price_e8 == 0 and asset_class == "cash":
             price_e8 = SCALE_E8
 
+        mkt_val_cents = compute_market_value_cents(qty_e8, price_e8)
         cost_basis_cents = 0
-        if total_cost_col and row.get(total_cost_col):
+        cost_basis_known = False
+        raw_total_cost = str(row.get(total_cost_col) or "").strip() if total_cost_col else ""
+        raw_avg_cost = str(row.get(avg_cost_col) or "").strip() if avg_cost_col else ""
+        if raw_total_cost and raw_total_cost.lower() not in ("--", "n/a", "na", "unknown"):
             try:
-                cost_basis_cents = abs(decimal_to_cents(row.get(total_cost_col)))
+                cost_basis_cents = abs(decimal_to_cents(raw_total_cost))
+                cost_basis_known = True
             except ValueError:
                 cost_basis_cents = 0
-        elif avg_cost_col and row.get(avg_cost_col):
+                cost_basis_known = False
+        elif raw_avg_cost and raw_avg_cost.lower() not in ("--", "n/a", "na", "unknown"):
             try:
-                avg_dec = to_decimal(row.get(avg_cost_col))
+                avg_dec = to_decimal(raw_avg_cost)
                 cost_basis_cents = abs(decimal_to_cents(avg_dec * abs(qty_dec)))
+                cost_basis_known = True
             except ValueError:
                 cost_basis_cents = 0
+                cost_basis_known = False
+        elif asset_class == "cash":
+            cost_basis_cents = mkt_val_cents
+            cost_basis_known = True
 
+        ext_acct = sanitize_untrusted_text(str(row.get(acct_col) or ""), max_len=60) if acct_col else ""
         name = sanitize_untrusted_text(
             str(row.get(name_col) or sym) if name_col else sym,
             max_len=100,
@@ -1284,7 +1304,9 @@ def parse_holdings_csv(
                 quantity_e8=qty_e8,
                 price_e8=price_e8,
                 cost_basis_cents=cost_basis_cents,
-                market_value_cents=compute_market_value_cents(qty_e8, price_e8),
+                cost_basis_known=cost_basis_known,
+                market_value_cents=mkt_val_cents,
+                external_account_id=ext_acct,
                 currency="USD",
                 source=source,
                 updated_at=utc_now_iso(),

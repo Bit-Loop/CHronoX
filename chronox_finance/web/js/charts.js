@@ -25,23 +25,28 @@ import {
 } from "./core.js";
 
 const EXPENSE_PALETTE = [
-  "#f59e0b", // Amber
-  "#3b82f6", // Cobalt Blue
-  "#a855f7", // Violet
-  "#ec4899", // Magenta
-  "#14b8a6", // Teal
-  "#64748b", // Steel (Others)
+  "#4f46e5", // Indigo
+  "#7c3aed", // Violet
+  "#db2777", // Rose-Magenta
+  "#ea580c", // Burnt Orange
+  "#ca8a04", // Ochre
+  "#475569", // Slate (Others)
 ];
-const COLOR_INCOME = "#10b981";
-const COLOR_SAVINGS = "#06b6d4";
-const COLOR_EXPENSE = "#f59e0b";
-const COLOR_DEFICIT = "#ef4444";
+const COLOR_INCOME = "var(--chart-inc-stroke)";
+const COLOR_SAVINGS = "var(--chart-sur-stroke)";
+const COLOR_EXPENSE = "var(--chart-exp-stroke)";
+const COLOR_DEFICIT = "var(--chart-def-stroke)";
+const TEXT_INCOME = "var(--chart-inc-text)";
+const TEXT_SAVINGS = "var(--chart-sur-text)";
+const TEXT_EXPENSE = "var(--chart-exp-text)";
+const TEXT_DEFICIT = "var(--chart-def-text)";
 
 const chartState = {
   period: "1y",
   month: null,
   data: null,
   loading: false,
+  reqSeq: 0,
   hiddenSeries: new Set(),
   trendScrubIdx: null,
   donutHoveredIdx: null,
@@ -107,7 +112,7 @@ export async function loadAnalyticsOverview(opts = {}) {
   }
   syncPeriodUI();
 
-  if (chartState.loading) return chartState.data;
+  const reqSeq = ++chartState.reqSeq;
   chartState.loading = true;
   try {
     const queryPeriod = chartState.month || chartState.period || "1y";
@@ -116,15 +121,19 @@ export async function loadAnalyticsOverview(opts = {}) {
       params.set("month", chartState.month);
     }
     const data = await api(`/api/v1/analytics/overview?${params.toString()}`);
+    if (reqSeq !== chartState.reqSeq) return chartState.data;
     chartState.data = data;
     state.analytics = data;
     renderAnalyticsOverview(data);
     return data;
   } catch (err) {
+    if (reqSeq !== chartState.reqSeq) return chartState.data;
     renderAnalyticsError(err && err.message ? err.message : "Failed to load analytics.");
     return null;
   } finally {
-    chartState.loading = false;
+    if (reqSeq === chartState.reqSeq) {
+      chartState.loading = false;
+    }
   }
 }
 
@@ -290,13 +299,32 @@ function renderCashflowSankey(data) {
 
   const rawNodes = Array.isArray(data.sankey_nodes) ? data.sankey_nodes : [];
   const rawLinks = Array.isArray(data.sankey_links) ? data.sankey_links : [];
+  const isDeficitGapNode = (n) =>
+    n.id === "src_deficit" || String(n.label || "") === "Unfunded Gap";
+  const isReserveDrawNode = (n) => String(n.label || "") === "Cash Reserves Draw";
+  const hasDeficitGap = rawNodes.some(
+    (n) => isDeficitGapNode(n) || String(n.label || "") === "Total Outflow"
+  );
+  const hasVerifiedSavings = rawNodes.some(
+    (n) => n.id === "out_savings" || String(n.label || "") === "Savings & Invest"
+  );
+  const hasUnallocatedSurplus = rawNodes.some(
+    (n) =>
+      n.id === "out_unallocated_surplus" ||
+      n.id === "out:unallocated_surplus" ||
+      String(n.label || "") === "Unallocated Surplus"
+  );
+  const pctDenomLabel = hasDeficitGap ? "of flow" : "of income";
 
   if (legendHost) {
-    legendHost.replaceChildren(
+    const pills = [
       el("span", { class: "pill pill-calm", text: "INCOME" }),
-      el("span", { class: "pill pill-watch", text: "TOP EXPENSES" }),
-      el("span", { class: "pill pill-blue", text: "SAVINGS / INVEST" })
-    );
+      el("span", { class: "pill pill-watch", text: "EXPENSES" }),
+    ];
+    if (hasDeficitGap) pills.push(el("span", { class: "pill pill-danger", text: "UNFUNDED GAP" }));
+    if (hasVerifiedSavings) pills.push(el("span", { class: "pill pill-blue", text: "SAVINGS & INVEST" }));
+    if (hasUnallocatedSurplus) pills.push(el("span", { class: "pill pill-soft", text: "UNALLOCATED SURPLUS" }));
+    legendHost.replaceChildren(...pills);
   }
 
   const defaultMetaText =
@@ -474,7 +502,7 @@ function renderCashflowSankey(data) {
     ].join(" ");
 
     const pctTxt = Number(lnk.pct_of_income || 0).toFixed(1);
-    const titleStr = `${src.label} -> ${tgt.label}: ${fmtMoney(val)} (${pctTxt}% of income)`;
+    const titleStr = `${src.label} -> ${tgt.label}: ${fmtMoney(val)} (${pctTxt}% ${pctDenomLabel})`;
 
     const path = svgEl(
       "path",
@@ -504,7 +532,7 @@ function renderCashflowSankey(data) {
   const nodeGroup = svgEl("g");
   const labelGroup = svgEl("g");
 
-  // Column headers
+  const hubTitle = String((col1[0] && col1[0].label) || "CASHFLOW HUB").toUpperCase();
   labelGroup.appendChild(
     svgEl("text", {
       x: colX[0],
@@ -515,7 +543,7 @@ function renderCashflowSankey(data) {
       "font-weight": "700",
       "letter-spacing": "0.08em",
       "text-anchor": "start",
-      text: "INCOME SOURCES",
+      text: hasDeficitGap ? "SOURCES & UNFUNDED GAP" : "INCOME SOURCES",
     })
   );
   labelGroup.appendChild(
@@ -528,7 +556,7 @@ function renderCashflowSankey(data) {
       "font-weight": "700",
       "letter-spacing": "0.08em",
       "text-anchor": "middle",
-      text: "TOTAL INCOME HUB",
+      text: hubTitle,
     })
   );
   labelGroup.appendChild(
@@ -541,7 +569,7 @@ function renderCashflowSankey(data) {
       "font-weight": "700",
       "letter-spacing": "0.08em",
       "text-anchor": "end",
-      text: "ALLOCATION & SURPLUS",
+      text: "OUTFLOWS & SURPLUS",
     })
   );
 
@@ -589,7 +617,11 @@ function renderCashflowSankey(data) {
         svgEl("text", {
           x: (n.x - 10).toFixed(1),
           y: (midY + 12).toFixed(1),
-          fill: "var(--primary)",
+          fill: isDeficitGapNode(n)
+            ? TEXT_DEFICIT
+            : isReserveDrawNode(n)
+            ? TEXT_EXPENSE
+            : TEXT_INCOME,
           "font-family": "var(--font-mono)",
           "font-size": "11",
           "font-weight": "700",
@@ -631,7 +663,13 @@ function renderCashflowSankey(data) {
         svgEl("text", {
           x: rightEdgeX.toFixed(1),
           y: (midY + 4).toFixed(1),
-          fill: n.color === COLOR_SAVINGS ? "var(--cyan)" : "var(--text-soft)",
+          fill:
+            String(n.label || "") === "Savings & Invest" ||
+            String(n.label || "") === "Unallocated Surplus" ||
+            String(n.id || "").includes("saving") ||
+            String(n.id || "").includes("surplus")
+              ? TEXT_SAVINGS
+              : "var(--text-soft)",
           "font-family": "var(--font-mono)",
           "font-size": "11.5",
           "font-weight": "700",
@@ -694,7 +732,7 @@ function renderCashflowSankey(data) {
     }
     const n = nodeMap.get(nodeId);
     if (meta && n) {
-      meta.textContent = `${n.label}: ${fmtMoney(n.amount_cents)} (${Number(n.pct_of_income || 0).toFixed(1)}% of income · ${matchedCount} flow${matchedCount === 1 ? "" : "s"})`;
+      meta.textContent = `${n.label}: ${fmtMoney(n.amount_cents)} (${Number(n.pct_of_income || 0).toFixed(1)}% ${pctDenomLabel} · ${matchedCount} flow${matchedCount === 1 ? "" : "s"})`;
     }
   };
 
@@ -715,6 +753,7 @@ function renderCashflowSankey(data) {
   const svg = svgEl(
     "svg",
     {
+      class: "sankey-desktop-svg",
       viewBox: `0 0 ${W} ${H}`,
       role: "img",
       "aria-label": "3-Column Cashflow Sankey diagram",
@@ -722,7 +761,39 @@ function renderCashflowSankey(data) {
     [defs, svgEl("g", {}, linkEls), nodeGroup, labelGroup]
   );
 
-  wrap.replaceChildren(svg);
+  // Mobile Stacked Flow Layout (guaranteed >= 12-13px readable typography on phone screens)
+  const makeMobileGroup = (heading, nodes) =>
+    el("div", { class: "sankey-mobile-group" }, [
+      el("span", { class: "eyebrow", text: heading }),
+      ...nodes.map((n) => {
+        const pct = Math.max(2, Math.min(100, Number(n.pct_of_income || 0)));
+        const barColor = n.color || COLOR_INCOME;
+        return el("div", { class: "sankey-mobile-row", style: { borderLeftColor: barColor } }, [
+          el("div", { class: "item-row" }, [
+            el("strong", { text: n.label }),
+            el("span", {
+              class: "tabular-nums",
+              style: { fontWeight: "700" },
+              text: `${fmtMoney(n.amount_cents)} (${Number(n.pct_of_income || 0).toFixed(1)}%)`,
+            }),
+          ]),
+          el("div", { class: "progress-track", style: { height: "5px" } }, [
+            el("div", {
+              class: "progress-fill",
+              style: { width: `${pct.toFixed(1)}%`, backgroundColor: barColor },
+            }),
+          ]),
+        ]);
+      }),
+    ]);
+
+  const mobileStack = el("div", { class: "sankey-mobile-stack", role: "region", "aria-label": "Cashflow breakdown" }, [
+    col0.length ? makeMobileGroup(hasDeficitGap ? "SOURCES & UNFUNDED GAP" : "INCOME SOURCES", col0) : null,
+    col1.length ? makeMobileGroup(hubTitle, col1) : null,
+    col2.length ? makeMobileGroup("OUTFLOWS & SURPLUS", col2) : null,
+  ]);
+
+  wrap.replaceChildren(svg, mobileStack);
 }
 
 /* ============================================================================
@@ -1072,7 +1143,7 @@ function renderTrendChart(data) {
     );
   }
 
-  // Build series paths
+  // Build series paths (distinct line dash patterns + point marker shapes for non-color-only meaning)
   const seriesNodes = [];
   const makeLinePath = (key) =>
     pts.map((p, i) => `${i === 0 ? "M" : "L"}${xFor(i).toFixed(1)},${yFor(Number(p[key] || 0)).toFixed(1)}`).join(" ");
@@ -1086,14 +1157,27 @@ function renderTrendChart(data) {
         d: surLine,
         fill: "none",
         stroke: COLOR_SAVINGS,
-        "stroke-width": "1.6",
-        "stroke-dasharray": "4 2",
+        "stroke-width": "1.8",
+        "stroke-dasharray": "2.5 2.5",
       })
     );
+    pts.forEach((p, i) => {
+      const cx = xFor(i);
+      const cy = yFor(Number(p.surplus_cents || 0));
+      const r = selectedIdx === i ? 4.2 : 2.8;
+      seriesNodes.push(
+        svgEl("polygon", {
+          points: `${cx.toFixed(1)},${(cy - r).toFixed(1)} ${(cx + r).toFixed(1)},${cy.toFixed(1)} ${cx.toFixed(1)},${(cy + r).toFixed(1)} ${(cx - r).toFixed(1)},${cy.toFixed(1)}`,
+          fill: COLOR_SAVINGS,
+          stroke: "var(--bg)",
+          "stroke-width": "1",
+        })
+      );
+    });
   }
   if (showInc) {
     seriesNodes.push(
-      svgEl("path", { d: makeLinePath("income_cents"), fill: "none", stroke: COLOR_INCOME, "stroke-width": "2.2" })
+      svgEl("path", { d: makeLinePath("income_cents"), fill: "none", stroke: COLOR_INCOME, "stroke-width": "2.3" })
     );
     pts.forEach((p, i) => {
       seriesNodes.push(
@@ -1110,14 +1194,22 @@ function renderTrendChart(data) {
   }
   if (showExp) {
     seriesNodes.push(
-      svgEl("path", { d: makeLinePath("expense_cents"), fill: "none", stroke: COLOR_EXPENSE, "stroke-width": "2.2" })
+      svgEl("path", {
+        d: makeLinePath("expense_cents"),
+        fill: "none",
+        stroke: COLOR_EXPENSE,
+        "stroke-width": "2.2",
+        "stroke-dasharray": "7 3",
+      })
     );
     pts.forEach((p, i) => {
+      const sz = selectedIdx === i ? 7.6 : 5.2;
       seriesNodes.push(
-        svgEl("circle", {
-          cx: xFor(i).toFixed(1),
-          cy: yFor(Number(p.expense_cents || 0)).toFixed(1),
-          r: selectedIdx === i ? "4.5" : "2.8",
+        svgEl("rect", {
+          x: (xFor(i) - sz / 2).toFixed(1),
+          y: (yFor(Number(p.expense_cents || 0)) - sz / 2).toFixed(1),
+          width: sz.toFixed(1),
+          height: sz.toFixed(1),
           fill: COLOR_EXPENSE,
           stroke: "var(--bg)",
           "stroke-width": "1",
@@ -1126,7 +1218,7 @@ function renderTrendChart(data) {
     });
   }
 
-  // Interactive Crosshair, Enlarged Active Dots & Floating Readout Tooltip
+  // Interactive Crosshair, Enlarged Active Markers & Floating Readout Tooltip (WCAG AA >= 4.5:1)
   const initIdx = selectedIdx >= 0 ? selectedIdx : pts.length - 1;
   const crosshair = svgEl("line", {
     x1: xFor(initIdx).toFixed(1),
@@ -1146,10 +1238,11 @@ function renderTrendChart(data) {
     "stroke-width": "1.6",
     opacity: showInc ? "1" : "0",
   });
-  const dotExp = svgEl("circle", {
-    cx: xFor(initIdx).toFixed(1),
-    cy: yFor(Number(pts[initIdx].expense_cents || 0)).toFixed(1),
-    r: "5.2",
+  const dotExp = svgEl("rect", {
+    x: (xFor(initIdx) - 4.8).toFixed(1),
+    y: (yFor(Number(pts[initIdx].expense_cents || 0)) - 4.8).toFixed(1),
+    width: "9.6",
+    height: "9.6",
     fill: COLOR_EXPENSE,
     stroke: "var(--bg)",
     "stroke-width": "1.6",
@@ -1157,8 +1250,8 @@ function renderTrendChart(data) {
   });
 
   // Floating tooltip inside SVG
-  const tipW = 166;
-  const tipH = 66;
+  const tipW = 176;
+  const tipH = 68;
   const tipRect = svgEl("rect", {
     x: "0",
     y: "0",
@@ -1179,7 +1272,7 @@ function renderTrendChart(data) {
   const tipInc = svgEl("text", {
     x: "8",
     y: "31",
-    fill: COLOR_INCOME,
+    fill: TEXT_INCOME,
     "font-family": "var(--font-mono)",
     "font-size": "10",
     "font-weight": "700",
@@ -1187,7 +1280,7 @@ function renderTrendChart(data) {
   const tipExp = svgEl("text", {
     x: "8",
     y: "45",
-    fill: COLOR_EXPENSE,
+    fill: TEXT_EXPENSE,
     "font-family": "var(--font-mono)",
     "font-size": "10",
     "font-weight": "700",
@@ -1195,16 +1288,16 @@ function renderTrendChart(data) {
   const tipSur = svgEl("text", {
     x: "8",
     y: "59",
-    fill: COLOR_SAVINGS,
+    fill: TEXT_SAVINGS,
     "font-family": "var(--font-mono)",
     "font-size": "10",
     "font-weight": "700",
   });
   const tipGroup = svgEl("g", { style: "pointer-events: none;" }, [tipRect, tipHead, tipInc, tipExp, tipSur]);
 
-  // Scrub bar readout + toggleable legend buttons
+  // Scrub bar readout + toggleable legend buttons with line-style glyphs
   const readoutSpan = el("span", { class: "tabular-nums" });
-  const makeLegendToggle = (key, label, color) => {
+  const makeLegendToggle = (key, label, strokeColor, textColor, styleTag) => {
     const active = !chartState.hiddenSeries.has(key);
     const btn = el(
       "button",
@@ -1214,13 +1307,14 @@ function renderTrendChart(data) {
         style: {
           height: "22px",
           opacity: active ? "1" : "0.45",
-          borderColor: active ? color : "var(--border)",
+          borderColor: active ? strokeColor : "var(--border)",
+          color: textColor,
         },
         "aria-pressed": String(active),
       },
       [
-        el("span", { class: "legend-swatch", style: { backgroundColor: color, width: "8px", height: "8px" } }),
-        label,
+        el("span", { class: "legend-swatch", style: { backgroundColor: strokeColor, width: "8px", height: "8px" } }),
+        `${styleTag} ${label}`,
       ]
     );
     btn.addEventListener("click", () => {
@@ -1234,9 +1328,9 @@ function renderTrendChart(data) {
   scrubBar.replaceChildren(
     readoutSpan,
     el("div", { class: "row-gap wrap", style: { gap: "5px" } }, [
-      makeLegendToggle("income", "Income", COLOR_INCOME),
-      makeLegendToggle("expense", "Expenses", COLOR_EXPENSE),
-      makeLegendToggle("surplus", "Surplus", COLOR_SAVINGS),
+      makeLegendToggle("income", "Income (INC)", COLOR_INCOME, TEXT_INCOME, "●"),
+      makeLegendToggle("expense", "Expenses (EXP)", COLOR_EXPENSE, TEXT_EXPENSE, "■ --"),
+      makeLegendToggle("surplus", "Surplus (SUR)", COLOR_SAVINGS, TEXT_SAVINGS, "◆ ··"),
     ])
   );
 
@@ -1252,28 +1346,28 @@ function renderTrendChart(data) {
     crosshair.setAttribute("x2", x.toFixed(1));
     dotInc.setAttribute("cx", x.toFixed(1));
     dotInc.setAttribute("cy", yI.toFixed(1));
-    dotExp.setAttribute("cx", x.toFixed(1));
-    dotExp.setAttribute("cy", yE.toFixed(1));
+    dotExp.setAttribute("x", (x - 4.8).toFixed(1));
+    dotExp.setAttribute("y", (yE - 4.8).toFixed(1));
 
     const tx = x + 12 + tipW > W - padR ? x - tipW - 12 : x + 12;
     const ty = padT + 4;
     tipGroup.setAttribute("transform", `translate(${Math.max(padL + 2, tx).toFixed(1)}, ${ty.toFixed(1)})`);
     tipHead.textContent = `${fmtMonthShort(p.month)}${chartState.month === p.month ? " [FILTERED]" : ""}`;
-    tipInc.textContent = `INC  ${fmtMoney(p.income_cents)}`;
-    tipExp.textContent = `EXP  ${fmtMoney(p.expense_cents)}`;
+    tipInc.textContent = `● INC  ${fmtMoney(p.income_cents)}`;
+    tipExp.textContent = `■ EXP  ${fmtMoney(p.expense_cents)}`;
     const surVal = Number(p.surplus_cents || 0);
-    tipSur.textContent = `SUR  ${surVal >= 0 ? "+" : ""}${fmtMoney(surVal)}`;
-    tipSur.setAttribute("fill", surVal >= 0 ? COLOR_SAVINGS : COLOR_DEFICIT);
+    tipSur.textContent = `◆ SUR  ${surVal >= 0 ? "+" : ""}${fmtMoney(surVal)}`;
+    tipSur.setAttribute("fill", surVal >= 0 ? TEXT_SAVINGS : TEXT_DEFICIT);
 
     readoutSpan.replaceChildren(
       el("strong", { text: `${fmtMonthShort(p.month)}  ` }),
-      el("span", { style: { color: COLOR_INCOME }, text: `In ${fmtMoneyCompact(p.income_cents)}` }),
+      el("span", { style: { color: TEXT_INCOME, fontWeight: "700" }, text: `INC ${fmtMoneyCompact(p.income_cents)}` }),
       " · ",
-      el("span", { style: { color: COLOR_EXPENSE }, text: `Out ${fmtMoneyCompact(p.expense_cents)}` }),
+      el("span", { style: { color: TEXT_EXPENSE, fontWeight: "700" }, text: `EXP ${fmtMoneyCompact(p.expense_cents)}` }),
       " · ",
       el("span", {
-        style: { color: surVal >= 0 ? COLOR_SAVINGS : COLOR_DEFICIT },
-        text: `Surplus ${surVal >= 0 ? "+" : ""}${fmtMoneyCompact(surVal)}`,
+        style: { color: surVal >= 0 ? TEXT_SAVINGS : TEXT_DEFICIT, fontWeight: "700" },
+        text: `SUR ${surVal >= 0 ? "+" : ""}${fmtMoneyCompact(surVal)}`,
       })
     );
   };

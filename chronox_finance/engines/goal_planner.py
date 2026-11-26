@@ -80,22 +80,28 @@ class GoalOptimizerEngine:
         # Can user buy in cash right now without breaking bills, cards, or emergency buffer?
         can_buy_today = remaining == 0 or remaining <= s.safe_to_spend_cents
 
-        # Determine realistic monthly flexible funding capacity (never raids Bills or Emergency Shield)
+        # Determine realistic monthly flexible funding capacity (never raids Bills or Emergency Shield,
+        # and never fabricates surplus when the profile has $0 income and $0 Safe-to-Spend).
         fun_jar = next((j for j in budget.jars if j.kind == JarKind.FUN), None)
         daily_jar = next((j for j in budget.jars if j.kind == JarKind.DAILY), None)
-        fun_alloc = fun_jar.auto_allocated_cents if fun_jar else 40_000
-        # Assume up to 50% of Guilt-Free Fun + 15% of Daily Living buffer can safely fund a priority goal
-        monthly_flex = max(
-            15_000,
-            int(round(fun_alloc * 0.50)) + int(round((daily_jar.auto_allocated_cents if daily_jar else 0) * 0.10)),
-        )
-        # Cap by actual post-bills income room
+        fun_alloc = fun_jar.auto_allocated_cents if fun_jar else 0
+        daily_alloc = daily_jar.auto_allocated_cents if daily_jar else 0
+        jar_flex = int(round(fun_alloc * 0.50)) + int(round(daily_alloc * 0.10))
+
         monthly_bills_and_mins = sum(
             j.auto_allocated_cents for j in budget.jars if j.kind == JarKind.BILLS
         ) + credit_report.total_monthly_minimums_cents
-        if budget.smoothed_monthly_income_cents > monthly_bills_and_mins:
-            income_headroom = int(round((budget.smoothed_monthly_income_cents - monthly_bills_and_mins) * 0.45))
-            monthly_flex = max(10_000, min(monthly_flex, income_headroom))
+
+        if budget.smoothed_monthly_income_cents > 0:
+            if budget.smoothed_monthly_income_cents > monthly_bills_and_mins:
+                income_headroom = int(
+                    round((budget.smoothed_monthly_income_cents - monthly_bills_and_mins) * 0.45)
+                )
+                monthly_flex = min(max(jar_flex, min(15_000, income_headroom)), income_headroom)
+            else:
+                monthly_flex = min(jar_flex, max(0, s.safe_to_spend_cents))
+        else:
+            monthly_flex = min(jar_flex, max(0, s.safe_to_spend_cents))
 
         # Collect concrete data-backed accelerators from user's real subscriptions & matured impulses
         accelerators: List[Dict[str, Any]] = []
@@ -141,21 +147,28 @@ class GoalOptimizerEngine:
             )
 
         # --- Path A: Cash-Only Sinking Fund ---
-        weekly_cash = max(2_500, int(round(monthly_flex / 4.33)))
+        weekly_cash = int(round(monthly_flex / 4.33)) if monthly_flex > 0 else 0
+        if monthly_flex > 0:
+            weekly_cash = min(monthly_flex, max(100, weekly_cash))
         per_paycheck_cash = int(round(weekly_cash * (max(7, payday_cadence_days) / 7.0)))
         if req.target_date:
             try:
                 td = date.fromisoformat(req.target_date)
                 weeks_avail = max(1, int(math.ceil((td - ref).days / 7.0)))
                 needed_weekly = int(math.ceil(remaining / weeks_avail))
-                # Use target-date pace if it fits within 1.35x flexible surplus
-                if needed_weekly <= int(weekly_cash * 1.35):
+                # Use target-date pace if it fits within 1.35x flexible surplus (or if surplus is $0 and user gave a deadline)
+                if weekly_cash == 0 or needed_weekly <= int(weekly_cash * 1.35):
                     weekly_cash = needed_weekly
                     per_paycheck_cash = int(round(weekly_cash * (max(7, payday_cadence_days) / 7.0)))
             except ValueError:
                 pass
 
-        weeks_a = 0 if remaining == 0 else max(1, int(math.ceil(remaining / max(1, weekly_cash))))
+        if remaining == 0:
+            weeks_a = 0
+        elif weekly_cash > 0:
+            weeks_a = max(1, int(math.ceil(remaining / weekly_cash)))
+        else:
+            weeks_a = 0
         ready_a = (ref + timedelta(days=weeks_a * 7)).isoformat()
         accel_note = ""
         if extra_monthly_from_subs > 0 and weeks_a > 1:
@@ -164,10 +177,24 @@ class GoalOptimizerEngine:
             if faster_weeks < weeks_a:
                 accel_note = f"Trimming unused subs cuts wait time from {weeks_a}w → {faster_weeks}w!"
 
-        steps_a = [
-            f"Auto-set aside {_fmt(per_paycheck_cash)} per paycheck ({_fmt(weekly_cash)}/week) into a '{req.item_name}' goal.",
-            f"Keep Bills ({_fmt(s.unpaid_bills_until_payday_cents)}) & Emergency Shield ({_fmt(s.emergency_buffer_cents)}) 100% untouched.",
-        ]
+        if weekly_cash > 0 or remaining == 0:
+            steps_a = [
+                f"Auto-set aside {_fmt(per_paycheck_cash)} per paycheck ({_fmt(weekly_cash)}/week) into a '{req.item_name}' goal.",
+                f"Keep Bills ({_fmt(s.unpaid_bills_until_payday_cents)}) & Emergency Shield ({_fmt(s.emergency_buffer_cents)}) 100% untouched.",
+            ]
+            summary_a = (
+                f"Save {_fmt(weekly_cash)}/week ({_fmt(per_paycheck_cash)}/paycheck) and own {req.item_name} "
+                f"debt-free by {ready_a} ({weeks_a} weeks) with $0 interest."
+            )
+        else:
+            steps_a = [
+                f"$0.00 monthly flexible surplus currently tracked — add an account balance or income deposit to size a weekly contribution for '{req.item_name}'.",
+                f"Keep Bills ({_fmt(s.unpaid_bills_until_payday_cents)}) & Emergency Shield ({_fmt(s.emergency_buffer_cents)}) 100% untouched.",
+            ]
+            summary_a = (
+                f"$0.00 monthly flexible surplus currently tracked — add income or liquid cash (or set a target date) "
+                f"to calculate a debt-free savings schedule for {req.item_name}."
+            )
         if accel_note:
             steps_a.append(accel_note)
         if can_buy_today and not high_apr_debts:
@@ -183,10 +210,7 @@ class GoalOptimizerEngine:
             weeks_to_goal=weeks_a,
             projected_ready_date=ready_a,
             interest_cost_cents=0,
-            summary=(
-                f"Save {_fmt(weekly_cash)}/week ({_fmt(per_paycheck_cash)}/paycheck) and own {req.item_name} "
-                f"debt-free by {ready_a} ({weeks_a} weeks) with $0 interest."
-            ),
+            summary=summary_a,
             steps=steps_a,
             credit_impact_note="0% impact on credit utilization or DTI — keeps FICO & AZEO spotless.",
         )
@@ -205,13 +229,39 @@ class GoalOptimizerEngine:
         )
 
         # --- Path C: Balanced ADHD Anti-Deprivation Split (Debt + Goal Together) ---
-        split_goal_weekly = max(2_000, int(round(weekly_cash * 0.45)))
-        split_debt_weekly = max(2_000, weekly_cash - split_goal_weekly)
-        split_paycheck = int(round(split_goal_weekly * (max(7, payday_cadence_days) / 7.0)))
-        weeks_c = 0 if remaining == 0 else max(1, int(math.ceil(remaining / max(1, split_goal_weekly))))
+        if weekly_cash > 0:
+            split_goal_weekly = max(100, int(round(weekly_cash * 0.45)))
+            split_debt_weekly = max(0, weekly_cash - split_goal_weekly)
+            split_paycheck = int(round(split_goal_weekly * (max(7, payday_cadence_days) / 7.0)))
+            weeks_c = 0 if remaining == 0 else max(1, int(math.ceil(remaining / max(1, split_goal_weekly))))
+        else:
+            split_goal_weekly = 0
+            split_debt_weekly = 0
+            split_paycheck = 0
+            weeks_c = 0
         ready_c = (ref + timedelta(days=weeks_c * 7)).isoformat()
         top_debt = high_apr_debts[0] if high_apr_debts else (credit_report.credit_lines[0] if credit_report.credit_lines else None)
         split_target_label = top_debt.name if top_debt else "Safety & Future Buffer"
+
+        if weekly_cash > 0 or remaining == 0:
+            summary_c = (
+                f"Send {_fmt(split_debt_weekly)}/wk to {split_target_label} AND {_fmt(split_goal_weekly)}/wk to "
+                f"{req.item_name} (ready {ready_c}) — avoids ADHD deprivation burnout while lowering utilization & interest."
+            )
+            steps_c = [
+                f"Route {_fmt(split_debt_weekly)}/wk automatically to {split_target_label}.",
+                f"Park {_fmt(split_goal_weekly)}/wk ({_fmt(split_paycheck)}/paycheck) into your {req.item_name} goal.",
+                "Never feel 'banned' from fun goals while still cutting debt & boosting credit every week!",
+            ]
+        else:
+            summary_c = (
+                f"$0.00 flexible weekly surplus currently tracked to split between {split_target_label} and {req.item_name} — "
+                f"add income or cash headroom first."
+            )
+            steps_c = [
+                f"Once positive monthly surplus is tracked, split contributions between {split_target_label} and {req.item_name}.",
+                "Protect essential bills and minimum debt payments before funding discretionary purchases.",
+            ]
 
         path_c = GoalPlanOption(
             path_id="balanced_debt_goal_split",
@@ -223,15 +273,8 @@ class GoalOptimizerEngine:
             weeks_to_goal=weeks_c,
             projected_ready_date=ready_c,
             interest_cost_cents=0,
-            summary=(
-                f"Send {_fmt(split_debt_weekly)}/wk to {split_target_label} AND {_fmt(split_goal_weekly)}/wk to "
-                f"{req.item_name} (ready {ready_c}) — avoids ADHD deprivation burnout while lowering utilization & interest."
-            ),
-            steps=[
-                f"Route {_fmt(split_debt_weekly)}/wk automatically to {split_target_label}.",
-                f"Park {_fmt(split_goal_weekly)}/wk ({_fmt(split_paycheck)}/paycheck) into your {req.item_name} goal.",
-                "Never feel 'banned' from fun goals while still cutting debt & boosting credit every week!",
-            ],
+            summary=summary_c,
+            steps=steps_c,
             credit_impact_note=(
                 f"Actively improves credit score by reducing {split_target_label} balance every week before buying."
             ),
@@ -286,6 +329,21 @@ class GoalOptimizerEngine:
         ]
 
         if not grace_cards:
+            # Compute actual Revolving APR cost ONLY if the user has tracked credit cards;
+            # never fabricate an invented APR when no cards exist.
+            actual_interest_cents = 0
+            if remaining > 0 and cards:
+                lowest_apr_bps = min(c.effective_apr_bps for c in cards)
+                if lowest_apr_bps > 0:
+                    months_est = max(1, int(math.ceil(weeks_cash / 4.33))) if weeks_cash > 0 else 12
+                    monthly_pay = max(1, int(math.ceil(remaining / months_est)))
+                    bal = remaining
+                    for _ in range(months_est):
+                        if bal <= 0:
+                            break
+                        mo_int = int(round(bal * (lowest_apr_bps / 10000.0) / 12.0))
+                        actual_interest_cents += mo_int
+                        bal = max(0, bal + mo_int - monthly_pay)
             blocked_steps = [
                 "Do NOT put this purchase on a card without an active grace period (interest starts Day 1!).",
                 f"Build the {_fmt(remaining)} cash sinking fund first, or reduce card balances below 29% utilization.",
@@ -303,7 +361,7 @@ class GoalOptimizerEngine:
                 per_paycheck_cents=per_paycheck_cash,
                 weeks_to_goal=weeks_cash,
                 projected_ready_date=ready_cash,
-                interest_cost_cents=int(round(remaining * 0.2499 / 2.0)),
+                interest_cost_cents=actual_interest_cents,
                 summary=(
                     "No credit card currently has both an active grace period AND enough safe credit limit headroom "
                     "for this purchase. Use Cash Sinking Fund (Path A) or Balanced Split (Path C) first."
@@ -322,14 +380,14 @@ class GoalOptimizerEngine:
         total_lim = max(1, credit_report.total_revolving_limit_cents)
         post_agg_util = round(((credit_report.total_revolving_balance_cents + req.target_cents) / total_lim) * 100.0, 1)
 
-        # How much must be paid BEFORE statement close so card reports <= 8.9% (800+ FICO tier)?
+        # How much must be paid BEFORE statement close so card reports <= 8.9% (AZEO target band)?
         safe_89_cap = int(math.floor(best.credit_limit_cents * 0.089))
         pre_close_paydown = max(0, post_card_bal - safe_89_cap)
         close_dt = date.fromisoformat(best.next_statement_close_date)
         golden_buy_dt = close_dt + timedelta(days=1)
         pay_by_dt = max(ref, close_dt - timedelta(days=3))
 
-        is_safe = can_buy_today or (weeks_cash <= 12)
+        is_safe = can_buy_today or (0 < weeks_cash <= 12)
         steps = [
             f"Best card in wallet: {best.name} (active grace period{', ' + best.rewards_note if best.rewards_note else ''}).",
             (
@@ -347,7 +405,7 @@ class GoalOptimizerEngine:
             )
         else:
             steps.append(
-                f"Utilization stays at {post_card_util:.1f}% on {best.name} ({post_agg_util:.1f}% aggregate) — right inside FICO's optimal <8.9% tier!"
+                f"Utilization stays at {post_card_util:.1f}% on {best.name} ({post_agg_util:.1f}% aggregate) — inside the <8.9% AZEO target band."
             )
         if velocity_warning:
             steps.append(velocity_warning)

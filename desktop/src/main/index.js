@@ -29,8 +29,8 @@ const { loadWindowState, trackWindowState } = require("./window-state");
 
 const APP_NAME = "ChronoX Finance";
 const DOCS_URL = "https://github.com/Bit-Loop/CHronoX";
-const MAX_STATEMENT_BYTES = 5 * 1024 * 1024; // 5 MB strict safety cap
-const MAX_SAVE_BYTES = 15 * 1024 * 1024;
+const MAX_STATEMENT_BYTES = 25 * 1024 * 1024; // 25 MB strict safety cap
+const MAX_SAVE_BYTES = 25 * 1024 * 1024;
 const PRIMARY_SHORTCUT = "CommandOrControl+Shift+Space";
 const FALLBACK_SHORTCUT = "Alt+Shift+Space";
 const VALID_TABS = new Set([

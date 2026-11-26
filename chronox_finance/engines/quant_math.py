@@ -72,7 +72,6 @@ __all__ = [
 
 MIN_EMERGENCY_BUFFER_CENTS = 50_000  # $500.00 baseline floor
 LATE_FEE_SHIELD_CENTS = 3_500  # $35.00 conservative late-fee floor
-LIQUIDITY_INSURANCE_EQUIV_PCT = 9.0  # 4.25% HYSA + 4.75% overdraft/card-shock avoidance
 INVEST_EXPECTED_ANNUAL_PCT = 7.5  # Long-run diversified expected return benchmark
 SAFETY_HYSA_ANNUAL_PCT = 4.25  # High-yield cash reserve benchmark
 
@@ -1069,7 +1068,7 @@ class QuantMathEngine:
                     ),
                     formula_note=(
                         f"Risk priority = ∞ (999% equiv); shields {_fmt(alloc)} min obligation "
-                        f"vs $35+ late fee & 60–110pt FICO drop"
+                        f"vs $35+ late fee & 7-year late-payment mark"
                     ),
                 )
             )
@@ -1189,12 +1188,12 @@ class QuantMathEngine:
             remaining -= alloc
             rem_debt[cl.id] -= alloc
 
-        # --- (d) AZEO / FICO Utilization Cliff Crossing (>28.9% -> <=8.9%) ---
-        # Pass 1: severe per-card utilization cliffs (>28.9% down to <=28.9%)
-        # Pass 2: 800+ FICO tier unlock (>8.9% down to <=8.9%)
-        for threshold_pct, threshold_ratio, equiv_floor, tier_label in (
-            (28.9, 0.289, 12.0, "28.9% FICO drag cliff"),
-            (8.9, 0.089, 10.5, "8.9% 800+ FICO tier"),
+        # --- (d) AZEO / Utilization Threshold Crossing (>28.9% -> <=8.9%) ---
+        # Pass 1: high per-card utilization thresholds (>28.9% down to <=28.9%)
+        # Pass 2: low-utilization AZEO target band (>8.9% down to <=8.9%)
+        for threshold_pct, threshold_ratio, tier_label in (
+            (28.9, 0.289, "28.9% utilization threshold"),
+            (8.9, 0.089, "8.9% AZEO target band"),
         ):
             if remaining <= 0:
                 break
@@ -1222,10 +1221,8 @@ class QuantMathEngine:
                     continue
                 before_util = round((rem_bal / cl.credit_limit_cents) * 100.0, 1)
                 after_util = round(((rem_bal - alloc) / cl.credit_limit_cents) * 100.0, 1)
-                eff_equiv = round(max(cl.effective_apr_bps / 100.0, equiv_floor), 2)
-                direct_interest = int(round(alloc * (cl.effective_apr_bps / 10000.0)))
-                # Conservative FICO score-tier borrowing-cost option value when direct APR is low/0%
-                benefit = max(direct_interest, int(round(alloc * (eff_equiv / 100.0))))
+                eff_equiv = round(cl.effective_apr_bps / 100.0, 2)
+                benefit = int(round(alloc * (cl.effective_apr_bps / 10000.0)))
                 steps.append(
                     OptimalAllocationStep(
                         bucket="azeo_fico_cliff",
@@ -1239,7 +1236,7 @@ class QuantMathEngine:
                         ),
                         formula_note=(
                             f"Util {before_util:.1f}% -> {after_util:.1f}% (<= {threshold_pct:.1f}% cap); "
-                            f"direct APR {cl.effective_apr_bps / 100:.2f}% + FICO tier unlock ({eff_equiv:.2f}% equiv)"
+                            f"{eff_equiv:.2f}% direct APR = {_fmt(benefit)}/yr interest avoided"
                         ),
                     )
                 )
@@ -1250,21 +1247,21 @@ class QuantMathEngine:
         buf_gap = max(0, int(emergency_buffer_gap_cents))
         if remaining > 0 and buf_gap > 0:
             alloc = min(remaining, buf_gap)
-            benefit = int(round(alloc * (LIQUIDITY_INSURANCE_EQUIV_PCT / 100.0)))
+            benefit = int(round(alloc * (SAFETY_HYSA_ANNUAL_PCT / 100.0)))
             steps.append(
                 OptimalAllocationStep(
                     bucket="emergency_buffer",
                     target_name="Statistical Emergency Buffer",
                     amount_cents=alloc,
                     expected_annual_benefit_cents=benefit,
-                    effective_apr_equivalent_pct=LIQUIDITY_INSURANCE_EQUIV_PCT,
+                    effective_apr_equivalent_pct=SAFETY_HYSA_ANNUAL_PCT,
                     rationale=(
                         f"Add {_fmt(alloc)} toward your volatility-sized emergency buffer "
                         f"to absorb P90 spending spikes without touching credit cards."
                     ),
                     formula_note=(
-                        f"4.25% HYSA + 4.75% shock-avoidance insurance = {LIQUIDITY_INSURANCE_EQUIV_PCT:.2f}% "
-                        f"equiv -> {_fmt(benefit)}/yr liquidity value"
+                        f"{_fmt(alloc)} * {SAFETY_HYSA_ANNUAL_PCT:.2f}% cash reserve yield = "
+                        f"{_fmt(benefit)}/yr"
                     ),
                 )
             )

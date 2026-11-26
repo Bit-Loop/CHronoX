@@ -7,7 +7,7 @@ Security features (Proposal A + Gate 1 Amendments #53):
 - Strict loopback `Host` & `Origin` validation (DNS-rebinding defense)
 - Strict Content-Security-Policy (`script-src 'self'`, zero CDNs, zero inline scripts)
 - Clean canonical `/api/v1/*` OpenAPI contract (`/api/openapi.json`) with `/api/*` aliases (`include_in_schema=False`)
-- Sliding-window rate limiting on auth & AI endpoints + 5 MB upload safety guard
+- Sliding-window rate limiting on auth & AI endpoints + 25 MB upload safety guard
 """
 
 from __future__ import annotations
@@ -50,6 +50,7 @@ from chronox_finance.models import (
     BalanceTransferRequest,
     BrokerCoinbaseConnectRequest,
     BrokerRobinhoodConnectRequest,
+    BrokerSchwabCompleteRequest,
     BrokerSchwabConnectRequest,
     CoachQuestionRequest,
     CreditAPIConnectRequest,
@@ -112,7 +113,7 @@ from chronox_finance.service import FinanceService
 logger = logging.getLogger(__name__)
 
 WEB_DIR = Path(__file__).parent / "web"
-MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
 _VALID_PROVIDERS = {p.value for p in AIProvider}
 _MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 _CSRF_EXEMPT_PATHS = {
@@ -184,7 +185,7 @@ def create_app(
         version="2.0.0",
         description=(
             "Local-First Industrial Personal Finance Command Center — Envelope-Encrypted Vault, "
-            "730-Day Connectors, MoneyStill Analytics, Firefly Automation Rules, Honest Credit Simulator, "
+            "730-Day Connectors, MoneyStill Analytics, Firefly Automation Rules, Credit Factor Analysis, "
             "Stocks & Crypto Portfolio, and Guarded Multi-Provider Agentic Coach."
         ),
         openapi_url="/api/openapi.json",
@@ -263,8 +264,13 @@ def create_app(
     @app.exception_handler(ConnectorAuthError)
     async def connector_auth_handler(_request: Request, exc: ConnectorAuthError):
         return JSONResponse(
-            status_code=401,
-            content={"detail": str(exc), "code": "connector_auth_error"},
+            status_code=502,
+            content={
+                "detail": str(exc),
+                "code": "connector_auth_error",
+                "provider": exc.provider,
+                "reconnect_required": True,
+            },
         )
 
     @app.exception_handler(ConnectorError)
@@ -475,7 +481,7 @@ def create_app(
 
     def _decode_upload(raw: bytes) -> str:
         if len(raw) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="Uploaded file exceeds 5 MB safety limit.")
+            raise HTTPException(status_code=413, detail="Uploaded file exceeds 25 MB safety limit.")
         for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
             try:
                 return raw.decode(enc)
@@ -485,7 +491,7 @@ def create_app(
 
     def _read_statement_payload(raw: bytes, filename: str) -> Any:
         if len(raw) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="Statement file exceeds 5 MB safety limit.")
+            raise HTTPException(status_code=413, detail="Statement file exceeds 25 MB safety limit.")
         if filename.lower().endswith(".pdf") or raw[:5] == b"%PDF-":
             return raw
         return _decode_upload(raw)
@@ -606,7 +612,7 @@ def create_app(
             "note": "Only funds remaining AFTER Bills, Credit Cards, and Emergency Buffer are 100% shielded.",
         }
 
-    # --- MoneyStill Analytics, Net Worth & What-If Scenarios ---
+    # --- MoneyStill Analytics, Net Worth & Scenario Projections ---
 
     @v1.get("/analytics/overview", tags=["Analytics"], dependencies=[Depends(require_auth)])
     def analytics_overview(
@@ -641,6 +647,10 @@ def create_app(
 
     # --- Accounts & Jars ---
 
+    @v1.get("/accounts", tags=["Accounts"], dependencies=[Depends(require_auth)])
+    def list_accounts():
+        return svc.get_dashboard().accounts
+
     @v1.post("/accounts", tags=["Accounts"], dependencies=[Depends(require_auth)])
     def create_account(req: AccountCreate):
         return svc.create_account(req)
@@ -668,6 +678,7 @@ def create_app(
     @v1.get("/transactions", tags=["Transactions"], dependencies=[Depends(require_auth)])
     def list_transactions(
         limit: int = 100,
+        offset: int = 0,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         account_id: Optional[int] = None,
@@ -676,7 +687,8 @@ def create_app(
         search: Optional[str] = None,
     ):
         return svc.list_transactions(
-            limit=max(1, min(5000, limit)),
+            limit=max(1, min(250_000, limit)),
+            offset=max(0, offset),
             start_date=start_date,
             end_date=end_date,
             account_id=account_id,
@@ -910,23 +922,25 @@ def create_app(
             raise HTTPException(status_code=404, detail="Email queue item not found")
         return updated
 
-    # --- Credit Reports, Inquiries, Derogatories & Honest Factor Simulator ---
+    # --- Credit Reports, Inquiries, Derogatories & Factor Analysis ---
 
     @v1.get("/credit/report", tags=["Credit"], dependencies=[Depends(require_auth)])
     def get_credit_report(
         extra_monthly_cents: int = 25_000,
         include_au: bool = True,
         include_authorized_user: Optional[bool] = None,
+        include_sandbox: bool = False,
     ):
         inc_au = include_authorized_user if include_authorized_user is not None else include_au
         return svc.get_credit_report(
             extra_monthly_budget_cents=max(0, min(50_000_000, extra_monthly_cents)),
             include_authorized_user=inc_au,
+            include_sandbox=include_sandbox,
         )
 
     @v1.get("/credit/reports", tags=["Credit"], dependencies=[Depends(require_auth)])
-    def list_credit_reports():
-        return svc.list_credit_reports()
+    def list_credit_reports(include_sandbox: bool = False):
+        return svc.list_credit_reports(include_sandbox=include_sandbox)
 
     @v1.post("/credit/reports", tags=["Credit"], dependencies=[Depends(require_auth)])
     def create_credit_report(req: CreditReportCreate):
@@ -952,7 +966,7 @@ def create_app(
                 raise HTTPException(status_code=400, detail="Missing 'file' field in multipart upload.")
             raw = await upload.read(MAX_UPLOAD_BYTES + 1)
             if len(raw) > MAX_UPLOAD_BYTES:
-                raise HTTPException(status_code=413, detail="Credit report file exceeds 5 MB limit.")
+                raise HTTPException(status_code=413, detail="Credit report file exceeds 25 MB limit.")
             fname = getattr(upload, "filename", "") or ""
             raw_confirm = str(form.get("confirm", form.get("commit", str(confirm)))).strip().lower()
             do_confirm = raw_confirm in ("1", "true", "yes", "on")
@@ -962,7 +976,7 @@ def create_app(
 
         raw_body = await request.body()
         if len(raw_body) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="Credit report payload exceeds 5 MB limit.")
+            raise HTTPException(status_code=413, detail="Credit report payload exceeds 25 MB limit.")
         if not raw_body.strip():
             raise HTTPException(status_code=400, detail="Empty credit report import payload.")
         try:
@@ -974,8 +988,8 @@ def create_app(
         return svc.import_credit_report(parsed, filename="structured.json", bureau_hint=b_hint, confirm=do_confirm)
 
     @v1.get("/credit/inquiries", tags=["Credit"], dependencies=[Depends(require_auth)])
-    def list_credit_inquiries():
-        return svc.list_credit_inquiries()
+    def list_credit_inquiries(include_sandbox: bool = False):
+        return svc.list_credit_inquiries(include_sandbox=include_sandbox)
 
     @v1.post("/credit/inquiries", tags=["Credit"], dependencies=[Depends(require_auth)])
     def create_credit_inquiry(req: CreditInquiryCreate):
@@ -988,8 +1002,8 @@ def create_app(
         return {"deleted": True}
 
     @v1.get("/credit/derogatories", tags=["Credit"], dependencies=[Depends(require_auth)])
-    def list_credit_derogatories():
-        return svc.list_credit_derogatories()
+    def list_credit_derogatories(include_sandbox: bool = False):
+        return svc.list_credit_derogatories(include_sandbox=include_sandbox)
 
     @v1.post("/credit/derogatories", tags=["Credit"], dependencies=[Depends(require_auth)])
     def create_credit_derogatory(req: CreditDerogatoryCreate):
@@ -1090,7 +1104,7 @@ def create_app(
 
         raw_body = await request.body()
         if len(raw_body) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="CSV import payload exceeds 5 MB limit.")
+            raise HTTPException(status_code=413, detail="CSV import payload exceeds 25 MB limit.")
         if not raw_body.strip():
             raise HTTPException(status_code=400, detail="Empty CSV import payload.")
         try:
@@ -1115,6 +1129,10 @@ def create_app(
     @v1.post("/brokers/schwab/connect", tags=["Portfolio"], dependencies=[Depends(require_auth)])
     def connect_schwab(req: BrokerSchwabConnectRequest):
         return svc.connect_schwab(req)
+
+    @v1.post("/brokers/schwab/complete", tags=["Portfolio"], dependencies=[Depends(require_auth)])
+    def complete_schwab_oauth(req: BrokerSchwabCompleteRequest):
+        return svc.complete_schwab_oauth(req)
 
     @v1.get("/brokers/schwab/callback", tags=["Portfolio"])
     def schwab_oauth_callback(code: str, state: str):
@@ -1332,11 +1350,22 @@ def create_app(
             headers={"Content-Disposition": 'attachment; filename="chronox-finance-backup.json"'},
         )
 
+    @v1.post("/backup/preview", tags=["Settings"], dependencies=[Depends(require_auth)])
+    async def preview_backup(file: Annotated[UploadFile, File(...)]):
+        raw = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(raw) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Backup file exceeds 25 MB limit.")
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            return svc.storage.preview_backup(payload)
+        except (ValueError, json.JSONDecodeError, KeyError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid backup file: {exc}") from exc
+
     @v1.post("/backup/import", tags=["Settings"], dependencies=[Depends(require_auth)])
     async def import_backup(file: Annotated[UploadFile, File(...)]):
         raw = await file.read(MAX_UPLOAD_BYTES + 1)
         if len(raw) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="Backup file exceeds 5 MB limit.")
+            raise HTTPException(status_code=413, detail="Backup file exceeds 25 MB limit.")
         try:
             payload = json.loads(raw.decode("utf-8"))
             svc.storage.import_backup(payload)

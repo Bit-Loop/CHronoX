@@ -44,14 +44,24 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=5.0.0",
     "ruff>=0.6.0",
+    "setuptools>=68.0",
+    "wheel>=0.43.0",
 ]
 
 [project.scripts]
 chronox = "main:main"
 chronox-finance = "chronox_finance.cli:run_cli"
 
+[tool.setuptools]
+py-modules = ["main"]
+include-package-data = true
+
 [tool.setuptools.packages.find]
 include = ["chronox_finance*", "config*", "utils*", "data*", "models*", "backtesting*", "monitoring*", "pipelines*", "training*"]
+
+[tool.setuptools.package-data]
+chronox_finance = ["web/*", "web/**/*"]
+config = ["*.yaml", "*.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

@@ -25,6 +25,7 @@ from chronox_finance.engines.recurring import (
     detect_payday_schedule,
     forecast_bill_amount_cents,
     match_transaction_to_bill,
+    step_bill_due_date,
 )
 from chronox_finance.models import (
     AccountType,
@@ -204,13 +205,22 @@ def _build_calm_jar_note(
     kind: JarKind,
     available_cents: int,
     allocated_cents: int,
+    target_cents: int,
+    projected_cents: int,
     pace_delta_pct: float,
     health: JarHealth,
+    needs_setup: bool = False,
 ) -> str:
     """Generate RSD-safe, shame-free, plain-English jar guidance."""
     avail_str = f"${abs(available_cents) / 100:,.2f}"
     if available_cents < 0:
         return f"Dipped {avail_str} over this cycle — totally fixable with a 1-click rebalance."
+    if needs_setup:
+        tgt_str = f"${target_cents / 100:,.2f}/mo"
+        if projected_cents > 0:
+            proj_str = f"${projected_cents / 100:,.2f}/mo"
+            return f"Setup state: $0.00 cash funded yet (target {tgt_str}, projected {proj_str})."
+        return f"Setup state: $0.00 cash funded yet — add an account balance or income deposit (target {tgt_str})."
     if health == JarHealth.CALM:
         if kind == JarKind.BILLS:
             return f"Bills shield solid — {avail_str} set aside and protected."
@@ -243,6 +253,66 @@ class AutoBudgetResult:
 class AutoBudgetEngine:
     """Deterministic self-updating auto-budget engine."""
 
+    @staticmethod
+    def _allocate_pool_across_jars(
+        *,
+        pool_cents: int,
+        jars: List[Dict[str, Any]],
+        monthly_bills_obligation_cents: int,
+        trailing_ema: Dict[int, int],
+    ) -> Dict[int, int]:
+        """Distribute `pool_cents` across jars (Bills-First + 3-month EMA reality blending)."""
+        if pool_cents <= 0:
+            return {int(j["id"]): 0 for j in jars}
+
+        allocations: Dict[int, int] = {}
+        bills_jar = next((j for j in jars if j["kind"] == JarKind.BILLS.value), None)
+        remaining = pool_cents
+
+        if bills_jar:
+            target_by_pct = int(round(pool_cents * (float(bills_jar["target_pct"]) / 100.0)))
+            ema_bills = trailing_ema.get(int(bills_jar["id"]), 0)
+            bills_need = max(
+                monthly_bills_obligation_cents,
+                target_by_pct,
+                int(round(0.7 * target_by_pct + 0.3 * ema_bills)),
+            )
+            bills_alloc = min(pool_cents, bills_need)
+            allocations[int(bills_jar["id"])] = bills_alloc
+            remaining = max(0, pool_cents - bills_alloc)
+
+        other_jars = [j for j in jars if not bills_jar or j["id"] != bills_jar["id"]]
+        pct_sum = sum(max(0.0, float(j["target_pct"])) for j in other_jars) or 100.0
+        raw_other: Dict[int, int] = {}
+        for j in other_jars:
+            jid = int(j["id"])
+            share = max(0.0, float(j["target_pct"])) / pct_sum
+            base_alloc = int(round(remaining * share))
+            ema_spend = trailing_ema.get(jid)
+            if ema_spend is not None and ema_spend > 0 and j["kind"] in (JarKind.DAILY.value, JarKind.FUN.value):
+                blended = int(round(0.75 * base_alloc + 0.25 * ema_spend))
+                lo, hi = int(base_alloc * 0.75), int(base_alloc * 1.25)
+                raw_other[jid] = max(lo, min(hi, blended))
+            else:
+                raw_other[jid] = base_alloc
+
+        raw_other_sum = sum(raw_other.values())
+        if raw_other_sum > 0 and remaining > 0:
+            scale = remaining / raw_other_sum
+            allocated_so_far = 0
+            for idx, j in enumerate(other_jars):
+                jid = int(j["id"])
+                if idx == len(other_jars) - 1:
+                    val = max(0, remaining - allocated_so_far)
+                else:
+                    val = int(round(raw_other[jid] * scale))
+                    allocated_so_far += val
+                allocations[jid] = val
+        else:
+            for j in other_jars:
+                allocations[int(j["id"])] = 0
+        return allocations
+
     def compute(
         self,
         *,
@@ -259,39 +329,68 @@ class AutoBudgetEngine:
         ref = today or date.today()
         ym_now = current_cycle_ym(ref)
         _m_start, _m_end, cycle_progress_pct = _month_bounds(ref)
+        profile_currency = str(settings.get("currency") or "USD").strip().upper() or "USD"
 
-        # 1. Infer payday schedule
+        # 0. Compute live USD account liquidity & credit card reserves first
+        total_liquid_cash_cents = 0
+        checking_and_cash_cents = 0
+        credit_card_reserved_cents = 0
+        for acct in accounts:
+            acct_curr = str(acct.get("currency") or profile_currency).strip().upper() or profile_currency
+            if acct_curr != profile_currency:
+                # Isolate foreign-currency balances so non-matching units never corrupt cent math
+                continue
+            atype = acct["account_type"]
+            bal = int(acct["balance_cents"])
+            if atype == AccountType.CREDIT.value:
+                if bal < 0:
+                    credit_card_reserved_cents += abs(bal)
+            elif acct.get("is_liquid", 1) and atype in (
+                AccountType.CHECKING.value,
+                AccountType.SAVINGS.value,
+                AccountType.CASH.value,
+            ):
+                total_liquid_cash_cents += bal
+                if atype in (AccountType.CHECKING.value, AccountType.CASH.value):
+                    checking_and_cash_cents += bal
+
+        # 1. Infer payday schedule (never inventing default income on a fresh profile)
+        expected_paycheck_cfg = int(settings.get("expected_paycheck_cents", 0) or 0)
         payday = detect_payday_schedule(
             transactions=transactions,
             fallback_cadence_days=int(settings.get("payday_cadence_days", 14)),
             fallback_payday_date=settings.get("next_payday_date"),
-            fallback_paycheck_cents=int(settings.get("expected_paycheck_cents", 220_000)),
+            fallback_paycheck_cents=expected_paycheck_cfg,
             today=ref,
+            user_configured_payday=bool(settings.get("payday_user_configured", 0)),
         )
         next_payday_dt = date.fromisoformat(payday.next_payday_date)
         days_until_payday = max(1, (next_payday_dt - ref).days)
 
-        # 2. Income smoothing
+        # 2. Income smoothing (actual vs projected)
         monthly_income_cents, smoothed_income_cents = _estimate_smoothed_monthly_income(
             transactions, payday, ref
         )
-        # Ensure sensible floor if user hasn't added income yet (sum of jar targets)
         configured_total_targets = sum(int(j.get("monthly_target_cents", 0)) for j in jars)
-        planning_income_cents = smoothed_income_cents if smoothed_income_cents > 0 else max(configured_total_targets, 100_000)
 
-        # 3. Annotate recurring bills & compute unpaid bills until next payday
+        # 3. Annotate recurring bills & reserve ALL unpaid occurrences due on/before next payday
         upcoming_bills: List[RecurringBillOut] = []
         unpaid_bills_until_payday_cents = 0
         monthly_bills_obligation_cents = 0
 
-        # Track bills already paid in last 5 days so we don't double-count a bill due today
-        recent_expenses = [
-            t
-            for t in transactions
-            if t.get("tx_type") == "expense"
-            and 0 <= (ref - date.fromisoformat(t["tx_date"])).days <= 5
-        ]
-        recent_paid_merchants = {t["normalized_merchant"] for t in recent_expenses}
+        recent_expenses: List[Tuple[int, Dict[str, Any]]] = []
+        for idx_tx, t in enumerate(transactions):
+            if t.get("tx_type") != "expense":
+                continue
+            try:
+                tx_dt = date.fromisoformat(str(t["tx_date"])[:10])
+            except ValueError:
+                continue
+            if -35 <= (ref - tx_dt).days <= 35:
+                tx_key = int(t["id"]) if t.get("id") is not None else -(idx_tx + 1)
+                recent_expenses.append((tx_key, t))
+
+        consumed_tx_keys: set[int] = set()
 
         for b in recurring_bills:
             if not b.get("active", 1):
@@ -301,17 +400,33 @@ class AutoBudgetEngine:
             amt = forecast_bill_amount_cents(b)
             prev_amt = b.get("previous_amount_cents")
             hike = max(0, amt - int(prev_amt)) if prev_amt is not None else 0
+            cadence_enum = RecurrenceCadence(b["cadence"])
 
             monthly_bills_obligation_cents += _bill_monthly_equivalent_cents(amt, b["cadence"])
 
-            if due_dt <= next_payday_dt:
-                # If due date is today or past-due and NOT just paid, reserve it
-                just_paid = days_until_due <= 0 and (
-                    b["normalized_merchant"] in recent_paid_merchants
-                    or any(match_transaction_to_bill(t, b, require_date_window=True) for t in recent_expenses)
-                )
-                if not just_paid:
+            # Step through ALL occurrences of this bill up to and including `next_payday_dt`
+            occ_dt = due_dt
+            anchor_day = due_dt.day
+            occ_guard = 0
+            while occ_dt <= next_payday_dt and occ_guard < 60:
+                occ_guard += 1
+                b_for_occ = dict(b, next_due_date=occ_dt.isoformat())
+                matched_tx_key: Optional[int] = None
+                if (occ_dt - ref).days <= int(b.get("due_window_days") or 4):
+                    for tx_key, cand_tx in recent_expenses:
+                        if tx_key in consumed_tx_keys:
+                            continue
+                        if match_transaction_to_bill(cand_tx, b_for_occ, require_date_window=True):
+                            matched_tx_key = tx_key
+                            break
+                if matched_tx_key is not None:
+                    consumed_tx_keys.add(matched_tx_key)
+                else:
                     unpaid_bills_until_payday_cents += amt
+                next_occ = step_bill_due_date(occ_dt, cadence_enum, anchor_day)
+                if next_occ <= occ_dt:
+                    break
+                occ_dt = next_occ
 
             upcoming_bills.append(
                 RecurringBillOut(
@@ -324,7 +439,7 @@ class AutoBudgetEngine:
                     due_window_days=int(b["due_window_days"]) if b.get("due_window_days") is not None else 4,
                     previous_amount_cents=int(prev_amt) if prev_amt is not None else None,
                     price_hike_cents=hike,
-                    cadence=RecurrenceCadence(b["cadence"]),
+                    cadence=cadence_enum,
                     next_due_date=b["next_due_date"],
                     days_until_due=days_until_due,
                     jar_id=b.get("jar_id"),
@@ -339,7 +454,6 @@ class AutoBudgetEngine:
         upcoming_bills.sort(key=lambda x: (x.days_until_due, -x.amount_cents))
 
         # 3b. Shield upcoming debt/credit-line minimum payments due before next payday
-        # (Skip credit cards already linked to a tracked `credit` account to avoid double-counting!)
         if credit_lines:
             from chronox_finance.engines.credit_debt import (
                 compute_effective_min_payment,
@@ -367,73 +481,7 @@ class AutoBudgetEngine:
                 if due_dt <= next_payday_dt:
                     unpaid_bills_until_payday_cents += min_pay
 
-        # 4. Self-Updating Adaptive Jar Allocations (Bills-First + 3-Month EMA Blending)
-        trailing_ema = _compute_trailing_jar_spend_ema(transactions, ref, splits_by_tx_id=splits_by_tx_id)
-        adaptive_allocations: Dict[int, int] = {}
-        adaptive_updates: List[Dict[str, Any]] = []
-
-        bills_jar = next((j for j in jars if j["kind"] == JarKind.BILLS.value), None)
-        remaining_income = planning_income_cents
-
-        # Step 4a: Protect Bills & Essentials first
-        if bills_jar:
-            target_by_pct = int(round(planning_income_cents * (float(bills_jar["target_pct"]) / 100.0)))
-            ema_bills = trailing_ema.get(int(bills_jar["id"]), 0)
-            bills_need = max(monthly_bills_obligation_cents, target_by_pct, int(round(0.7 * target_by_pct + 0.3 * ema_bills)))
-            bills_alloc = min(planning_income_cents, bills_need)
-            adaptive_allocations[int(bills_jar["id"])] = bills_alloc
-            remaining_income = max(0, planning_income_cents - bills_alloc)
-
-        # Step 4b: Distribute remaining income across non-bills jars using normalized target_pct + gentle EMA nudge
-        other_jars = [j for j in jars if not bills_jar or j["id"] != bills_jar["id"]]
-        pct_sum = sum(max(0.0, float(j["target_pct"])) for j in other_jars) or 100.0
-        raw_other: Dict[int, int] = {}
-        for j in other_jars:
-            jid = int(j["id"])
-            share = max(0.0, float(j["target_pct"])) / pct_sum
-            base_alloc = int(round(remaining_income * share))
-            ema_spend = trailing_ema.get(jid)
-            if ema_spend is not None and ema_spend > 0 and j["kind"] in (JarKind.DAILY.value, JarKind.FUN.value):
-                # Gentle 25% adaptation toward reality, capped within [0.75x, 1.25x] of base target
-                blended = int(round(0.75 * base_alloc + 0.25 * ema_spend))
-                lo, hi = int(base_alloc * 0.75), int(base_alloc * 1.25)
-                raw_other[jid] = max(lo, min(hi, blended))
-            else:
-                raw_other[jid] = base_alloc
-
-        # Re-normalize non-bills jars so total allocations NEVER exceed planning_income_cents
-        raw_other_sum = sum(raw_other.values())
-        if raw_other_sum > 0 and remaining_income > 0:
-            scale = remaining_income / raw_other_sum
-            allocated_so_far = 0
-            for idx, j in enumerate(other_jars):
-                jid = int(j["id"])
-                if idx == len(other_jars) - 1:
-                    val = max(0, remaining_income - allocated_so_far)
-                else:
-                    val = int(round(raw_other[jid] * scale))
-                    allocated_so_far += val
-                adaptive_allocations[jid] = val
-        else:
-            for j in other_jars:
-                adaptive_allocations[int(j["id"])] = 0
-
-        for j in jars:
-            jid = int(j["id"])
-            prev_alloc = int(j.get("auto_allocated_cents", 0))
-            new_alloc = adaptive_allocations.get(jid, prev_alloc)
-            if abs(new_alloc - prev_alloc) >= 500:  # >= $5.00 shift worth surfacing
-                adaptive_updates.append(
-                    {
-                        "jar_id": jid,
-                        "jar_name": j["name"],
-                        "previous_cents": prev_alloc,
-                        "recommended_cents": new_alloc,
-                        "delta_cents": new_alloc - prev_alloc,
-                    }
-                )
-
-        # 5. Compute current-month split-aware spending & intra-cycle rebalance transfers per jar
+        # 4. Compute current-month split-aware spending & intra-cycle rebalance transfers per jar
         spent_by_jar: Dict[int, int] = defaultdict(int)
         monthly_spent_cents = 0
         for tx in transactions:
@@ -449,30 +497,95 @@ class AutoBudgetEngine:
             transfer_delta_by_jar[int(tr["from_jar_id"])] -= amt
             transfer_delta_by_jar[int(tr["to_jar_id"])] += amt
 
+        # 5. Separate Projected Allocations vs Actual Funded Cash Allocations
+        trailing_ema = _compute_trailing_jar_spend_ema(transactions, ref, splits_by_tx_id=splits_by_tx_id)
+        projected_allocations = self._allocate_pool_across_jars(
+            pool_cents=smoothed_income_cents,
+            jars=jars,
+            monthly_bills_obligation_cents=monthly_bills_obligation_cents,
+            trailing_ema=trailing_ema,
+        )
+
+        existing_rollovers = 0
+        for j in jars:
+            if j.get("rollover_enabled", 1):
+                r_val = max(0, int(j.get("rollover_cents", 0)))
+                cap = j.get("rollover_cap_cents")
+                if cap is not None and r_val > int(cap):
+                    r_val = int(cap)
+                existing_rollovers += r_val
+
+        # Actual cash available to back current-cycle jar allocations (never inventing cash on $0 profiles)
+        cycle_cash_pool = max(0, total_liquid_cash_cents + monthly_spent_cents - existing_rollovers)
+        if smoothed_income_cents > 0:
+            funded_pool = min(smoothed_income_cents, cycle_cash_pool)
+        elif cycle_cash_pool > 0:
+            base_plan = configured_total_targets if configured_total_targets > 0 else cycle_cash_pool
+            funded_pool = min(base_plan, cycle_cash_pool)
+        else:
+            funded_pool = 0
+
+        adaptive_allocations = self._allocate_pool_across_jars(
+            pool_cents=funded_pool,
+            jars=jars,
+            monthly_bills_obligation_cents=monthly_bills_obligation_cents,
+            trailing_ema=trailing_ema,
+        )
+        needs_setup = (
+            total_liquid_cash_cents <= 0
+            and monthly_income_cents == 0
+            and existing_rollovers == 0
+            and monthly_spent_cents == 0
+        )
+
+        adaptive_updates: List[Dict[str, Any]] = []
+        for j in jars:
+            jid = int(j["id"])
+            prev_alloc = int(j.get("auto_allocated_cents", 0))
+            new_alloc = adaptive_allocations.get(jid, 0)
+            if abs(new_alloc - prev_alloc) >= 500:
+                adaptive_updates.append(
+                    {
+                        "jar_id": jid,
+                        "jar_name": j["name"],
+                        "previous_cents": prev_alloc,
+                        "recommended_cents": new_alloc,
+                        "delta_cents": new_alloc - prev_alloc,
+                    }
+                )
+
         # 6. Build JarState objects
         jar_states: List[JarState] = []
         for j in jars:
             jid = int(j["id"])
             kind = JarKind(j["kind"])
-            alloc = adaptive_allocations.get(jid, int(j.get("monthly_target_cents", 0)))
+            funded_alloc = adaptive_allocations.get(jid, 0)
+            proj_alloc = projected_allocations.get(jid, 0)
+            target_cents = int(j.get("monthly_target_cents", 0))
             rollover = int(j.get("rollover_cents", 0)) if j.get("rollover_enabled", 1) else 0
             cap = j.get("rollover_cap_cents")
             if cap is not None and rollover > int(cap):
                 rollover = int(cap)
             t_delta = transfer_delta_by_jar.get(jid, 0)
-            effective_budget = max(0, alloc + rollover + t_delta)
+            effective_budget = max(0, funded_alloc + rollover + t_delta)
             spent = spent_by_jar.get(jid, 0)
-            available = (alloc + rollover + t_delta) - spent
+            available = (funded_alloc + rollover + t_delta) - spent
 
-            pct_used = round((spent / effective_budget * 100.0), 1) if effective_budget > 0 else (100.0 if spent > 0 else 0.0)
-            pace_delta = round(pct_used - cycle_progress_pct, 1)
+            pct_used = (
+                round((spent / effective_budget * 100.0), 1)
+                if effective_budget > 0
+                else (100.0 if spent > 0 else 0.0)
+            )
+            pace_delta = round(pct_used - cycle_progress_pct, 1) if effective_budget > 0 else 0.0
 
-            if available < 0 or pct_used >= 95.0:
+            if available < 0 or (effective_budget > 0 and pct_used >= 95.0):
                 health = JarHealth.REBALANCE
-            elif pace_delta > 15.0 and kind in (JarKind.DAILY, JarKind.FUN):
+            elif effective_budget > 0 and pace_delta > 15.0 and kind in (JarKind.DAILY, JarKind.FUN):
                 health = JarHealth.WATCH
             else:
                 health = JarHealth.CALM
+
+            jar_needs_setup = needs_setup or (funded_alloc == 0 and rollover == 0 and t_delta == 0 and spent == 0)
 
             jar_states.append(
                 JarState(
@@ -484,8 +597,10 @@ class AutoBudgetEngine:
                     color=j["color"],
                     priority=int(j["priority"]),
                     target_pct=float(j["target_pct"]),
-                    monthly_target_cents=int(j["monthly_target_cents"]),
-                    auto_allocated_cents=alloc,
+                    monthly_target_cents=target_cents,
+                    auto_allocated_cents=funded_alloc,
+                    funded_cents=funded_alloc,
+                    projected_allocation_cents=proj_alloc,
                     rollover_cents=rollover,
                     spent_cents=spent,
                     available_cents=available,
@@ -495,38 +610,34 @@ class AutoBudgetEngine:
                     is_locked=bool(j.get("is_locked", 0)),
                     rollover_enabled=bool(j.get("rollover_enabled", 1)),
                     rollover_cap_cents=int(cap) if cap is not None else None,
-                    calm_note=_build_calm_jar_note(kind, available, effective_budget, pace_delta, health),
+                    needs_setup=jar_needs_setup,
+                    calm_note=_build_calm_jar_note(
+                        kind,
+                        available,
+                        effective_budget,
+                        target_cents,
+                        proj_alloc,
+                        pace_delta,
+                        health,
+                        needs_setup=jar_needs_setup,
+                    ),
                 )
             )
 
         # 7. Real-time Safe-to-Spend Firewall Calculation
-        total_liquid_cash_cents = 0
-        credit_card_reserved_cents = 0
-        for acct in accounts:
-            atype = acct["account_type"]
-            bal = int(acct["balance_cents"])
-            if atype == AccountType.CREDIT.value:
-                # Negative balance on credit card represents balance owed (reserve cash to pay in full!)
-                if bal < 0:
-                    credit_card_reserved_cents += abs(bal)
-            elif acct.get("is_liquid", 1) and atype in (
-                AccountType.CHECKING.value,
-                AccountType.SAVINGS.value,
-                AccountType.CASH.value,
-            ):
-                total_liquid_cash_cents += bal
-
         emergency_buffer_cents = int(settings.get("emergency_buffer_cents", 50_000))
 
-        # Locked jar reserves (Safety + Invest available funds that are intentionally ring-fenced;
-        # Bills are already accounted for via unpaid_bills_until_payday_cents so we don't double-subtract)
         locked_jar_reserves_cents = sum(
             max(0, js.available_cents)
             for js in jar_states
             if js.is_locked and js.kind in (JarKind.SAFETY, JarKind.INVEST)
         )
+        locked_non_invest_reserves_cents = sum(
+            max(0, js.available_cents)
+            for js in jar_states
+            if js.is_locked and js.kind not in (JarKind.INVEST, JarKind.BILLS)
+        )
 
-        # Raw Safe-to-Spend before clamping
         raw_safe_to_spend = (
             total_liquid_cash_cents
             - unpaid_bills_until_payday_cents
@@ -552,18 +663,27 @@ class AutoBudgetEngine:
         )
 
         # 8. ChronoX "Don't Trade Your Rent" Safe-to-Invest Capital Cap
-        cash_after_essentials = (
+        # Subtracts locked non-invest reserves (Safety) AND caps by non-savings liquid cash
+        # so locked savings or $0-safe-to-spend reserves can NEVER be treated as investable cash.
+        cash_after_essentials_and_safety = (
             total_liquid_cash_cents
             - unpaid_bills_until_payday_cents
             - emergency_buffer_cents
             - credit_card_reserved_cents
+            - locked_non_invest_reserves_cents
         )
+        deployable_checking_headroom = (
+            checking_and_cash_cents
+            - unpaid_bills_until_payday_cents
+            - credit_card_reserved_cents
+        )
+        investable_cash_ceiling = min(cash_after_essentials_and_safety, deployable_checking_headroom)
         invest_jar = next((js for js in jar_states if js.kind == JarKind.INVEST), None)
         bills_healthy = all(js.available_cents >= 0 for js in jar_states if js.kind == JarKind.BILLS)
-        if cash_after_essentials <= 0 or not bills_healthy or not invest_jar:
+        if investable_cash_ceiling <= 0 or not bills_healthy or not invest_jar:
             safe_to_invest_cents = 0
         else:
-            safe_to_invest_cents = max(0, min(invest_jar.available_cents, cash_after_essentials))
+            safe_to_invest_cents = max(0, min(invest_jar.available_cents, investable_cash_ceiling))
 
         # 9. Zero-Guilt 1-Click Auto-Rebalance Plans for any negative jar
         rebalance_plans = self._build_rebalance_plans(jar_states)
@@ -600,6 +720,13 @@ class AutoBudgetEngine:
             for j in sorted(jars, key=lambda x: donor_priority.get(x.kind, 50))
             if j.kind != JarKind.BILLS and j.available_cents > 0
         ]
+        # If profile is not yet funded with cash, allow reallocating unspent planned targets (never Bills!)
+        if not donors:
+            donors = [
+                {"jar": j, "surplus": max(0, j.monthly_target_cents - j.spent_cents)}
+                for j in sorted(jars, key=lambda x: donor_priority.get(x.kind, 50))
+                if j.kind != JarKind.BILLS and max(0, j.monthly_target_cents - j.spent_cents) > 0
+            ]
 
         plans: List[RebalancePlan] = []
         for deficit_jar in deficits:

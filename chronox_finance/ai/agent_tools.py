@@ -1408,7 +1408,7 @@ def _validate_single_action(
         if kind == "credit_card" and limit_cents <= 0:
             return None, "create_credit_line for a credit card requires positive `credit_limit_cents`"
 
-        apr_bps = _strict_int(payload.get("apr_bps")) if payload.get("apr_bps") is not None else 2499
+        apr_bps = _strict_int(payload.get("apr_bps")) if payload.get("apr_bps") is not None else 0
         if apr_bps is None or not (0 <= apr_bps <= 10000):
             return None, "create_credit_line `apr_bps` must be 0..10000"
 
@@ -1961,7 +1961,7 @@ def _parse_single_deterministic_clause(
         apr_m = re.search(r"(\d{1,2}(?:\.\d{1,2})?)\s*%", low)
         limit_cents = int(round(float(limit_m.group(1).replace(",", "")) * 100)) if limit_m else (_parse_dollars_to_cents(text) or 0)
         bal_cents = int(round(float(bal_m.group(1).replace(",", "")) * 100)) if bal_m else 0
-        apr_bps = int(round(float(apr_m.group(1)) * 100)) if apr_m else 2499
+        apr_bps = int(round(float(apr_m.group(1)) * 100)) if apr_m else 0
         name_part = re.sub(r"(?:limit|balance|apr).*$", "", text, flags=re.I)
         name_part = re.sub(r"\b(?:add|create|new|a|credit\s+card|credit\s+line)\b", " ", name_part, flags=re.I)
         name_part = re.sub(r"\s+", " ", name_part).strip(" -:'\"")

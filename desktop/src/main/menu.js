@@ -131,7 +131,7 @@ function buildApplicationMenu(options) {
           click: () => cb.onNavigateTab && cb.onNavigateTab("today"),
         },
         {
-          label: "Analytics & What-If",
+          label: "Analytics & Forecast",
           accelerator: "CommandOrControl+2",
           click: () => cb.onNavigateTab && cb.onNavigateTab("analytics"),
         },

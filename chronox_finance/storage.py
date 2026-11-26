@@ -26,7 +26,7 @@ import threading
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from chronox_finance.models import (
     AccountType,
@@ -149,7 +149,7 @@ CREATE TABLE IF NOT EXISTS profile_settings (
     default_cooling_hours INTEGER NOT NULL DEFAULT 48,
     payday_cadence_days INTEGER NOT NULL DEFAULT 14,
     next_payday_date TEXT,
-    expected_paycheck_cents INTEGER NOT NULL DEFAULT 220000,
+    expected_paycheck_cents INTEGER NOT NULL DEFAULT 0,
     calm_mode INTEGER NOT NULL DEFAULT 1,
     auto_rebalance_enabled INTEGER NOT NULL DEFAULT 1,
     opencode_base_url TEXT NOT NULL DEFAULT 'https://opencode.ai/zen/go/v1',
@@ -303,7 +303,7 @@ CREATE TABLE IF NOT EXISTS credit_lines (
     kind TEXT NOT NULL DEFAULT 'credit_card',
     balance_cents INTEGER NOT NULL DEFAULT 0,
     credit_limit_cents INTEGER NOT NULL DEFAULT 0,
-    apr_bps INTEGER NOT NULL DEFAULT 2499,
+    apr_bps INTEGER NOT NULL DEFAULT 0,
     min_payment_cents INTEGER NOT NULL DEFAULT 0,
     statement_closing_day INTEGER NOT NULL DEFAULT 15,
     payment_due_day INTEGER NOT NULL DEFAULT 10,
@@ -663,6 +663,115 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
     for emoji, key in _EMOJI_ICON_MIGRATION.items():
         conn.execute("UPDATE jars SET icon = ? WHERE icon = ?", (key, emoji))
 
+    _ensure_additive_columns(conn)
+
+
+def _ensure_additive_columns(conn: sqlite3.Connection) -> None:
+    """Idempotently ensure all additive columns & indexes exist on v2 databases."""
+    _ensure_columns(
+        conn,
+        "profile_settings",
+        [
+            ("income_configured", "INTEGER NOT NULL DEFAULT 0"),
+            ("payday_user_configured", "INTEGER NOT NULL DEFAULT 0"),
+        ],
+    )
+    _ensure_columns(
+        conn,
+        "accounts",
+        [
+            ("connection_id", "INTEGER"),
+            ("external_id", "TEXT NOT NULL DEFAULT ''"),
+            ("mask", "TEXT NOT NULL DEFAULT ''"),
+            ("currency", "TEXT NOT NULL DEFAULT 'USD'"),
+            ("available_cents", "INTEGER"),
+            ("credit_limit_cents", "INTEGER"),
+        ],
+    )
+    _ensure_columns(
+        conn,
+        "transactions",
+        [
+            ("external_id", "TEXT NOT NULL DEFAULT ''"),
+            ("affects_balance", "INTEGER NOT NULL DEFAULT 1"),
+            ("transfer_direction", "TEXT NOT NULL DEFAULT ''"),
+        ],
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_acct_extid ON transactions(account_id, external_id)")
+    _ensure_columns(
+        conn,
+        "bank_connections",
+        [
+            ("backfill_status", "TEXT NOT NULL DEFAULT 'complete'"),
+            ("imported_start_date", "TEXT"),
+            ("imported_end_date", "TEXT"),
+            ("last_error", "TEXT NOT NULL DEFAULT ''"),
+        ],
+    )
+    _ensure_columns(
+        conn,
+        "credit_lines",
+        [
+            ("source_env", "TEXT NOT NULL DEFAULT 'production'"),
+            ("external_account_id", "TEXT NOT NULL DEFAULT ''"),
+        ],
+    )
+    _ensure_columns(
+        conn,
+        "credit_reports",
+        [
+            ("is_sandbox", "INTEGER NOT NULL DEFAULT 0"),
+        ],
+    )
+    _ensure_columns(
+        conn,
+        "credit_inquiries",
+        [
+            ("is_sandbox", "INTEGER NOT NULL DEFAULT 0"),
+        ],
+    )
+    _ensure_columns(
+        conn,
+        "credit_derogatories",
+        [
+            ("is_sandbox", "INTEGER NOT NULL DEFAULT 0"),
+        ],
+    )
+    existing_holding_cols = {
+        str(r[1]) for r in conn.execute("PRAGMA table_info(holdings)").fetchall()
+    }
+    had_cb_known = "cost_basis_known" in existing_holding_cols
+    _ensure_columns(
+        conn,
+        "holdings",
+        [
+            ("external_account_id", "TEXT NOT NULL DEFAULT ''"),
+            ("cost_basis_known", "INTEGER NOT NULL DEFAULT 1"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+        ],
+    )
+    if not had_cb_known and existing_holding_cols:
+        conn.execute(
+            "UPDATE holdings SET cost_basis_known = 0 "
+            "WHERE cost_basis_cents <= 0 AND LOWER(COALESCE(asset_class, '')) != 'cash'"
+        )
+
+
+def _tx_balance_effect(tx_type: str, amount_cents: int, transfer_direction: str = "") -> int:
+    """Signed balance delta for a transaction when `affects_balance == 1`."""
+    amt = int(amount_cents)
+    if tx_type == "income":
+        return amt
+    if tx_type == "expense":
+        return -amt
+    if tx_type == "transfer":
+        direction = (transfer_direction or "").strip().lower()
+        if direction == "out":
+            return -amt
+        if direction == "in":
+            return amt
+    return 0
+
 
 MIGRATIONS: List[Tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "Base ChronoX Finance ledger schema", _migrate_v1),
@@ -677,6 +786,7 @@ class FinanceStorage:
         self.db_path = db_path
         self._lock = threading.RLock()
         self._tx_depth = 0
+        self._closed = False
         if db_path != ":memory:":
             parent = Path(db_path).parent
             parent.mkdir(parents=True, exist_ok=True)
@@ -760,6 +870,7 @@ class FinanceStorage:
                 )
                 had_existing_data = True
 
+            _ensure_additive_columns(self._conn)
             self._seed_defaults()
 
     def _seed_defaults(self) -> None:
@@ -784,9 +895,10 @@ class FinanceStorage:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO profile_settings (
-                    id, next_payday_date, intelligence_mode, ai_provider, gemini_model, gemini_base_url, updated_at
+                    id, next_payday_date, expected_paycheck_cents, income_configured, payday_user_configured,
+                    intelligence_mode, ai_provider, gemini_model, gemini_base_url, updated_at
                 )
-                VALUES (1, ?, ?, ?, ?, ?, ?)
+                VALUES (1, ?, 0, 0, 0, ?, ?, ?, ?, ?)
                 """,
                 (default_payday, env_mode, env_provider, env_gemini_model, env_gemini_url, now),
             )
@@ -807,7 +919,7 @@ class FinanceStorage:
                             slug, name, kind, icon, color, priority, target_pct,
                             monthly_target_cents, auto_allocated_cents, rollover_cents,
                             is_locked, rollover_enabled, rollover_cap_cents, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)
                         """,
                         (
                             jar["slug"],
@@ -817,7 +929,6 @@ class FinanceStorage:
                             jar["color"],
                             jar["priority"],
                             jar["target_pct"],
-                            jar["monthly_target_cents"],
                             jar["monthly_target_cents"],
                             jar["is_locked"],
                             jar["rollover_enabled"],
@@ -858,6 +969,7 @@ class FinanceStorage:
 
     def close(self) -> None:
         with self._lock:
+            self._closed = True
             self._conn.close()
 
     def ping(self) -> bool:
@@ -892,6 +1004,8 @@ class FinanceStorage:
             "payday_cadence_days",
             "next_payday_date",
             "expected_paycheck_cents",
+            "income_configured",
+            "payday_user_configured",
             "calm_mode",
             "auto_rebalance_enabled",
             "onboarding_completed",
@@ -924,12 +1038,16 @@ class FinanceStorage:
         filtered = {k: v for k, v in updates.items() if k in allowed and v is not None}
         if not filtered:
             return self.get_settings(ctx=ctx)
+        if "expected_paycheck_cents" in filtered and "income_configured" not in filtered:
+            filtered["income_configured"] = int(int(filtered["expected_paycheck_cents"]) > 0)
         for bool_col in (
             "calm_mode",
             "auto_rebalance_enabled",
             "onboarding_completed",
             "codex_cli_enabled",
             "email_scanner_enabled",
+            "income_configured",
+            "payday_user_configured",
         ):
             if bool_col in filtered:
                 filtered[bool_col] = int(bool(filtered[bool_col]))
@@ -980,16 +1098,42 @@ class FinanceStorage:
         balance_cents: int,
         institution: str = "",
         is_liquid: bool = True,
+        *,
+        connection_id: Optional[int] = None,
+        external_id: str = "",
+        mask: str = "",
+        currency: str = "USD",
+        available_cents: Optional[int] = None,
+        credit_limit_cents: Optional[int] = None,
         ctx: RequestContext = LOCAL_CONTEXT,
     ) -> Dict[str, Any]:
         now = utc_now_iso()
+        curr = (currency or "USD").strip().upper()[:12] or "USD"
         with self.transaction() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO accounts (name, account_type, balance_cents, institution, is_liquid, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO accounts (
+                    name, account_type, balance_cents, institution, is_liquid,
+                    connection_id, external_id, mask, currency, available_cents, credit_limit_cents,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (name, account_type, int(balance_cents), institution, int(is_liquid), now, now),
+                (
+                    name,
+                    account_type,
+                    int(balance_cents),
+                    institution,
+                    int(is_liquid),
+                    connection_id,
+                    (external_id or "").strip(),
+                    (mask or "").strip(),
+                    curr,
+                    int(available_cents) if available_cents is not None else None,
+                    int(credit_limit_cents) if credit_limit_cents is not None else None,
+                    now,
+                    now,
+                ),
             )
             row = conn.execute("SELECT * FROM accounts WHERE id = ?", (cur.lastrowid,)).fetchone()
             return dict(row)
@@ -1004,13 +1148,48 @@ class FinanceStorage:
             )
 
     def set_account_balance(
-        self, account_id: int, balance_cents: int, ctx: RequestContext = LOCAL_CONTEXT
+        self,
+        account_id: int,
+        balance_cents: int,
+        *,
+        available_cents: Optional[int] = None,
+        credit_limit_cents: Optional[int] = None,
+        currency: Optional[str] = None,
+        mask: Optional[str] = None,
+        connection_id: Optional[int] = None,
+        external_id: Optional[str] = None,
+        mark_history_reconciled: bool = True,
+        ctx: RequestContext = LOCAL_CONTEXT,
     ) -> Optional[Dict[str, Any]]:
+        now = utc_now_iso()
         with self.transaction() as conn:
-            conn.execute(
-                "UPDATE accounts SET balance_cents = ?, updated_at = ? WHERE id = ?",
-                (int(balance_cents), utc_now_iso(), account_id),
-            )
+            sets = ["balance_cents = ?", "updated_at = ?"]
+            vals: List[Any] = [int(balance_cents), now]
+            if available_cents is not None:
+                sets.append("available_cents = ?")
+                vals.append(int(available_cents))
+            if credit_limit_cents is not None:
+                sets.append("credit_limit_cents = ?")
+                vals.append(int(credit_limit_cents))
+            if currency:
+                sets.append("currency = ?")
+                vals.append(currency.strip().upper()[:12])
+            if mask is not None and mask != "":
+                sets.append("mask = ?")
+                vals.append(mask.strip()[:16])
+            if connection_id is not None:
+                sets.append("connection_id = ?")
+                vals.append(int(connection_id))
+            if external_id is not None and external_id != "":
+                sets.append("external_id = ?")
+                vals.append(external_id.strip())
+            vals.append(account_id)
+            conn.execute(f"UPDATE accounts SET {', '.join(sets)} WHERE id = ?", vals)
+            if mark_history_reconciled:
+                conn.execute(
+                    "UPDATE transactions SET affects_balance = 0 WHERE account_id = ?",
+                    (account_id,),
+                )
             row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
             return dict(row) if row else None
 
@@ -1248,11 +1427,16 @@ class FinanceStorage:
         needs_review: bool,
         source: str,
         fingerprint: Optional[str] = None,
+        external_id: str = "",
+        transfer_direction: str = "",
         adjust_balance: bool = True,
         ctx: RequestContext = LOCAL_CONTEXT,
     ) -> Optional[Dict[str, Any]]:
         """Insert a transaction atomically and update account balance. Returns None if duplicate fingerprint."""
         now = utc_now_iso()
+        ext_id = (external_id or "").strip()
+        xfer_dir = (transfer_direction or "").strip().lower()
+        affects_bal = int(bool(adjust_balance))
         with self.transaction() as conn:
             if fingerprint:
                 existing = conn.execute(
@@ -1265,8 +1449,9 @@ class FinanceStorage:
                 """
                 INSERT INTO transactions (
                     account_id, jar_id, tx_type, amount_cents, merchant, normalized_merchant,
-                    subcategory, memo, tx_date, confidence, needs_review, source, fingerprint, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    subcategory, memo, tx_date, confidence, needs_review, source, fingerprint,
+                    external_id, affects_balance, transfer_direction, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     account_id,
@@ -1282,12 +1467,15 @@ class FinanceStorage:
                     int(needs_review),
                     source,
                     fingerprint,
+                    ext_id,
+                    affects_bal,
+                    xfer_dir,
                     now,
                 ),
             )
             if adjust_balance:
-                delta = int(amount_cents) if tx_type == "income" else -int(amount_cents)
-                if tx_type != "transfer":
+                delta = _tx_balance_effect(tx_type, int(amount_cents), xfer_dir)
+                if delta != 0:
                     conn.execute(
                         "UPDATE accounts SET balance_cents = balance_cents + ?, updated_at = ? WHERE id = ?",
                         (delta, now, account_id),
@@ -1303,10 +1491,79 @@ class FinanceStorage:
             ).fetchone()
             return dict(row)
 
-    def list_transactions(
+    def find_provider_transaction(
         self,
         *,
-        limit: int = 200,
+        external_id: str,
+        account_id: Optional[int] = None,
+        ctx: RequestContext = LOCAL_CONTEXT,
+    ) -> Optional[Dict[str, Any]]:
+        ext_id = (external_id or "").strip()
+        if not ext_id:
+            return None
+        with self._lock:
+            if account_id is not None:
+                fp = compute_tx_fingerprint(account_id, "", "", 0, "", "", ext_id)
+                row = self._conn.execute(
+                    "SELECT * FROM transactions WHERE (account_id = ? AND external_id = ?) OR fingerprint = ? LIMIT 1",
+                    (int(account_id), ext_id, fp),
+                ).fetchone()
+                if row:
+                    return dict(row)
+            row = self._conn.execute(
+                "SELECT * FROM transactions WHERE external_id = ? LIMIT 1",
+                (ext_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def delete_provider_transactions(
+        self,
+        *,
+        external_ids: Sequence[str],
+        account_ids: Optional[Sequence[int]] = None,
+        ctx: RequestContext = LOCAL_CONTEXT,
+    ) -> int:
+        clean_ids = [str(eid).strip() for eid in external_ids if str(eid).strip()]
+        if not clean_ids:
+            return 0
+        deleted = 0
+        with self.transaction() as conn:
+            for eid in clean_ids:
+                if account_ids:
+                    fps = [compute_tx_fingerprint(int(aid), "", "", 0, "", "", eid) for aid in account_ids]
+                    placeholders_aid = ",".join("?" for _ in account_ids)
+                    placeholders_fp = ",".join("?" for _ in fps)
+                    rows = conn.execute(
+                        f"SELECT id, account_id, tx_type, amount_cents, affects_balance, transfer_direction "
+                        f"FROM transactions WHERE (account_id IN ({placeholders_aid}) AND external_id = ?) "
+                        f"OR fingerprint IN ({placeholders_fp})",
+                        [*[int(a) for a in account_ids], eid, *fps],
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT id, account_id, tx_type, amount_cents, affects_balance, transfer_direction "
+                        "FROM transactions WHERE external_id = ?",
+                        (eid,),
+                    ).fetchall()
+                for row in rows:
+                    if int(row["affects_balance"] or 0) == 1:
+                        delta = -_tx_balance_effect(
+                            str(row["tx_type"]),
+                            int(row["amount_cents"]),
+                            str(row["transfer_direction"] or ""),
+                        )
+                        if delta != 0:
+                            conn.execute(
+                                "UPDATE accounts SET balance_cents = balance_cents + ?, updated_at = ? WHERE id = ?",
+                                (delta, utc_now_iso(), row["account_id"]),
+                            )
+                    conn.execute("DELETE FROM transactions WHERE id = ?", (row["id"],))
+                    deleted += 1
+        return deleted
+
+    def count_transactions(
+        self,
+        *,
         since_date: Optional[str] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
@@ -1314,12 +1571,8 @@ class FinanceStorage:
         jar_id: Optional[int] = None,
         needs_review_only: bool = False,
         search: Optional[str] = None,
-        include_splits: bool = False,
-        include_tags: bool = False,
         ctx: RequestContext = LOCAL_CONTEXT,
-    ) -> List[Dict[str, Any]]:
-        """Query transactions with 730-day range filtering (`limit <= 5000`, indexed by `(account_id, tx_date DESC)`)."""
-        bounded_limit = max(1, min(5000, int(limit)))
+    ) -> int:
         effective_start = start_date or since_date
         clauses = ["1=1"]
         params: List[Any] = []
@@ -1343,14 +1596,67 @@ class FinanceStorage:
             )
             q = f"%{search.strip().lower()}%"
             params.extend([q, q, q])
-        params.append(bounded_limit)
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT COUNT(*) FROM transactions t WHERE {' AND '.join(clauses)}",
+                params,
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def list_transactions(
+        self,
+        *,
+        limit: Optional[int] = 200,
+        offset: int = 0,
+        since_date: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        account_id: Optional[int] = None,
+        jar_id: Optional[int] = None,
+        needs_review_only: bool = False,
+        search: Optional[str] = None,
+        include_splits: bool = False,
+        include_tags: bool = False,
+        ctx: RequestContext = LOCAL_CONTEXT,
+    ) -> List[Dict[str, Any]]:
+        """Query transactions with 730-day+ range filtering and optional offset pagination."""
+        effective_start = start_date or since_date
+        clauses = ["1=1"]
+        params: List[Any] = []
+        if effective_start:
+            clauses.append("t.tx_date >= ?")
+            params.append(effective_start)
+        if end_date:
+            clauses.append("t.tx_date <= ?")
+            params.append(end_date)
+        if account_id is not None:
+            clauses.append("t.account_id = ?")
+            params.append(int(account_id))
+        if jar_id is not None:
+            clauses.append("t.jar_id = ?")
+            params.append(int(jar_id))
+        if needs_review_only:
+            clauses.append("t.needs_review = 1")
+        if search:
+            clauses.append(
+                "(LOWER(t.merchant) LIKE ? OR LOWER(t.memo) LIKE ? OR LOWER(t.subcategory) LIKE ?)"
+            )
+            q = f"%{search.strip().lower()}%"
+            params.extend([q, q, q])
+
+        limit_clause = ""
+        if limit is not None and int(limit) > 0:
+            bounded_limit = max(1, min(250_000, int(limit)))
+            limit_clause = "LIMIT ? OFFSET ?"
+            params.extend([bounded_limit, max(0, int(offset))])
+
         sql = f"""
             SELECT t.*, COALESCE(j.name, '') AS jar_name, COALESCE(j.icon, '') AS jar_icon
             FROM transactions t
             LEFT JOIN jars j ON t.jar_id = j.id
             WHERE {' AND '.join(clauses)}
             ORDER BY t.tx_date DESC, t.id DESC
-            LIMIT ?
+            {limit_clause}
         """
         with self._lock:
             rows = [dict(r) for r in self._conn.execute(sql, params).fetchall()]
@@ -1385,6 +1691,7 @@ class FinanceStorage:
         self, tx_id: int, updates: Dict[str, Any], ctx: RequestContext = LOCAL_CONTEXT
     ) -> Optional[Dict[str, Any]]:
         allowed = {
+            "account_id",
             "jar_id",
             "amount_cents",
             "tx_type",
@@ -1395,37 +1702,54 @@ class FinanceStorage:
             "memo",
             "needs_review",
             "confidence",
+            "fingerprint",
+            "transfer_direction",
         }
         filtered = {k: v for k, v in updates.items() if k in allowed}
         if not filtered:
             return self.get_transaction(tx_id, ctx=ctx)
         if "amount_cents" in filtered:
             filtered["amount_cents"] = int(filtered["amount_cents"])
+        if "account_id" in filtered and filtered["account_id"] is not None:
+            filtered["account_id"] = int(filtered["account_id"])
         with self.transaction() as conn:
             existing = conn.execute("SELECT * FROM transactions WHERE id = ?", (tx_id,)).fetchone()
             if not existing:
                 return None
 
-            def _signed(ttype: str, amt: int) -> int:
-                if ttype == "income":
-                    return amt
-                if ttype == "expense":
-                    return -amt
-                return 0
-
-            old_signed = _signed(str(existing["tx_type"]), int(existing["amount_cents"]))
+            affects_bal = int(existing["affects_balance"] if "affects_balance" in existing.keys() else 1)
+            old_acct_id = int(existing["account_id"])
+            new_acct_id = int(filtered.get("account_id") or old_acct_id)
+            old_dir = str(existing["transfer_direction"] or "") if "transfer_direction" in existing.keys() else ""
+            new_dir = str(filtered.get("transfer_direction", old_dir) or "")
+            old_signed = _tx_balance_effect(str(existing["tx_type"]), int(existing["amount_cents"]), old_dir)
             new_type = str(filtered.get("tx_type", existing["tx_type"]))
             new_amt = int(filtered.get("amount_cents", existing["amount_cents"]))
-            balance_delta = _signed(new_type, new_amt) - old_signed
+            new_signed = _tx_balance_effect(new_type, new_amt, new_dir)
 
             cols = ", ".join(f"{k} = ?" for k in filtered)
             vals = list(filtered.values()) + [tx_id]
             conn.execute(f"UPDATE transactions SET {cols} WHERE id = ?", vals)
-            if balance_delta != 0:
-                conn.execute(
-                    "UPDATE accounts SET balance_cents = balance_cents + ?, updated_at = ? WHERE id = ?",
-                    (balance_delta, utc_now_iso(), existing["account_id"]),
-                )
+            if affects_bal == 1:
+                now = utc_now_iso()
+                if new_acct_id != old_acct_id:
+                    if old_signed != 0:
+                        conn.execute(
+                            "UPDATE accounts SET balance_cents = balance_cents + ?, updated_at = ? WHERE id = ?",
+                            (-old_signed, now, old_acct_id),
+                        )
+                    if new_signed != 0:
+                        conn.execute(
+                            "UPDATE accounts SET balance_cents = balance_cents + ?, updated_at = ? WHERE id = ?",
+                            (new_signed, now, new_acct_id),
+                        )
+                else:
+                    balance_delta = new_signed - old_signed
+                    if balance_delta != 0:
+                        conn.execute(
+                            "UPDATE accounts SET balance_cents = balance_cents + ?, updated_at = ? WHERE id = ?",
+                            (balance_delta, now, old_acct_id),
+                        )
         return self.get_transaction(tx_id, ctx=ctx)
 
     def delete_transaction(self, tx_id: int, ctx: RequestContext = LOCAL_CONTEXT) -> bool:
@@ -1433,17 +1757,15 @@ class FinanceStorage:
             row = conn.execute("SELECT * FROM transactions WHERE id = ?", (tx_id,)).fetchone()
             if not row:
                 return False
-            if row["tx_type"] == "income":
-                delta = -int(row["amount_cents"])
-            elif row["tx_type"] == "expense":
-                delta = int(row["amount_cents"])
-            else:
-                delta = 0
-            if delta:
-                conn.execute(
-                    "UPDATE accounts SET balance_cents = balance_cents + ?, updated_at = ? WHERE id = ?",
-                    (delta, utc_now_iso(), row["account_id"]),
-                )
+            affects_bal = int(row["affects_balance"] if "affects_balance" in row.keys() else 1)
+            if affects_bal == 1:
+                old_dir = str(row["transfer_direction"] or "") if "transfer_direction" in row.keys() else ""
+                delta = -_tx_balance_effect(str(row["tx_type"]), int(row["amount_cents"]), old_dir)
+                if delta:
+                    conn.execute(
+                        "UPDATE accounts SET balance_cents = balance_cents + ?, updated_at = ? WHERE id = ?",
+                        (delta, utc_now_iso(), row["account_id"]),
+                    )
             conn.execute("DELETE FROM transactions WHERE id = ?", (tx_id,))
             return True
 
@@ -1836,7 +2158,8 @@ class FinanceStorage:
                     UPDATE bank_connections
                     SET institution = ?, env = ?, sync_cursor = ?, status = ?,
                         token_expires_at = ?, history_days_requested = ?,
-                        last_synced_at = ?, updated_at = ?
+                        backfill_status = ?, imported_start_date = ?, imported_end_date = ?,
+                        last_error = ?, last_synced_at = ?, updated_at = ?
                     WHERE id = ?
                     """,
                     (
@@ -1846,6 +2169,10 @@ class FinanceStorage:
                         data.get("status", existing["status"]),
                         data.get("token_expires_at", existing["token_expires_at"]),
                         int(data.get("history_days_requested", existing["history_days_requested"])),
+                        str(data.get("backfill_status", existing["backfill_status"] or "complete")),
+                        data.get("imported_start_date", existing["imported_start_date"]),
+                        data.get("imported_end_date", existing["imported_end_date"]),
+                        str(data.get("last_error", existing["last_error"] or "")),
                         data.get("last_synced_at", existing["last_synced_at"]),
                         now,
                         existing["id"],
@@ -1860,8 +2187,10 @@ class FinanceStorage:
                 """
                 INSERT INTO bank_connections (
                     provider, item_id, institution, env, sync_cursor, status,
-                    token_expires_at, history_days_requested, last_synced_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    token_expires_at, history_days_requested,
+                    backfill_status, imported_start_date, imported_end_date, last_error,
+                    last_synced_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     data["provider"],
@@ -1872,6 +2201,10 @@ class FinanceStorage:
                     str(data.get("status", "active")),
                     data.get("token_expires_at"),
                     int(data.get("history_days_requested", 730)),
+                    str(data.get("backfill_status", "complete")),
+                    data.get("imported_start_date"),
+                    data.get("imported_end_date"),
+                    str(data.get("last_error", "")),
                     data.get("last_synced_at"),
                     now,
                     now,
@@ -2289,29 +2622,32 @@ class FinanceStorage:
         thread_id: Optional[str] = None,
         ctx: RequestContext = LOCAL_CONTEXT,
     ) -> None:
-        with self.transaction() as conn:
-            conn.execute(
-                """
-                INSERT INTO ai_usage_log (
-                    usage_date, provider, model, cached, input_tokens, output_tokens,
-                    cached_tokens, cost_microdollars, saved_microdollars, latency_ms, thread_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    date.today().isoformat(),
-                    provider,
-                    model,
-                    int(bool(cached)),
-                    int(input_tokens),
-                    int(output_tokens),
-                    int(cached_tokens),
-                    int(cost_microdollars),
-                    int(saved_microdollars),
-                    int(latency_ms),
-                    thread_id,
-                    utc_now_iso(),
-                ),
-            )
+        with self._lock:
+            if self._closed:
+                return
+            with self.transaction() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO ai_usage_log (
+                        usage_date, provider, model, cached, input_tokens, output_tokens,
+                        cached_tokens, cost_microdollars, saved_microdollars, latency_ms, thread_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        date.today().isoformat(),
+                        provider,
+                        model,
+                        int(bool(cached)),
+                        int(input_tokens),
+                        int(output_tokens),
+                        int(cached_tokens),
+                        int(cost_microdollars),
+                        int(saved_microdollars),
+                        int(latency_ms),
+                        thread_id,
+                        utc_now_iso(),
+                    ),
+                )
 
     def get_ai_usage_summary(
         self, days: int = 30, ctx: RequestContext = LOCAL_CONTEXT
@@ -2548,11 +2884,20 @@ class FinanceStorage:
     # --- Credit Lines, Reports, Inquiries & Derogatories ---
 
     def list_credit_lines(
-        self, active_only: bool = True, ctx: RequestContext = LOCAL_CONTEXT
+        self,
+        active_only: bool = True,
+        *,
+        include_sandbox: bool = False,
+        ctx: RequestContext = LOCAL_CONTEXT,
     ) -> List[Dict[str, Any]]:
-        sql = "SELECT * FROM credit_lines"
+        clauses = []
         if active_only:
-            sql += " WHERE active = 1"
+            clauses.append("active = 1")
+        if not include_sandbox:
+            clauses.append("COALESCE(source_env, 'production') != 'sandbox'")
+        sql = "SELECT * FROM credit_lines"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY CASE WHEN kind = 'credit_card' THEN 0 ELSE 1 END, apr_bps DESC, id ASC"
         with self._lock:
             return [dict(r) for r in self._conn.execute(sql).fetchall()]
@@ -2575,8 +2920,9 @@ class FinanceStorage:
                     name, issuer, kind, balance_cents, credit_limit_cents, apr_bps,
                     min_payment_cents, statement_closing_day, payment_due_day,
                     promo_apr_bps, promo_ends_date, opened_date, has_grace_period,
-                    autopay_mode, rewards_note, account_id, is_authorized_user, active, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    autopay_mode, rewards_note, account_id, is_authorized_user,
+                    source_env, external_account_id, active, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     data["name"],
@@ -2584,7 +2930,7 @@ class FinanceStorage:
                     data.get("kind", "credit_card"),
                     int(data.get("balance_cents", 0)),
                     int(data.get("credit_limit_cents", 0)),
-                    int(data.get("apr_bps", 2499)),
+                    int(data.get("apr_bps", 0)),
                     int(data.get("min_payment_cents", 0)),
                     int(data.get("statement_closing_day", 15)),
                     int(data.get("payment_due_day", 10)),
@@ -2596,6 +2942,8 @@ class FinanceStorage:
                     data.get("rewards_note", ""),
                     data.get("account_id"),
                     int(bool(data.get("is_authorized_user", False))),
+                    str(data.get("source_env") or "production"),
+                    str(data.get("external_account_id") or ""),
                     now,
                     now,
                 ),
@@ -2622,6 +2970,8 @@ class FinanceStorage:
             "autopay_mode",
             "rewards_note",
             "is_authorized_user",
+            "source_env",
+            "external_account_id",
             "active",
         }
         filtered = {k: v for k, v in updates.items() if k in allowed}
@@ -2645,12 +2995,18 @@ class FinanceStorage:
             cur = conn.execute("DELETE FROM credit_lines WHERE id = ?", (line_id,))
             return cur.rowcount > 0
 
-    def list_credit_reports(self, ctx: RequestContext = LOCAL_CONTEXT) -> List[Dict[str, Any]]:
+    def list_credit_reports(
+        self,
+        *,
+        include_sandbox: bool = False,
+        ctx: RequestContext = LOCAL_CONTEXT,
+    ) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM credit_reports"
+        if not include_sandbox:
+            sql += " WHERE COALESCE(is_sandbox, 0) = 0"
+        sql += " ORDER BY pulled_date DESC, id DESC"
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM credit_reports ORDER BY pulled_date DESC, id DESC"
-            ).fetchall()
-            return [dict(r) for r in rows]
+            return [dict(r) for r in self._conn.execute(sql).fetchall()]
 
     def create_credit_report(
         self, data: Dict[str, Any], ctx: RequestContext = LOCAL_CONTEXT
@@ -2659,8 +3015,8 @@ class FinanceStorage:
         with self.transaction() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO credit_reports (bureau, model, score, pulled_date, source, notes, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO credit_reports (bureau, model, score, pulled_date, source, notes, is_sandbox, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(data["bureau"]),
@@ -2669,6 +3025,7 @@ class FinanceStorage:
                     str(data.get("pulled_date") or date.today().isoformat()),
                     str(data.get("source", "manual")),
                     str(data.get("notes", "")),
+                    int(bool(data.get("is_sandbox", False))),
                     now,
                 ),
             )
@@ -2684,12 +3041,18 @@ class FinanceStorage:
             cur = conn.execute("DELETE FROM credit_reports WHERE id = ?", (report_id,))
             return cur.rowcount > 0
 
-    def list_credit_inquiries(self, ctx: RequestContext = LOCAL_CONTEXT) -> List[Dict[str, Any]]:
+    def list_credit_inquiries(
+        self,
+        *,
+        include_sandbox: bool = False,
+        ctx: RequestContext = LOCAL_CONTEXT,
+    ) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM credit_inquiries"
+        if not include_sandbox:
+            sql += " WHERE COALESCE(is_sandbox, 0) = 0"
+        sql += " ORDER BY inquiry_date DESC, id DESC"
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM credit_inquiries ORDER BY inquiry_date DESC, id DESC"
-            ).fetchall()
-            return [dict(r) for r in rows]
+            return [dict(r) for r in self._conn.execute(sql).fetchall()]
 
     def create_credit_inquiry(
         self, data: Dict[str, Any], ctx: RequestContext = LOCAL_CONTEXT
@@ -2701,8 +3064,8 @@ class FinanceStorage:
         with self.transaction() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO credit_inquiries (lender, bureau, inquiry_date, counts_until, drops_off, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO credit_inquiries (lender, bureau, inquiry_date, counts_until, drops_off, is_sandbox, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(data["lender"]),
@@ -2710,6 +3073,7 @@ class FinanceStorage:
                     inq_date,
                     counts_until,
                     drops_off,
+                    int(bool(data.get("is_sandbox", False))),
                     now,
                 ),
             )
@@ -2726,11 +3090,20 @@ class FinanceStorage:
             return cur.rowcount > 0
 
     def list_credit_derogatories(
-        self, active_only: bool = False, ctx: RequestContext = LOCAL_CONTEXT
+        self,
+        active_only: bool = False,
+        *,
+        include_sandbox: bool = False,
+        ctx: RequestContext = LOCAL_CONTEXT,
     ) -> List[Dict[str, Any]]:
-        sql = "SELECT * FROM credit_derogatories"
+        clauses = []
         if active_only:
-            sql += " WHERE active = 1"
+            clauses.append("active = 1")
+        if not include_sandbox:
+            clauses.append("COALESCE(is_sandbox, 0) = 0")
+        sql = "SELECT * FROM credit_derogatories"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY drops_off ASC, id DESC"
         with self._lock:
             return [dict(r) for r in self._conn.execute(sql).fetchall()]
@@ -2745,8 +3118,8 @@ class FinanceStorage:
         with self.transaction() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO credit_derogatories (kind, lender, opened_date, drops_off, active, notes, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO credit_derogatories (kind, lender, opened_date, drops_off, active, notes, is_sandbox, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     kind,
@@ -2755,6 +3128,7 @@ class FinanceStorage:
                     drops_off,
                     int(bool(data.get("active", True))),
                     str(data.get("notes", "")),
+                    int(bool(data.get("is_sandbox", False))),
                     now,
                 ),
             )
@@ -2796,10 +3170,19 @@ class FinanceStorage:
         qty_e8 = int(data.get("quantity_e8", 0))
         price_e8 = int(data.get("price_e8", 0))
         market_val = compute_holding_value_cents(qty_e8, price_e8)
-        cost_basis = int(data.get("cost_basis_cents", 0))
+        raw_cb = data.get("cost_basis_cents")
+        cb_known_in = data.get("cost_basis_known")
+        if cb_known_in is not None:
+            cb_known = bool(cb_known_in)
+        elif raw_cb is None:
+            cb_known = False
+        else:
+            cb_known = int(raw_cb) > 0 or str(data.get("asset_class", "")).lower() == "cash"
+        cost_basis = int(raw_cb or 0)
         holding_id = data.get("id")
         conn_id = data.get("connection_id")
         acct_id = data.get("account_id")
+        ext_acct_id = str(data.get("external_account_id") or "").strip()
 
         with self.transaction() as conn:
             existing = None
@@ -2808,20 +3191,43 @@ class FinanceStorage:
                     "SELECT * FROM holdings WHERE id = ?", (int(holding_id),)
                 ).fetchone()
             elif conn_id is not None:
-                existing = conn.execute(
-                    "SELECT * FROM holdings WHERE connection_id = ? AND symbol = ?",
-                    (int(conn_id), symbol),
-                ).fetchone()
+                if ext_acct_id:
+                    existing = conn.execute(
+                        """
+                        SELECT * FROM holdings
+                        WHERE connection_id = ?
+                          AND COALESCE(external_account_id, '') = ?
+                          AND symbol = ?
+                        """,
+                        (int(conn_id), ext_acct_id, symbol),
+                    ).fetchone()
+                else:
+                    existing = conn.execute(
+                        """
+                        SELECT * FROM holdings
+                        WHERE connection_id = ?
+                          AND COALESCE(external_account_id, '') = ''
+                          AND COALESCE(account_id, -1) = COALESCE(?, -1)
+                          AND symbol = ?
+                        """,
+                        (int(conn_id), acct_id, symbol),
+                    ).fetchone()
 
             if existing:
+                # Preserve existing known cost basis if a quote refresh / broker sync didn't supply one
+                if cb_known_in is None and raw_cb is None:
+                    cost_basis = int(existing["cost_basis_cents"] or 0)
+                    cb_known = bool(existing["cost_basis_known"] if "cost_basis_known" in existing.keys() else (cost_basis > 0))
                 conn.execute(
                     """
                     UPDATE holdings
                     SET account_id = COALESCE(?, account_id),
+                        external_account_id = CASE WHEN ? != '' THEN ? ELSE external_account_id END,
                         name = COALESCE(NULLIF(?, ''), name),
                         asset_class = ?,
                         quantity_e8 = ?,
                         cost_basis_cents = ?,
+                        cost_basis_known = ?,
                         price_e8 = ?,
                         market_value_cents = ?,
                         source = ?,
@@ -2830,10 +3236,13 @@ class FinanceStorage:
                     """,
                     (
                         acct_id,
+                        ext_acct_id,
+                        ext_acct_id,
                         str(data.get("name", "")),
                         str(data.get("asset_class", existing["asset_class"])),
                         qty_e8,
                         cost_basis,
+                        int(cb_known),
                         price_e8,
                         market_val,
                         str(data.get("source", existing["source"])),
@@ -2846,29 +3255,52 @@ class FinanceStorage:
                 ).fetchone()
                 return dict(row)
 
+            created_ts = str(data.get("created_at") or now)
             cur = conn.execute(
                 """
                 INSERT INTO holdings (
-                    account_id, connection_id, symbol, name, asset_class,
-                    quantity_e8, cost_basis_cents, price_e8, market_value_cents, source, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    account_id, connection_id, external_account_id, symbol, name, asset_class,
+                    quantity_e8, cost_basis_cents, cost_basis_known, price_e8, market_value_cents,
+                    source, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     acct_id,
                     conn_id,
+                    ext_acct_id,
                     symbol,
                     str(data.get("name", "")),
                     str(data.get("asset_class", "equity")),
                     qty_e8,
                     cost_basis,
+                    int(cb_known),
                     price_e8,
                     market_val,
                     str(data.get("source", "manual")),
+                    created_ts,
                     now,
                 ),
             )
             row = conn.execute("SELECT * FROM holdings WHERE id = ?", (cur.lastrowid,)).fetchone()
             return dict(row)
+
+    def prune_connection_holdings(
+        self,
+        connection_id: int,
+        keep_ids: Sequence[int],
+        ctx: RequestContext = LOCAL_CONTEXT,
+    ) -> int:
+        """Delete stale holdings for `connection_id` that were no longer returned by the broker."""
+        with self.transaction() as conn:
+            if not keep_ids:
+                cur = conn.execute("DELETE FROM holdings WHERE connection_id = ?", (int(connection_id),))
+                return int(cur.rowcount)
+            placeholders = ",".join("?" for _ in keep_ids)
+            cur = conn.execute(
+                f"DELETE FROM holdings WHERE connection_id = ? AND id NOT IN ({placeholders})",
+                [int(connection_id), *[int(i) for i in keep_ids]],
+            )
+            return int(cur.rowcount)
 
     def delete_holding(self, holding_id: int, ctx: RequestContext = LOCAL_CONTEXT) -> bool:
         with self.transaction() as conn:
@@ -3096,7 +3528,54 @@ class FinanceStorage:
                 "dopamine_xp=0, recent_wins_json='[]', updated_at=? WHERE id=1",
                 (utc_now_iso(),),
             )
-            conn.execute("UPDATE jars SET rollover_cents=0, updated_at=?", (utc_now_iso(),))
+            conn.execute("UPDATE jars SET auto_allocated_cents=0, rollover_cents=0, updated_at=?", (utc_now_iso(),))
+            conn.execute(
+                "UPDATE profile_settings SET expected_paycheck_cents=0, income_configured=0, "
+                "payday_user_configured=0, last_rollover_ym='', updated_at=? WHERE id=1",
+                (utc_now_iso(),),
+            )
+
+    def preview_backup(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate a ChronoX backup payload without mutating ledger data and return a summary."""
+        if not isinstance(payload, dict) or payload.get("schema_version") not in (1, 2):
+            raise ValueError("Unsupported or invalid ChronoX Finance backup format")
+        if not payload.get("jars"):
+            raise ValueError("Backup is missing required budget jars")
+        if isinstance(payload.get("settings"), dict):
+            for url_key in ("opencode_base_url", "gemini_base_url", "codex_base_url", "wrapper_base_url"):
+                if payload["settings"].get(url_key):
+                    validate_external_api_url(str(payload["settings"][url_key]))
+        txs = payload.get("transactions") or []
+        if not isinstance(txs, list):
+            raise ValueError("Invalid transactions array in backup")
+        for tx in txs:
+            if not isinstance(tx, dict) or "account_id" not in tx or "tx_type" not in tx or "amount_cents" not in tx or "tx_date" not in tx:
+                raise ValueError("Backup contains malformed transaction records")
+        accts = payload.get("accounts") or []
+        goals_list = payload.get("goals") or payload.get("savings_goals") or []
+        dates = [str(t.get("tx_date", "")) for t in txs if t.get("tx_date")]
+        date_window = {
+            "start": min(dates) if dates else None,
+            "end": max(dates) if dates else None,
+        }
+        return {
+            "valid": True,
+            "schema_version": int(payload["schema_version"]),
+            "exported_at": str(payload.get("exported_at") or ""),
+            "counts": {
+                "accounts": len(accts),
+                "jars": len(payload.get("jars") or []),
+                "transactions": len(txs),
+                "recurring_bills": len(payload.get("recurring_bills") or []),
+                "goals": len(goals_list),
+                "savings_goals": len(goals_list),
+                "credit_lines": len(payload.get("credit_lines") or []),
+                "holdings": len(payload.get("holdings") or []),
+                "automation_rules": len(payload.get("automation_rules") or []),
+            },
+            "date_range": date_window,
+            "tx_date_range": date_window,
+        }
 
     def export_backup(self, ctx: RequestContext = LOCAL_CONTEXT) -> Dict[str, Any]:
         """
@@ -3141,10 +3620,10 @@ class FinanceStorage:
                 "budget_transfers": [
                     dict(r) for r in self._conn.execute("SELECT * FROM budget_transfers ORDER BY id ASC").fetchall()
                 ],
-                "credit_lines": self.list_credit_lines(active_only=False, ctx=ctx),
-                "credit_reports": self.list_credit_reports(ctx=ctx),
-                "credit_inquiries": self.list_credit_inquiries(ctx=ctx),
-                "credit_derogatories": self.list_credit_derogatories(active_only=False, ctx=ctx),
+                "credit_lines": self.list_credit_lines(active_only=False, include_sandbox=False, ctx=ctx),
+                "credit_reports": self.list_credit_reports(include_sandbox=False, ctx=ctx),
+                "credit_inquiries": self.list_credit_inquiries(include_sandbox=False, ctx=ctx),
+                "credit_derogatories": self.list_credit_derogatories(active_only=False, include_sandbox=False, ctx=ctx),
                 "holdings": self.list_holdings(ctx=ctx),
                 "portfolio_snapshots": self.list_portfolio_snapshots(ctx=ctx),
                 "net_worth_snapshots": self.list_net_worth_snapshots(ctx=ctx),
@@ -3157,14 +3636,7 @@ class FinanceStorage:
         self, payload: Dict[str, Any], ctx: RequestContext = LOCAL_CONTEXT
     ) -> None:
         """Restore a sanitized JSON backup (v1 or v2) atomically."""
-        if not isinstance(payload, dict) or payload.get("schema_version") not in (1, 2):
-            raise ValueError("Unsupported or invalid ChronoX Finance backup format")
-        if not payload.get("jars"):
-            raise ValueError("Backup is missing required budget jars")
-        if isinstance(payload.get("settings"), dict):
-            for url_key in ("opencode_base_url", "gemini_base_url", "codex_base_url", "wrapper_base_url"):
-                if payload["settings"].get(url_key):
-                    validate_external_api_url(str(payload["settings"][url_key]))
+        self.preview_backup(payload)
 
         now = utc_now_iso()
         with self.transaction(immediate=True) as conn:
@@ -3228,8 +3700,12 @@ class FinanceStorage:
             for acct in payload.get("accounts", []):
                 conn.execute(
                     """
-                    INSERT INTO accounts (id, name, account_type, balance_cents, institution, is_liquid, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO accounts (
+                        id, name, account_type, balance_cents, institution, is_liquid,
+                        connection_id, external_id, mask, currency, available_cents, credit_limit_cents,
+                        created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         acct["id"],
@@ -3238,6 +3714,11 @@ class FinanceStorage:
                         acct["balance_cents"],
                         acct.get("institution", ""),
                         acct.get("is_liquid", 1),
+                        acct.get("external_id", ""),
+                        acct.get("mask", ""),
+                        acct.get("currency", "USD"),
+                        acct.get("available_cents"),
+                        acct.get("credit_limit_cents"),
                         acct.get("created_at", now),
                         acct.get("updated_at", now),
                     ),
@@ -3258,7 +3739,10 @@ class FinanceStorage:
                     ),
                 )
 
-            for g in payload.get("goals", []):
+            from chronox_finance.engines.categorizer import normalize_merchant
+
+            raw_goals = payload.get("goals") or payload.get("savings_goals") or []
+            for idx_g, g in enumerate(raw_goals, start=1):
                 conn.execute(
                     """
                     INSERT INTO goals (
@@ -3267,13 +3751,13 @@ class FinanceStorage:
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        g["id"],
+                        g.get("id", idx_g),
                         g["name"],
                         g["target_cents"],
                         g.get("saved_cents", 0),
                         g.get("target_date"),
                         g.get("priority", 2),
-                        g.get("priority_order", 0),
+                        g.get("priority_order", idx_g - 1),
                         g.get("category", "gadget"),
                         g.get("funding_jar_slug", "fun"),
                         g.get("status", "active"),
@@ -3284,22 +3768,25 @@ class FinanceStorage:
                     ),
                 )
 
-            for tx in payload.get("transactions", []):
+            for idx_tx, tx in enumerate(payload.get("transactions", []), start=1):
+                merch = str(tx.get("merchant", ""))
+                norm_merch = str(tx.get("normalized_merchant") or normalize_merchant(merch))
                 conn.execute(
                     """
                     INSERT INTO transactions (
                         id, account_id, jar_id, tx_type, amount_cents, merchant, normalized_merchant,
-                        subcategory, memo, tx_date, confidence, needs_review, source, fingerprint, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        subcategory, memo, tx_date, confidence, needs_review, source, fingerprint,
+                        external_id, affects_balance, transfer_direction, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        tx["id"],
+                        tx.get("id", idx_tx),
                         tx["account_id"],
                         tx.get("jar_id"),
                         tx["tx_type"],
                         tx["amount_cents"],
-                        tx["merchant"],
-                        tx["normalized_merchant"],
+                        merch,
+                        norm_merch,
                         tx.get("subcategory", ""),
                         tx.get("memo", ""),
                         tx["tx_date"],
@@ -3307,6 +3794,9 @@ class FinanceStorage:
                         tx.get("needs_review", 0),
                         tx.get("source", "backup"),
                         tx.get("fingerprint"),
+                        tx.get("external_id", ""),
+                        tx.get("affects_balance", 1),
+                        tx.get("transfer_direction", ""),
                         tx.get("created_at", now),
                     ),
                 )
@@ -3460,8 +3950,9 @@ class FinanceStorage:
                         id, name, issuer, kind, balance_cents, credit_limit_cents, apr_bps,
                         min_payment_cents, statement_closing_day, payment_due_day,
                         promo_apr_bps, promo_ends_date, opened_date, has_grace_period,
-                        autopay_mode, rewards_note, account_id, is_authorized_user, active, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        autopay_mode, rewards_note, account_id, is_authorized_user,
+                        source_env, external_account_id, active, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         cl["id"],
@@ -3470,7 +3961,7 @@ class FinanceStorage:
                         cl.get("kind", "credit_card"),
                         cl["balance_cents"],
                         cl.get("credit_limit_cents", 0),
-                        cl.get("apr_bps", 2499),
+                        cl.get("apr_bps", 0),
                         cl.get("min_payment_cents", 0),
                         cl.get("statement_closing_day", 15),
                         cl.get("payment_due_day", 10),
@@ -3482,6 +3973,8 @@ class FinanceStorage:
                         cl.get("rewards_note", ""),
                         cl.get("account_id"),
                         cl.get("is_authorized_user", 0),
+                        str(cl.get("source_env") or "production"),
+                        str(cl.get("external_account_id") or ""),
                         cl.get("active", 1),
                         cl.get("created_at", now),
                         cl.get("updated_at", now),
@@ -3506,35 +3999,38 @@ class FinanceStorage:
                     ),
                 )
 
-            for ci in payload.get("credit_inquiries", []):
+            for idx_ci, ci in enumerate(payload.get("credit_inquiries", []), start=1):
+                inq_date = str(ci["inquiry_date"])
                 conn.execute(
                     """
                     INSERT INTO credit_inquiries (id, lender, bureau, inquiry_date, counts_until, drops_off, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        ci["id"],
+                        ci.get("id", idx_ci),
                         ci["lender"],
                         ci.get("bureau", "experian"),
-                        ci["inquiry_date"],
-                        ci["counts_until"],
-                        ci["drops_off"],
+                        inq_date,
+                        ci.get("counts_until") or _add_months_iso(inq_date, 12),
+                        ci.get("drops_off") or _add_months_iso(inq_date, 24),
                         ci.get("created_at", now),
                     ),
                 )
 
-            for cd in payload.get("credit_derogatories", []):
+            for idx_cd, cd in enumerate(payload.get("credit_derogatories", []), start=1):
+                cd_kind = str(cd["kind"])
+                cd_opened = str(cd["opened_date"])
                 conn.execute(
                     """
                     INSERT INTO credit_derogatories (id, kind, lender, opened_date, drops_off, active, notes, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        cd["id"],
-                        cd["kind"],
+                        cd.get("id", idx_cd),
+                        cd_kind,
                         cd.get("lender", ""),
-                        cd["opened_date"],
-                        cd["drops_off"],
+                        cd_opened,
+                        cd.get("drops_off") or compute_derogatory_drop_off(cd_kind, cd_opened),
                         cd.get("active", 1),
                         cd.get("notes", ""),
                         cd.get("created_at", now),
@@ -3544,24 +4040,30 @@ class FinanceStorage:
             for h in payload.get("holdings", []):
                 qty_e8 = int(h["quantity_e8"])
                 price_e8 = int(h["price_e8"])
+                cb_val = int(h.get("cost_basis_cents", 0) or 0)
+                cb_known = int(bool(h.get("cost_basis_known", cb_val > 0)))
                 conn.execute(
                     """
                     INSERT INTO holdings (
-                        id, account_id, connection_id, symbol, name, asset_class,
-                        quantity_e8, cost_basis_cents, price_e8, market_value_cents, source, updated_at
-                    ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        id, account_id, connection_id, external_account_id, symbol, name, asset_class,
+                        quantity_e8, cost_basis_cents, cost_basis_known, price_e8, market_value_cents,
+                        source, created_at, updated_at
+                    ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         h["id"],
                         h.get("account_id"),
+                        h.get("external_account_id", ""),
                         h["symbol"],
                         h.get("name", ""),
                         h.get("asset_class", "equity"),
                         qty_e8,
-                        h.get("cost_basis_cents", 0),
+                        cb_val,
+                        cb_known,
                         price_e8,
                         compute_holding_value_cents(qty_e8, price_e8),
                         h.get("source", "backup"),
+                        h.get("created_at") or h.get("updated_at", now),
                         h.get("updated_at", now),
                     ),
                 )

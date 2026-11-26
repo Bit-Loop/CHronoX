@@ -109,6 +109,8 @@ class ImportedRow:
     tx_type: str  # "expense", "income", or "transfer"
     memo: str = ""
     external_id: str = ""
+    transfer_direction: str = ""  # "out" | "in" | ""
+    account_hint: str = ""        # Optional section/account name or external account_id
 
 
 @dataclass
@@ -120,6 +122,9 @@ class IngestionResult:
     transfers_detected: int = 0
     detected_institution: str = "generic"  # "generic", "navy_federal", "plaid"
     pending_skipped: int = 0
+    detected_account_hint: str = ""
+    detected_account_type: str = ""  # "checking", "savings", "credit", or ""
+    parse_failed: bool = False
 
 
 def _parse_date(raw: str) -> Optional[str]:
@@ -367,9 +372,17 @@ def _parse_bank_csv_detailed(
 
         memo = (raw_row.get(memo_col) or "").strip() if (memo_col and memo_col != desc_col) else ""
         ext_id = (raw_row.get(id_col) or "").strip() if id_col else ""
+        acct_col_val = ""
+        for cand_acct_col in ("account", "account name", "account_name", "account_id", "account number"):
+            if cand_acct_col in headers_lower:
+                acct_col_val = (raw_row.get(headers_lower[cand_acct_col]) or "").strip()
+                if acct_col_val:
+                    break
         final_type = _classify_transfer(merchant, memo, tx_type, detect_transfers)
+        xfer_dir = ""
         if final_type == "transfer":
             transfers += 1
+            xfer_dir = "in" if tx_type == "income" else "out"
 
         rows.append(
             ImportedRow(
@@ -379,6 +392,8 @@ def _parse_bank_csv_detailed(
                 tx_type=final_type,
                 memo=memo[:240],
                 external_id=ext_id[:80],
+                transfer_direction=xfer_dir,
+                account_hint=acct_col_val[:80],
             )
         )
 
@@ -392,6 +407,17 @@ def _parse_bank_csv_detailed(
     if pending_skipped > 0:
         warnings.append(f"Skipped {pending_skipped} pending authorization(s) to prevent settlement duplicates.")
 
+    preamble_text = "\n".join(lines[: max(1, header_idx)]).lower()
+    detected_acct_type = ""
+    detected_acct_hint = ""
+    if "savings" in preamble_text or "hysa" in preamble_text:
+        detected_acct_type = "savings"
+        detected_acct_hint = "Share Savings" if detected_inst == "navy_federal" else "Savings"
+    elif "credit card" in preamble_text or "cashrewards" in preamble_text:
+        detected_acct_type = "credit"
+    elif "checking" in preamble_text:
+        detected_acct_type = "checking"
+
     return IngestionResult(
         format_detected="csv",
         rows=rows,
@@ -400,6 +426,9 @@ def _parse_bank_csv_detailed(
         transfers_detected=transfers,
         detected_institution=detected_inst,
         pending_skipped=pending_skipped,
+        detected_account_hint=detected_acct_hint,
+        detected_account_type=detected_acct_type,
+        parse_failed=(len(rows) == 0 and pending_skipped == 0),
     )
 
 
@@ -452,8 +481,10 @@ def parse_ofx_statement(text: str, detect_transfers: bool = True) -> IngestionRe
             final_type = "transfer" if detect_transfers else base_type
         else:
             final_type = _classify_transfer(name, memo, base_type, detect_transfers)
+        xfer_dir = ""
         if final_type == "transfer":
             transfers += 1
+            xfer_dir = "in" if base_type == "income" else "out"
 
         rows.append(
             ImportedRow(
@@ -463,11 +494,22 @@ def parse_ofx_statement(text: str, detect_transfers: bool = True) -> IngestionRe
                 tx_type=final_type,
                 memo=(memo if memo != name else "")[:240],
                 external_id=fitid[:80],
+                transfer_direction=xfer_dir,
             )
         )
 
     bal_block = re.search(r"<LEDGERBAL>([\s\S]*?)(?:</LEDGERBAL>|(?=<AVAILBAL>)|(?=</STMTRS>)|(?=</CCSTMTRS>))", text, re.IGNORECASE)
     detected_bal = _parse_money_to_cents(_extract_ofx_tag(bal_block.group(1), "BALAMT")) if bal_block else None
+    ofx_acct_type_raw = _extract_ofx_tag(text, "ACCTTYPE").upper()
+    ofx_acct_id = _extract_ofx_tag(text, "ACCTID")
+    if "<CCSTMTRS>" in text.upper() or ofx_acct_type_raw == "CREDITLINE":
+        ofx_acct_type = "credit"
+    elif "SAV" in ofx_acct_type_raw:
+        ofx_acct_type = "savings"
+    elif "CHECK" in ofx_acct_type_raw:
+        ofx_acct_type = "checking"
+    else:
+        ofx_acct_type = ""
 
     return IngestionResult(
         format_detected="ofx",
@@ -475,6 +517,9 @@ def parse_ofx_statement(text: str, detect_transfers: bool = True) -> IngestionRe
         warnings=warnings,
         detected_balance_cents=detected_bal,
         transfers_detected=transfers,
+        detected_account_hint=ofx_acct_id[:80],
+        detected_account_type=ofx_acct_type,
+        parse_failed=(len(rows) == 0),
     )
 
 
@@ -484,10 +529,20 @@ def parse_qif_statement(text: str, detect_transfers: bool = True) -> IngestionRe
     warnings: List[str] = []
     transfers = 0
     rec: Dict[str, str] = {}
+    qif_acct_type = ""
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("!"):
+        if not line:
+            continue
+        if line.startswith("!"):
+            low_hdr = line.lower()
+            if "ccard" in low_hdr:
+                qif_acct_type = "credit"
+            elif "oth a" in low_hdr or "sav" in low_hdr:
+                qif_acct_type = "savings"
+            elif "bank" in low_hdr:
+                qif_acct_type = "checking"
             continue
         if line == "^":
             dt_str = _parse_date(rec.get("D", ""))
@@ -497,8 +552,10 @@ def parse_qif_statement(text: str, detect_transfers: bool = True) -> IngestionRe
             if dt_str and amt is not None and amt != 0 and payee:
                 base_type = "income" if amt > 0 else "expense"
                 final_type = _classify_transfer(payee, memo, base_type, detect_transfers)
+                xfer_dir = ""
                 if final_type == "transfer":
                     transfers += 1
+                    xfer_dir = "in" if base_type == "income" else "out"
                 rows.append(
                     ImportedRow(
                         tx_date=dt_str,
@@ -506,6 +563,7 @@ def parse_qif_statement(text: str, detect_transfers: bool = True) -> IngestionRe
                         amount_cents=abs(amt),
                         tx_type=final_type,
                         memo=(memo if memo != payee else "")[:240],
+                        transfer_direction=xfer_dir,
                     )
                 )
             elif rec:
@@ -515,7 +573,14 @@ def parse_qif_statement(text: str, detect_transfers: bool = True) -> IngestionRe
         code, val = line[0].upper(), line[1:].strip()
         rec[code] = val
 
-    return IngestionResult(format_detected="qif", rows=rows, warnings=warnings, transfers_detected=transfers)
+    return IngestionResult(
+        format_detected="qif",
+        rows=rows,
+        warnings=warnings,
+        transfers_detected=transfers,
+        detected_account_type=qif_acct_type,
+        parse_failed=(len(rows) == 0),
+    )
 
 
 _PLAID_ITEM_KEYS = {
@@ -582,20 +647,36 @@ def parse_json_statement(
     else:
         detected_inst = "generic"
 
-    # Extract current/available balance from official Plaid `accounts` array when present
+    # Extract current/available balance & account metadata from official Plaid `accounts` array when present
     detected_balance_cents: Optional[int] = None
+    json_acct_names: Dict[str, str] = {}
+    detected_acct_type = ""
     if isinstance(data, dict) and isinstance(data.get("accounts"), list):
         for acct in data["accounts"]:
             if not isinstance(acct, dict):
                 continue
+            aid = str(acct.get("account_id") or acct.get("id") or "").strip()
+            aname = str(acct.get("name") or "").strip()
+            asub = str(acct.get("subtype") or acct.get("type") or "").strip().lower()
+            if aid and aname:
+                json_acct_names[aid] = aname
+            if not detected_acct_type:
+                if "sav" in asub:
+                    detected_acct_type = "savings"
+                elif "credit" in asub:
+                    detected_acct_type = "credit"
+                elif "check" in asub:
+                    detected_acct_type = "checking"
             bals = acct.get("balances")
-            if isinstance(bals, dict):
+            if isinstance(bals, dict) and detected_balance_cents is None:
                 raw_bal = bals.get("current") if bals.get("current") is not None else bals.get("available")
                 if raw_bal is not None:
                     bal_c = _parse_money_to_cents(str(raw_bal))
                     if bal_c is not None:
+                        is_credit_or_loan = ("credit" in asub or "loan" in asub or str(acct.get("type") or "").strip().lower() in ("credit", "loan"))
+                        if is_plaid_api and is_credit_or_loan and bal_c > 0:
+                            bal_c = -bal_c
                         detected_balance_cents = bal_c
-                        break
 
     rows: List[ImportedRow] = []
     warnings: List[str] = []
@@ -652,8 +733,18 @@ def parse_json_statement(
         else:
             final_type = _classify_transfer(merchant, memo, base_type, detect_transfers)
 
+        xfer_dir = ""
         if final_type == "transfer":
             transfers += 1
+            if pfc_primary == "TRANSFER_IN":
+                xfer_dir = "in"
+            elif pfc_primary == "TRANSFER_OUT":
+                xfer_dir = "out"
+            else:
+                xfer_dir = "in" if signed > 0 else "out"
+
+        item_acct_id = str(item.get("account_id") or "").strip()
+        row_acct_hint = json_acct_names.get(item_acct_id, item_acct_id)
 
         rows.append(
             ImportedRow(
@@ -663,6 +754,8 @@ def parse_json_statement(
                 tx_type=final_type,
                 memo=memo[:240],
                 external_id=str(item.get("transaction_id") or item.get("id") or "")[:80],
+                transfer_direction=xfer_dir,
+                account_hint=row_acct_hint[:80],
             )
         )
 
@@ -677,6 +770,8 @@ def parse_json_statement(
         transfers_detected=transfers,
         detected_institution=detected_inst,
         pending_skipped=pending_skipped,
+        detected_account_type=detected_acct_type,
+        parse_failed=(len(rows) == 0 and pending_skipped == 0),
     )
 
 
@@ -823,6 +918,7 @@ def parse_navy_federal_pdf(
             warnings=[
                 "Could not extract text from PDF (scanned image PDFs need OCR; download a CSV from Navy Federal Online Banking for instant results)."
             ],
+            parse_failed=True,
         )
 
     detected_inst = (
@@ -897,8 +993,10 @@ def parse_navy_federal_pdf(
         base_type = "income" if signed > 0 else "expense"
         memo = f"NFCU {current_section}".strip() if current_section else ""
         final_type = _classify_transfer(desc, memo, base_type, detect_transfers)
+        xfer_dir = ""
         if final_type == "transfer":
             transfers += 1
+            xfer_dir = "in" if base_type == "income" else "out"
 
         rows.append(
             ImportedRow(
@@ -907,6 +1005,8 @@ def parse_navy_federal_pdf(
                 amount_cents=abs(signed),
                 tx_type=final_type,
                 memo=memo[:240],
+                transfer_direction=xfer_dir,
+                account_hint=current_section[:80],
             )
         )
 
@@ -914,6 +1014,13 @@ def parse_navy_federal_pdf(
         warnings.append(
             "No transaction rows matched in this PDF. Tip: Navy Federal Activity CSV exports include exact columns and running balances."
         )
+
+    sec_low = current_section.lower()
+    pdf_acct_type = (
+        "savings"
+        if "saving" in sec_low or "money market" in sec_low
+        else ("credit" if "reward" in sec_low or "credit" in sec_low else ("checking" if "checking" in sec_low else ""))
+    )
 
     return IngestionResult(
         format_detected="pdf",
@@ -923,6 +1030,9 @@ def parse_navy_federal_pdf(
         transfers_detected=transfers,
         detected_institution=detected_inst,
         pending_skipped=pending_skipped,
+        detected_account_hint=current_section[:80],
+        detected_account_type=pdf_acct_type,
+        parse_failed=(len(rows) == 0 and pending_skipped == 0),
     )
 
 

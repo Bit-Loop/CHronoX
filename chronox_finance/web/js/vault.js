@@ -420,12 +420,17 @@ export function renderJars(jars) {
   if (!jarsGrid) return;
   jarsGrid.replaceChildren(
     ...jars.map((j) => {
+      const needsSetup = Boolean(j.needs_setup);
       const pct = Math.min(100, Math.max(0, Number(j.pct_used) || 0));
-      const healthClass = `pill pill-${j.health || "calm"}`;
-      const healthLabel =
-        { calm: "NOMINAL", watch: "WATCH PACE", rebalance: "REBALANCE" }[j.health] ||
-        String(j.health || "NOMINAL").toUpperCase();
+      const healthClass = needsSetup ? "pill pill-soft" : `pill pill-${j.health || "calm"}`;
+      const healthLabel = needsSetup
+        ? "SETUP · $0 FUNDED"
+        : { calm: "NOMINAL", watch: "WATCH PACE", rebalance: "REBALANCE" }[j.health] ||
+          String(j.health || "NOMINAL").toUpperCase();
       const isEditing = state.editingJarId === j.id;
+      const fundedCents = Number(j.funded_cents ?? j.auto_allocated_cents ?? 0);
+      const targetCents = Number(j.monthly_target_cents || 0);
+      const projectedCents = Number(j.projected_allocation_cents || 0);
 
       const editor = isEditing
         ? el("form", { class: "inline-editor", "data-jar-edit-form": String(j.id) }, [
@@ -460,6 +465,10 @@ export function renderJars(jars) {
           ])
         : null;
 
+      const metaLine = needsSetup
+        ? `Cash funded: ${fmtMoney(fundedCents)} · Target: ${fmtMoney(targetCents)}/mo (${Number(j.target_pct || 0).toFixed(0)}%)`
+        : `Spent ${fmtMoney(j.spent_cents)} / ${fmtMoney(fundedCents)} funded (${Number(j.target_pct || 0).toFixed(0)}%${targetCents > 0 ? ` · Target ${fmtMoney(targetCents)}/mo` : ""})`;
+
       return el("div", { class: "jar-card", style: { borderTopColor: j.color || "var(--primary)" } }, [
         el("div", { class: "jar-top" }, [
           el("span", { class: "jar-name" }, [
@@ -486,7 +495,7 @@ export function renderJars(jars) {
         el("div", {
           class: "jar-avail",
           text: fmtMoney(j.available_cents),
-          style: { color: j.available_cents < 0 ? "var(--crimson)" : j.color || "var(--text)" },
+          style: { color: j.available_cents < 0 ? "var(--crimson)" : needsSetup ? "var(--muted)" : j.color || "var(--text)" },
         }),
         el("div", { class: "progress-track" }, [
           el("div", {
@@ -499,8 +508,14 @@ export function renderJars(jars) {
         ]),
         el("div", {
           class: "muted small",
-          text: `Spent ${fmtMoney(j.spent_cents)} / ${fmtMoney(j.auto_allocated_cents)} (${Number(j.target_pct || 0).toFixed(0)}%)`,
+          text: metaLine,
         }),
+        needsSetup && projectedCents > 0
+          ? el("div", {
+              class: "muted small",
+              text: `Projected allocation: ${fmtMoney(projectedCents)}/mo (pending cash deposit)`,
+            })
+          : null,
         j.rollover_cents > 0
           ? el("div", { class: "muted small", text: `+${fmtMoney(j.rollover_cents)} rolled over` })
           : null,
@@ -752,6 +767,16 @@ export function renderAccounts(accounts) {
   box.replaceChildren(
     ...accounts.map((a) => {
       const isReconciling = state.reconcilingAcctId === a.id;
+      const currency = String(a.currency || "USD").toUpperCase();
+      const nonUsd = currency !== "USD";
+      const fmtAcctVal = (cents) =>
+        nonUsd ? `${currency} ${(Number(cents || 0) / 100).toFixed(2)}` : fmtMoney(cents);
+      const maskSuffix = a.mask ? ` ••••${a.mask}` : "";
+      const availNote =
+        a.available_cents != null && Number(a.available_cents) !== Number(a.balance_cents)
+          ? ` · Avail ${fmtAcctVal(a.available_cents)}`
+          : "";
+
       const reconcileForm = isReconciling
         ? el("form", { class: "inline-editor", "data-reconcile-form": String(a.id) }, [
             el("div", { class: "row-gap" }, [
@@ -777,11 +802,17 @@ export function renderAccounts(accounts) {
       return el("div", { class: "item-box" }, [
         el("div", { class: "item-row" }, [
           el("div", {}, [
-            el("strong", { text: a.name }),
-            el("div", { class: "muted small", text: `${String(a.account_type || "").toUpperCase()} · ${a.institution || "Local"}` }),
+            el("div", { class: "row-gap wrap", style: { gap: "6px" } }, [
+              el("strong", { text: `${a.name}${maskSuffix}` }),
+              nonUsd ? el("span", { class: "pill pill-watch", text: `${currency} · ISOLATED` }) : null,
+            ]),
+            el("div", {
+              class: "muted small",
+              text: `${String(a.account_type || "").toUpperCase()} · ${a.institution || "Local"}${availNote}`,
+            }),
           ]),
           el("div", { class: "row-gap" }, [
-            el("strong", { class: "num", text: fmtMoney(a.balance_cents) }),
+            el("strong", { class: "num", text: fmtAcctVal(a.balance_cents) }),
             el("button", {
               type: "button",
               class: "btn btn-ghost btn-xs",
@@ -910,14 +941,27 @@ function populateSelectors(jars, accounts) {
     );
     if (prev) manualAcct.value = prev;
   }
+
+  const csvAcct = $("csv-account-select");
+  if (csvAcct) {
+    const prev = csvAcct.value;
+    csvAcct.replaceChildren(
+      el("option", { value: "", text: "Auto-Match from Statement / Default Checking" }),
+      ...accounts.map((a) => el("option", { value: String(a.id), text: `${a.name} (${a.account_type})` }))
+    );
+    if (prev) csvAcct.value = prev;
+  }
 }
+
+const TX_PAGE_SIZE = 500;
+let _txRenderLimit = TX_PAGE_SIZE;
 
 export async function loadTransactions() {
   try {
     const q = ($("tx-search") && $("tx-search").value.trim()) || "";
     const jarId = ($("tx-jar-filter") && $("tx-jar-filter").value) || "";
     const range = ($("tx-date-range") && $("tx-date-range").value) || "90";
-    const params = new URLSearchParams({ limit: range === "730" || range === "all" ? "2000" : "400" });
+    const params = new URLSearchParams({ limit: "250000" });
     if (q) params.set("search", q);
     if (jarId) params.set("jar_id", jarId);
     if (range !== "all") {
@@ -926,6 +970,7 @@ export async function loadTransactions() {
     }
     const txs = await api(`/api/v1/transactions?${params.toString()}`);
     state.transactions = Array.isArray(txs) ? txs : [];
+    _txRenderLimit = TX_PAGE_SIZE;
     renderTransactionsTable(state.transactions);
   } catch (err) {
     if (err.status !== 401) toast(err.message, true);
@@ -946,15 +991,18 @@ export function renderTransactionsTable(txs) {
     return;
   }
 
+  const visibleTxs = txs.slice(0, _txRenderLimit);
   const rows = [];
-  for (const tx of txs) {
+  for (const tx of visibleTxs) {
     const isEditing = state.editingTxId === tx.id;
+    const isTransfer = tx.tx_type === "transfer";
+    const nonJarLabel = tx.tx_type === "income" ? "Income" : isTransfer ? "Transfer" : "Unassigned";
     if (isEditing) {
       const jarSelect = el("select", { name: "jar_id", "aria-label": "Edit jar" }, [
-        el("option", { value: "", text: tx.tx_type === "income" ? "Income" : "Unassigned" }),
+        el("option", { value: "", text: nonJarLabel }),
         ...jars.map((j) => el("option", { value: String(j.id), text: j.name, selected: tx.jar_id === j.id })),
       ]);
-      if (tx.tx_type === "income") jarSelect.disabled = true;
+      if (tx.tx_type === "income" || isTransfer) jarSelect.disabled = true;
 
       rows.push(
         el("tr", { class: "tx-edit-row" }, [
@@ -977,12 +1025,13 @@ export function renderTransactionsTable(txs) {
     }
 
     const select = el("select", { "data-tx-jar-select": String(tx.id), "aria-label": `Jar for ${tx.merchant}` }, [
-      el("option", { value: "", text: tx.tx_type === "income" ? "Income" : "Unassigned" }),
+      el("option", { value: "", text: nonJarLabel }),
       ...jars.map((j) => el("option", { value: String(j.id), text: j.name, selected: tx.jar_id === j.id })),
     ]);
-    if (tx.tx_type === "income") select.disabled = true;
+    if (tx.tx_type === "income" || isTransfer) select.disabled = true;
 
     const metaBadges = [];
+    if (isTransfer) metaBadges.push(el("span", { class: "pill pill-soft", text: "Transfer" }));
     if (tx.needs_review) metaBadges.push(el("span", { class: "pill pill-watch", text: "Review" }));
     if (Array.isArray(tx.splits) && tx.splits.length > 0) {
       metaBadges.push(el("span", { class: "pill pill-blue", text: `${tx.splits.length} Splits` }));
@@ -997,6 +1046,19 @@ export function renderTransactionsTable(txs) {
       }
     }
 
+    const amtSign =
+      tx.tx_type === "income" || (isTransfer && tx.transfer_direction === "in")
+        ? "+"
+        : tx.tx_type === "expense" || (isTransfer && tx.transfer_direction === "out")
+        ? "-"
+        : "";
+    const amtClass =
+      tx.tx_type === "income"
+        ? "tx-income"
+        : isTransfer
+        ? "muted"
+        : "tx-expense";
+
     rows.push(
       el("tr", {}, [
         el("td", { class: "num-inline", text: tx.tx_date }),
@@ -1006,8 +1068,8 @@ export function renderTransactionsTable(txs) {
         ]),
         el("td", {}, [select]),
         el("td", {
-          class: `num ${tx.tx_type === "income" ? "tx-income" : "tx-expense"}`,
-          text: `${tx.tx_type === "income" ? "+" : "-"}${fmtMoney(tx.amount_cents)}`,
+          class: `num ${amtClass}`,
+          text: `${amtSign}${fmtMoney(tx.amount_cents)}`,
         }),
         el("td", { class: "num" }, [
           el("div", { class: "tx-actions" }, [
@@ -1044,6 +1106,37 @@ export function renderTransactionsTable(txs) {
               },
               [makeIcon("x", "ui-icon-sm")]
             ),
+          ]),
+        ]),
+      ])
+    );
+  }
+  if (txs.length > visibleTxs.length) {
+    const remaining = txs.length - visibleTxs.length;
+    const moreBtn = el("button", {
+      type: "button",
+      class: "btn btn-soft btn-xs",
+      text: `Show next ${Math.min(TX_PAGE_SIZE, remaining)} (${visibleTxs.length} of ${txs.length} shown)`,
+    });
+    moreBtn.addEventListener("click", () => {
+      _txRenderLimit += TX_PAGE_SIZE;
+      renderTransactionsTable(txs);
+    });
+    const allBtn = el("button", {
+      type: "button",
+      class: "btn btn-ghost btn-xs",
+      text: `Show all ${txs.length}`,
+    });
+    allBtn.addEventListener("click", () => {
+      _txRenderLimit = txs.length;
+      renderTransactionsTable(txs);
+    });
+    rows.push(
+      el("tr", {}, [
+        el("td", { colspan: "5" }, [
+          el("div", { class: "row-gap wrap", style: { justifyContent: "center", padding: "6px 0" } }, [
+            moreBtn,
+            allBtn,
           ]),
         ]),
       ])
@@ -1270,28 +1363,50 @@ export async function loadConnections() {
     }
     box.replaceChildren(
       ...list.map((c) => {
+        const needsReauth = c.status === "needs_reauth";
         const statusCls =
-          c.status === "active" ? "pill-calm" : c.status === "paused_locked" ? "pill-watch" : "pill-danger";
+          c.status === "active"
+            ? "pill-calm"
+            : c.status === "paused_locked"
+            ? "pill-watch"
+            : "pill-danger";
         const statusLabel =
-          c.status === "paused_locked" ? "SYNC PAUSED: VAULT LOCKED" : String(c.status || "active").toUpperCase();
+          c.status === "paused_locked"
+            ? "SYNC PAUSED: VAULT LOCKED"
+            : needsReauth
+            ? "RECONNECT REQUIRED"
+            : String(c.status || "active").replace(/_/g, " ").toUpperCase();
+        const windowNote =
+          c.imported_start_date && c.imported_end_date
+            ? ` · Window: ${c.imported_start_date} to ${c.imported_end_date}`
+            : "";
         return el("div", { class: "item-box" }, [
-          el("div", { class: "item-row" }, [
+          el("div", { class: "item-row wrap" }, [
             el("div", {}, [
-              el("strong", { text: `${c.institution || c.provider.toUpperCase()} (${c.provider})` }),
+              el("div", { class: "row-gap wrap", style: { gap: "6px" } }, [
+                el("strong", { text: `${c.institution || c.provider.toUpperCase()} (${c.provider})` }),
+                c.env && c.env !== "production" ? el("span", { class: "pill pill-watch", text: "TEST ENV" }) : null,
+              ]),
               el("div", {
                 class: "muted small",
-                text: `Env: ${c.env} · Last sync: ${c.last_synced_at ? c.last_synced_at.replace("T", " ").slice(0, 16) : "Never"}`,
+                text: `Last sync: ${c.last_synced_at ? c.last_synced_at.replace("T", " ").slice(0, 16) : "Never"}${windowNote}`,
               }),
+              c.last_error
+                ? el("div", { class: "small error-text", text: c.last_error })
+                : null,
             ]),
             el("div", { class: "row-gap wrap" }, [
               el("span", { class: `pill ${statusCls}`, text: statusLabel }),
+              c.provider === "plaid" && c.backfill_status === "backfill_pending"
+                ? el("span", { class: "pill pill-watch", text: "BACKFILL PENDING" })
+                : null,
               c.needs_relink_for_730d
                 ? el("span", { class: "pill pill-watch", text: "RE-LINK FOR 730D HISTORY" })
                 : null,
               el("button", {
                 type: "button",
                 class: "btn btn-soft btn-xs",
-                text: "Sync",
+                text: needsReauth ? "Retry Sync" : "Sync",
                 "data-conn-sync": String(c.id),
                 "data-conn-provider": c.provider,
               }),
@@ -1435,7 +1550,7 @@ export async function loadSettings() {
     setVal("set-cooling-hours", s.default_cooling_hours || 48);
     setVal("set-payday-cadence", s.payday_cadence_days || 14);
     setVal("set-next-payday", s.next_payday_date || "");
-    setVal("set-expected-paycheck", Math.round((s.expected_paycheck_cents || 220000) / 100));
+    setVal("set-expected-paycheck", Math.round((s.expected_paycheck_cents ?? 0) / 100));
     setVal("set-auto-lock-minutes", s.vault_auto_lock_minutes ?? 30);
 
     await Promise.all([
@@ -1846,6 +1961,8 @@ export function initVaultAndShell() {
     const fd = new FormData();
     fd.append("file", file, file.name || "statement.csv");
     fd.append("institution", $("csv-institution").value || "auto");
+    const targetAcct = $("csv-account-select") && $("csv-account-select").value;
+    if (targetAcct) fd.append("account_id", targetAcct);
     fd.append("skip_pending", $("csv-skip-pending").checked ? "true" : "false");
     fd.append("flip_expense_sign", $("csv-flip-sign").checked ? "true" : "false");
     fd.append("detect_transfers", $("csv-detect-transfers").checked ? "true" : "false");
@@ -1858,10 +1975,15 @@ export function initVaultAndShell() {
       try {
         const res = await api("/api/v1/import/preview", { method: "POST", body: buildStatementFormData() });
         const box = $("csv-import-result");
+        const warnTxt =
+          Array.isArray(res.warnings) && res.warnings.length ? ` Warnings: ${res.warnings.join(" | ")}` : "";
+        const acctTxt = res.target_account_name ? ` -> ${res.target_account_name}` : "";
         box.textContent =
-          `Preview (${String(res.format_detected || "").toUpperCase()}): ` +
-          `${res.new_count} new, ${res.duplicate_count} duplicate, ${res.transfers_detected} transfer(s). Click Import to apply.`;
+          `Preview (${String(res.format_detected || "").toUpperCase()}${acctTxt}): ` +
+          `${res.new_count} new, ${res.duplicate_count} duplicate, ${res.transfers_detected} transfer(s).${warnTxt}`;
+        box.className = `notice-bar details-spacer${res.parse_failed ? " notice-warn" : ""}`;
         box.classList.remove("hidden");
+        if (res.parse_failed) toast(res.warnings && res.warnings[0] ? res.warnings[0] : "Statement file yielded 0 transactions.", true);
       } catch (err) {
         toast(err.message, true);
       }
@@ -1876,12 +1998,20 @@ export function initVaultAndShell() {
         try {
           const res = await api("/api/v1/import/statement", { method: "POST", body: buildStatementFormData() });
           const box = $("csv-import-result");
-          box.textContent = `Imported ${res.imported_count} transaction(s) (${res.duplicate_count} duplicate, ${res.transfers_detected} transfer isolated).`;
+          const warnTxt =
+            Array.isArray(res.warnings) && res.warnings.length ? ` (${res.warnings.join(" | ")})` : "";
+          const acctTxt = res.target_account_name ? ` into ${res.target_account_name}` : "";
+          box.textContent = `Imported ${res.imported_count} transaction(s)${acctTxt} (${res.duplicate_count} duplicate, ${res.transfers_detected} transfer isolated).${warnTxt}`;
+          box.className = `notice-bar details-spacer${res.parse_failed ? " notice-warn" : ""}`;
           box.classList.remove("hidden");
           state.desktopStatementFile = null;
           const deskBox = $("desktop-selected-statement");
           if (deskBox) deskBox.classList.add("hidden");
-          toast(`Imported ${res.imported_count} transactions.`);
+          if (res.parse_failed) {
+            toast(res.warnings && res.warnings[0] ? res.warnings[0] : "Could not parse any transactions from statement.", true);
+          } else {
+            toast(`Imported ${res.imported_count} transactions.`);
+          }
           await refreshAll();
         } catch (err) {
           toast(err.message, true);
@@ -1906,15 +2036,21 @@ export function initVaultAndShell() {
         try {
           const jarVal = $("manual-tx-jar").value;
           const acctVal = $("manual-tx-account").value;
+          const rawType = $("manual-tx-type").value;
+          const txType =
+            rawType === "transfer_out" || rawType === "transfer_in" ? "transfer" : rawType;
+          const transferDirection =
+            rawType === "transfer_out" ? "out" : rawType === "transfer_in" ? "in" : null;
           await api("/api/v1/transactions", {
             method: "POST",
             body: JSON.stringify({
-              tx_type: $("manual-tx-type").value,
+              tx_type: txType,
+              transfer_direction: transferDirection,
               merchant: $("manual-tx-merchant").value.trim(),
               amount_cents: dollarsToCents($("manual-tx-amount").value),
               tx_date: $("manual-tx-date").value || isoDateOffset(0),
               account_id: acctVal ? Number(acctVal) : null,
-              jar_id: jarVal ? Number(jarVal) : null,
+              jar_id: txType === "expense" && jarVal ? Number(jarVal) : null,
               memo: $("manual-tx-memo").value.trim(),
               source: "manual_detailed",
             }),
@@ -2118,7 +2254,7 @@ export function initVaultAndShell() {
             body: JSON.stringify({
               client_id: $("set-plaid-client-id").value.trim(),
               secret: $("set-plaid-secret").value.trim(),
-              env: $("set-plaid-env").value,
+              env: "production",
             }),
           });
           $("set-plaid-secret").value = "";
@@ -2157,7 +2293,8 @@ export function initVaultAndShell() {
           }
         }
         if (stBox) {
-          stBox.textContent = "Hosted Link opened in system browser — waiting for bank completion (730d requested)...";
+          stBox.textContent = "Hosted Link opened in system browser — waiting for bank completion (up to 730d requested)...";
+          stBox.className = "notice-bar details-spacer";
           stBox.classList.remove("hidden");
         }
         stopPlaidPolling();
@@ -2168,33 +2305,69 @@ export function initVaultAndShell() {
             stopPlaidPolling();
             return;
           }
+          let poll = null;
           try {
-            const poll = await api("/api/v1/plaid/poll-link", {
+            poll = await api("/api/v1/plaid/poll-link", {
               method: "POST",
               body: JSON.stringify({ link_token: lt.link_token }),
             });
-            if (poll && poll.public_token) {
-              stopPlaidPolling();
-              await api("/api/v1/plaid/exchange", {
+          } catch (_pollErr) {
+            return;
+          }
+          if (!poll) return;
+          if (poll.status === "exited") {
+            stopPlaidPolling();
+            const exitMsg = poll.error_message || "Plaid Hosted Link closed before linking completed.";
+            if (stBox) {
+              stBox.textContent = exitMsg;
+              stBox.className = "notice-bar notice-warn details-spacer";
+              stBox.classList.remove("hidden");
+            }
+            toast(exitMsg, true);
+            return;
+          }
+          if (poll.public_token) {
+            stopPlaidPolling();
+            try {
+              const exRes = await api("/api/v1/plaid/exchange", {
                 method: "POST",
                 body: JSON.stringify({
                   public_token: poll.public_token,
                   institution: poll.institution || "Plaid Institution",
                 }),
               });
-              await api("/api/v1/plaid/sync", { method: "POST" });
-              if (stBox) stBox.textContent = "Plaid bank linked & 730-day transaction sync complete.";
-              toast("Plaid bank connected & synced.");
+              const newConnId = exRes && (exRes.id || exRes.connection_id);
+              const syncRes = await api("/api/v1/plaid/sync", {
+                method: "POST",
+                body: JSON.stringify(newConnId ? { connection_id: newConnId } : {}),
+              });
+              const note =
+                (syncRes && syncRes.history_note) ||
+                "Plaid bank linked & initial transaction sync complete.";
+              if (stBox) {
+                stBox.textContent = note;
+                stBox.className = "notice-bar details-spacer";
+                stBox.classList.remove("hidden");
+              }
+              toast(note);
               await loadConnections();
               await refreshAll();
+            } catch (syncErr) {
+              const msg = (syncErr && syncErr.message) || "Plaid link or initial sync failed.";
+              if (stBox) {
+                stBox.textContent = msg;
+                stBox.className = "notice-bar notice-warn details-spacer";
+                stBox.classList.remove("hidden");
+              }
+              toast(msg, true);
+              await loadConnections();
             }
-          } catch (_err) {
-            // Keep polling until finished or timed out
           }
         }, 3000);
       } catch (err) {
         if (stBox) {
           stBox.textContent = err.message;
+          stBox.className = "notice-bar notice-warn details-spacer";
           stBox.classList.remove("hidden");
         }
         toast(err.message, true);
@@ -2480,14 +2653,65 @@ export function initVaultAndShell() {
     backupInp.addEventListener("change", async (e) => {
       const file = e.target.files[0];
       if (!file) return;
+      const previewBox = $("backup-preview-box");
       const fd = new FormData();
       fd.append("file", file);
       try {
-        await api("/api/v1/backup/import", { method: "POST", body: fd });
+        const prev = await api("/api/v1/backup/preview", { method: "POST", body: fd });
         e.target.value = "";
-        toast("JSON backup restored.");
-        await refreshAll({ refreshAI: true });
+        if (!previewBox) return;
+        const counts = (prev && prev.counts) || {};
+        const dr = (prev && (prev.date_range || prev.tx_date_range)) || {};
+        const rangeTxt = dr.start && dr.end ? `${dr.start} to ${dr.end}` : "No transactions";
+        const goalsCnt = counts.goals ?? counts.savings_goals ?? 0;
+        const confirmBtn = el("button", {
+          type: "button",
+          class: "btn btn-primary btn-xs",
+          text: "Confirm & Replace Ledger",
+        });
+        const cancelBtn = el("button", {
+          type: "button",
+          class: "btn btn-ghost btn-xs",
+          text: "Cancel",
+        });
+        cancelBtn.addEventListener("click", () => {
+          previewBox.classList.add("hidden");
+          previewBox.replaceChildren();
+        });
+        confirmBtn.addEventListener("click", () =>
+          withBusy(confirmBtn, async () => {
+            const importFd = new FormData();
+            importFd.append("file", file);
+            try {
+              await api("/api/v1/backup/import", { method: "POST", body: importFd });
+              previewBox.classList.add("hidden");
+              previewBox.replaceChildren();
+              toast("JSON backup restored.");
+              await refreshAll({ refreshAI: true });
+            } catch (impErr) {
+              toast(impErr.message, true);
+            }
+          })
+        );
+        previewBox.classList.remove("hidden");
+        previewBox.replaceChildren(
+          el("div", { class: "stack-xs" }, [
+            el("strong", { text: `Backup Preview (${file.name})` }),
+            el("div", {
+              class: "small tabular-nums",
+              text:
+                `${counts.accounts || 0} account(s) · ${counts.transactions || 0} transaction(s) (${rangeTxt}) · ` +
+                `${counts.recurring_bills || 0} bill(s) · ${goalsCnt} goal(s) · ${counts.holdings || 0} holding(s)`,
+            }),
+            el("div", {
+              class: "small muted",
+              text: "Warning: Restoring this backup replaces your current local ledger tables (sealed API credentials stay untouched).",
+            }),
+            el("div", { class: "row-gap" }, [confirmBtn, cancelBtn]),
+          ])
+        );
       } catch (err) {
+        e.target.value = "";
         toast(err.message, true);
       }
     });
@@ -2717,20 +2941,28 @@ export function initVaultAndShell() {
       await withBusy(btn, async () => {
         try {
           const prov = btn.dataset.connProvider;
+          const connId = Number(btn.dataset.connSync);
           const url =
             prov === "plaid"
               ? "/api/v1/plaid/sync"
               : prov === "simplefin"
               ? "/api/v1/simplefin/sync"
               : prov && prov.startsWith("credit_api_")
-              ? `/api/v1/credit/apis/${btn.dataset.connSync}/sync`
-              : `/api/v1/brokers/${btn.dataset.connSync}/sync`;
-          await api(url, { method: "POST" });
-          toast(`Synced ${prov.toUpperCase()} connection.`);
+              ? `/api/v1/credit/apis/${connId}/sync`
+              : `/api/v1/brokers/${connId}/sync`;
+          const opts =
+            prov === "plaid" || prov === "simplefin"
+              ? { method: "POST", body: JSON.stringify({ connection_id: connId }) }
+              : { method: "POST" };
+          const syncRes = await api(url, opts);
+          toast(
+            (syncRes && syncRes.history_note) || `Synced ${String(prov || "").toUpperCase()} connection.`
+          );
           await loadConnections();
           await refreshAll();
         } catch (err) {
           toast(err.message, true);
+          await loadConnections();
         }
       });
       return;

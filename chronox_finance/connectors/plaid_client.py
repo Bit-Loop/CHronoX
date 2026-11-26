@@ -143,8 +143,9 @@ def _map_plaid_security_class(sec_type: str, sec_subtype: str = "") -> str:
 
 def _normalize_plaid_account(raw: Dict[str, Any], institution: str = "") -> NormalizedAccount:
     balances = raw.get("balances") or {}
+    raw_type = str(raw.get("type") or "").strip().lower()
     acct_type, is_liquid = _map_plaid_account_type(
-        str(raw.get("type") or ""),
+        raw_type,
         str(raw.get("subtype") or ""),
     )
     current_val = balances.get("current")
@@ -155,6 +156,10 @@ def _normalize_plaid_account(raw: Dict[str, Any], institution: str = "") -> Norm
         or balances.get("unofficial_currency_code")
         or "USD"
     )
+    raw_bal_cents = decimal_to_cents(current_val)
+    # Plaid reports debt owed on credit/loan accounts as a positive `current` balance,
+    # whereas ChronoX represents debt on `credit` accounts as negative `balance_cents`.
+    norm_bal_cents = -raw_bal_cents if (acct_type == "credit" or raw_type in ("credit", "loan")) else raw_bal_cents
     name = sanitize_untrusted_text(str(raw.get("name") or raw.get("official_name") or "Account"), max_len=80)
     official_name = sanitize_untrusted_text(str(raw.get("official_name") or ""), max_len=120)
     return NormalizedAccount(
@@ -165,7 +170,7 @@ def _normalize_plaid_account(raw: Dict[str, Any], institution: str = "") -> Norm
         account_type=acct_type,
         subtype=str(raw.get("subtype") or "").lower(),
         institution=sanitize_untrusted_text(institution, max_len=80),
-        balance_cents=decimal_to_cents(current_val),
+        balance_cents=norm_bal_cents,
         available_cents=decimal_to_cents(avail_val) if avail_val is not None else None,
         limit_cents=decimal_to_cents(limit_val) if limit_val is not None else None,
         currency=str(currency).upper(),
@@ -189,8 +194,10 @@ def _normalize_plaid_transaction(raw: Dict[str, Any]) -> NormalizedTransaction:
     primary_cat = str(pfc.get("primary") or "").strip().upper()
     detailed_cat = str(pfc.get("detailed") or "").strip().upper()
 
+    xfer_dir = ""
     if primary_cat in ("TRANSFER_IN", "TRANSFER_OUT") or detailed_cat == "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT":
         tx_type = "transfer"
+        xfer_dir = "in" if (primary_cat == "TRANSFER_IN" or amt_dec < Decimal(0)) else "out"
     elif amt_dec < Decimal(0):
         tx_type = "income"
     else:
@@ -220,6 +227,7 @@ def _normalize_plaid_transaction(raw: Dict[str, Any]) -> NormalizedTransaction:
         merchant=merchant,
         amount_cents=amount_cents,
         tx_type=tx_type,
+        transfer_direction=xfer_dir,
         memo=memo,
         subcategory=subcategory,
         pending=bool(raw.get("pending", False)),
@@ -244,7 +252,7 @@ class PlaidClient:
         client_id: str,
         secret: str,
         *,
-        env: str = "sandbox",
+        env: str = "production",
         base_url: Optional[str] = None,
         timeout: float = 25.0,
         max_retries: int = 2,
@@ -260,7 +268,7 @@ class PlaidClient:
                 provider=self.provider_name,
             )
 
-        normalized_env = (env or "sandbox").strip().lower()
+        normalized_env = (env or "production").strip().lower()
         if base_url is not None:
             resolved_url = validate_strict_external_url(
                 base_url,
@@ -486,6 +494,22 @@ class PlaidClient:
             request_id=str(data.get("request_id") or ""),
         )
 
+    def remove_item(self, access_token: str) -> Dict[str, Any]:
+        """
+        Revoke an active Plaid Item via `POST /item/remove` so recurring Plaid
+        product subscriptions stop billing before local credentials are deleted.
+        """
+        cleaned_token = (access_token or "").strip()
+        if not cleaned_token:
+            raise ConnectorAuthError("access_token is required", provider=self.provider_name)
+        try:
+            data = self._post("/item/remove", {"access_token": cleaned_token})
+            return {"removed": True, "request_id": str(data.get("request_id") or "")}
+        except ConnectorError as exc:
+            if exc.error_code in ("ITEM_NOT_FOUND", "INVALID_ACCESS_TOKEN"):
+                return {"removed": True, "already_revoked": True}
+            raise
+
     def sync_transactions(
         self,
         access_token: str,
@@ -517,6 +541,7 @@ class PlaidClient:
             removed: List[str] = []
             accounts_by_id: Dict[str, NormalizedAccount] = {}
             warnings: List[str] = []
+            tx_update_status = ""
             has_more = True
             pages_fetched = 0
             restart_needed = False
@@ -540,6 +565,8 @@ class PlaidClient:
                     raise
 
                 pages_fetched += 1
+                if data.get("transactions_update_status"):
+                    tx_update_status = str(data["transactions_update_status"])
                 for raw_acct in data.get("accounts") or []:
                     if isinstance(raw_acct, dict) and raw_acct.get("account_id"):
                         norm_acct = _normalize_plaid_account(raw_acct, institution=institution)
@@ -578,6 +605,7 @@ class PlaidClient:
                 removed_external_ids=removed,
                 next_cursor=current_cursor,
                 has_more=has_more,
+                transactions_update_status=tx_update_status,
                 warnings=warnings,
             )
 
@@ -793,7 +821,9 @@ class PlaidClient:
             if price_raw is None:
                 price_raw = sec.get("close_price")
             price_e8 = decimal_to_e8(price_raw)
-            cost_basis_cents = decimal_to_cents(raw_h.get("cost_basis"))
+            cb_raw = raw_h.get("cost_basis")
+            cost_basis_cents = decimal_to_cents(cb_raw)
+            cb_known = cb_raw is not None and (cost_basis_cents > 0 or bool(sec.get("is_cash_equivalent")))
             market_value_cents = compute_market_value_cents(qty_e8, price_e8)
 
             asset_class = _map_plaid_security_class(
@@ -802,6 +832,7 @@ class PlaidClient:
             )
             if bool(sec.get("is_cash_equivalent")):
                 asset_class = "cash"
+                cb_known = True
                 if symbol.startswith("CUR:"):
                     symbol = symbol.split(":", 1)[1]
 
@@ -818,6 +849,7 @@ class PlaidClient:
                     quantity_e8=qty_e8,
                     price_e8=price_e8,
                     cost_basis_cents=cost_basis_cents,
+                    cost_basis_known=cb_known,
                     market_value_cents=market_value_cents,
                     external_account_id=str(raw_h.get("account_id") or ""),
                     currency=str(currency).upper(),

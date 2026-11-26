@@ -1,18 +1,18 @@
 /**
- * ChronoX Finance — Stocks & Crypto Portfolio + Honest 5-Factor Credit Simulator (ES Module)
+ * ChronoX Finance — Stocks & Crypto Portfolio + Credit & Debt Factor Analysis (ES Module)
  * Pure zero-CDN DOM/SVG implementation:
  * Part A — Portfolio:
- * - Total Investments, Cost Basis, Unrealized P&L (tabular-nums)
+ * - Total Investments, Cost Basis, Unrealized P&L (tabular-nums, cost-basis coverage aware)
  * - Sharp asset-class allocation bars (Equities, ETFs, Crypto, Cash)
  * - Holdings ledger with exact 10^-8 quantity & sub-cent price formatting (e.g. $0.00002415)
  * - Live Quote Refresh, Manual Add/Delete, Broker CSV Import
  * - Direct Read-Only Broker Adapters (Coinbase CDP, Robinhood Crypto, Charles Schwab OAuth2 + 7-day countdown, Plaid Investments)
  * Part B — Credit & Debt:
  * - Imported Actual Bureau Score card (never fabricated!)
- * - Honest 5-Factor Credit Simulator (FICO 8 + VantageScore 3.0 directional bars & simulated paydown cliff delta ranges)
+ * - Credit Factor Analysis (FICO 8 + VantageScore 3.0 factor weights & utilization tiers)
  * - Chase 5/24 Velocity Gauge (all issuers + AU toggle + next slot drop-off date) + Inquiries (24m) & Derogatories (7y/10y)
  * - Official Credit Report Importer (structured form primary + AnnualCreditReport PDF mandatory review confirmation)
- * - Niche Advisor Alerts, AZEO Statement-Close Calendar, 4-Strategy Payoff Arena, Credit Lines Manager & Balance Transfer Breakeven
+ * - Niche Advisor Alerts, AZEO Statement-Close Calendar, Debt Payoff Strategy Comparison, Credit Lines Manager & Balance Transfer Breakeven
  */
 
 import {
@@ -52,7 +52,6 @@ const portState = {
   creditReport: null,
   creditApis: null,
   factorModel: "fico8", // "fico8" | "vantage3"
-  simPaydownDollars: 0,
   pendingPdfBundle: null,
 };
 
@@ -179,21 +178,48 @@ function renderPortfolio(port, connections) {
   const pnl = Number(port.unrealized_pnl_cents || 0);
   const pnlPct = Number(port.unrealized_pnl_pct || 0);
   const holdings = Array.isArray(port.holdings) ? port.holdings : [];
+  const unknownBasisVal = Number(port.unknown_cost_basis_value_cents || 0);
+  const unknownBasisCnt = Number(port.unknown_cost_basis_holdings_count || 0);
+  const knownBasisCnt = Number(port.known_cost_basis_holdings_count || 0);
+  const knownBasisVal = Number(port.known_cost_basis_value_cents ?? (totalVal - unknownBasisVal));
+  const coveragePct = Number(port.cost_basis_coverage_pct ?? 100);
+  const hasAnyUnknownBasis = unknownBasisCnt > 0 || unknownBasisVal > 0;
+  const allUnknownBasis = holdings.length > 0 && knownBasisCnt <= 0 && knownBasisVal <= 0 && hasAnyUnknownBasis;
 
   animateMoney($("port-total-value"), totalVal, "portTotal");
-  animateMoney($("port-cost-basis"), costBasis, "portCost");
+  const costBasisNode = $("port-cost-basis");
+  if (allUnknownBasis && costBasisNode) {
+    costBasisNode.textContent = "Unknown";
+  } else {
+    animateMoney(costBasisNode, costBasis, "portCost");
+  }
   const cntNode = $("port-holdings-count");
-  if (cntNode) cntNode.textContent = `${holdings.length} holding${holdings.length === 1 ? "" : "s"}`;
+  if (cntNode) {
+    const covNote =
+      hasAnyUnknownBasis ? ` · ${coveragePct.toFixed(0)}% basis known` : "";
+    cntNode.textContent = `${holdings.length} holding${holdings.length === 1 ? "" : "s"}${covNote}`;
+  }
 
   const pnlNode = $("port-unrealized-pnl");
   if (pnlNode) {
-    pnlNode.textContent = `${pnl >= 0 ? "+" : ""}${fmtMoney(pnl)}`;
-    pnlNode.style.color = pnl > 0 ? "var(--primary)" : pnl < 0 ? "var(--crimson)" : "var(--text)";
+    if (allUnknownBasis) {
+      pnlNode.textContent = "--";
+      pnlNode.style.color = "var(--muted)";
+    } else {
+      pnlNode.textContent = `${pnl >= 0 ? "+" : ""}${fmtMoney(pnl)}`;
+      pnlNode.style.color = pnl > 0 ? "var(--primary)" : pnl < 0 ? "var(--crimson)" : "var(--text)";
+    }
   }
   const pctNode = $("port-unrealized-pct");
   if (pctNode) {
-    pctNode.textContent = `${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%`;
-    pctNode.className = `pill ${pnl > 0 ? "pill-calm" : pnl < 0 ? "pill-danger" : "pill-soft"}`;
+    if (allUnknownBasis) {
+      pctNode.textContent = "BASIS UNKNOWN";
+      pctNode.className = "pill pill-watch";
+    } else {
+      const suffix = hasAnyUnknownBasis ? " (known basis)" : "";
+      pctNode.textContent = `${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%${suffix}`;
+      pctNode.className = `pill ${pnl > 0 ? "pill-calm" : pnl < 0 ? "pill-danger" : "pill-soft"}`;
+    }
   }
   const syncNode = $("port-last-sync");
   if (syncNode) {
@@ -284,8 +310,10 @@ function renderHoldingsTable(holdings) {
 
   const rows = holdings.map((h) => {
     const meta = ASSET_CLASS_META[h.asset_class] || { label: h.asset_class || "Other", color: "#64748b" };
+    const basisKnown = h.cost_basis_known !== false;
     const pnl = Number(h.unrealized_pnl_cents || 0);
     const pnlPct = Number(h.unrealized_pnl_pct || 0);
+    const acctSuffix = h.external_account_id ? ` · ${String(h.external_account_id).slice(-6)}` : "";
     const delBtn = el(
       "button",
       {
@@ -312,7 +340,7 @@ function renderHoldingsTable(holdings) {
     return el("tr", {}, [
       el("td", {}, [
         el("strong", { class: "tabular-nums", text: h.symbol }),
-        h.name ? el("span", { class: "tx-memo-sub", text: h.name }) : null,
+        h.name || acctSuffix ? el("span", { class: "tx-memo-sub", text: `${h.name || ""}${acctSuffix}`.trim() }) : null,
       ]),
       el("td", {}, [
         el("span", {
@@ -324,12 +352,17 @@ function renderHoldingsTable(holdings) {
       el("td", { class: "num tabular-nums", text: fmtE8Qty(h.quantity_e8) }),
       el("td", { class: "num tabular-nums", text: fmtE8Price(h.price_e8) }),
       el("td", { class: "num tabular-nums", style: { fontWeight: "700" }, text: fmtMoney(h.market_value_cents) }),
-      el("td", { class: "num tabular-nums muted", text: fmtMoney(h.cost_basis_cents) }),
+      el("td", {
+        class: "num tabular-nums muted",
+        text: basisKnown ? fmtMoney(h.cost_basis_cents) : "Unknown",
+      }),
       el("td", { class: "num tabular-nums" }, [
-        el("span", {
-          style: { color: pnl > 0 ? "var(--primary)" : pnl < 0 ? "var(--crimson)" : "var(--muted)", fontWeight: "700" },
-          text: `${pnl >= 0 ? "+" : ""}${fmtMoney(pnl)} (${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%)`,
-        }),
+        basisKnown
+          ? el("span", {
+              style: { color: pnl > 0 ? "var(--primary)" : pnl < 0 ? "var(--crimson)" : "var(--muted)", fontWeight: "700" },
+              text: `${pnl >= 0 ? "+" : ""}${fmtMoney(pnl)} (${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(1)}%)`,
+            })
+          : el("span", { class: "muted small", text: "-- (No basis)" }),
       ]),
       el("td", {}, [el("span", { class: "pill pill-soft", text: h.source || "manual" })]),
       el("td", { class: "num" }, [delBtn]),
@@ -394,10 +427,16 @@ function renderBrokerCards(connections) {
 
   grid.replaceChildren(
     ...specs.map((sp) => {
+      const needsReauth = sp.conn && sp.conn.status === "needs_reauth";
       const statusBadge = sp.conn
         ? el("span", {
-            class: `pill ${sp.conn.status === "active" ? "pill-calm" : "pill-watch"}`,
-            text: sp.conn.status === "active" ? "CONNECTED" : sp.conn.status.toUpperCase(),
+            class: `pill ${sp.conn.status === "active" ? "pill-calm" : needsReauth ? "pill-danger" : "pill-watch"}`,
+            text:
+              sp.conn.status === "active"
+                ? "CONNECTED"
+                : needsReauth
+                ? "RECONNECT REQUIRED"
+                : sp.conn.status.replace(/_/g, " ").toUpperCase(),
           })
         : el("span", { class: "pill pill-soft", text: sp.tag });
 
@@ -438,6 +477,7 @@ function renderBrokerCards(connections) {
                 await refreshAll();
               } catch (err) {
                 toast(err.message || `Could not sync ${sp.title}.`, true);
+                await loadPortfolio();
               }
             })
           );
@@ -448,6 +488,9 @@ function renderBrokerCards(connections) {
       return el("article", { class: "track-card" }, [
         el("div", { class: "track-head" }, [statusBadge, el("h3", { text: sp.title })]),
         el("p", { class: "muted small", text: sp.desc }),
+        sp.conn && sp.conn.last_error
+          ? el("div", { class: "small error-text", text: sp.conn.last_error })
+          : null,
         el("div", { class: "row-gap wrap" }, actions),
       ]);
     })
@@ -552,7 +595,7 @@ function openBrokerModal(brokerKey) {
     const form = el("form", { class: "stack-sm" }, [
       el("div", { class: "notice-bar notice-warn" }, [
         makeIcon("clock", "ui-icon-sm"),
-        "Optional BYOK connector. Schwab access tokens last 30m and refresh tokens expire every 7 days (requires registered exact HTTPS loopback callback).",
+        "Optional BYOK connector. ChronoX opens an ephemeral loopback HTTPS listener for your registered 127.0.0.1 callback, or you can paste the redirected URL below.",
       ]),
       el("label", { class: "field" }, [
         el("span", { text: "Schwab App Key (Client ID)" }),
@@ -567,7 +610,7 @@ function openBrokerModal(brokerKey) {
         el("input", {
           name: "redirect_uri",
           type: "url",
-          value: "https://127.0.0.1:8443/api/v1/brokers/schwab/callback",
+          value: "https://127.0.0.1:8787/api/v1/brokers/schwab/callback",
           required: true,
         }),
       ]),
@@ -577,6 +620,22 @@ function openBrokerModal(brokerKey) {
       ]),
       el("button", { type: "submit", class: "btn btn-primary", text: "Generate OAuth2 Authorize URL" }),
     ]);
+
+    const completeForm = el("form", { class: "subpanel stack-xs details-spacer" }, [
+      el("span", { class: "eyebrow", text: "FALLBACK: PASTE REDIRECT URL OR CODE" }),
+      el("p", {
+        class: "muted small",
+        text: "If your browser warns on the local self-signed HTTPS loopback certificate, copy the full redirected https://127.0.0.1:... URL from the address bar and paste it here:",
+      }),
+      el("input", {
+        name: "callback_url_or_code",
+        type: "text",
+        placeholder: "https://127.0.0.1:8787/api/v1/brokers/schwab/callback?code=...&state=...",
+        required: true,
+      }),
+      el("button", { type: "submit", class: "btn btn-soft btn-xs", text: "Complete Schwab Authorization" }),
+    ]);
+
     form.addEventListener("submit", async (ev) => {
       ev.preventDefault();
       const btn = form.querySelector("button[type=submit]");
@@ -592,11 +651,16 @@ function openBrokerModal(brokerKey) {
             }),
           });
           const authUrl = res && (res.authorize_url || res.authorization_url || res.auth_url);
+          const listenerNote =
+            res && (res.callback_listener_active || res.loopback_tls_listener)
+              ? `Local HTTPS callback listener active at ${res.redirect_uri || "127.0.0.1"}.`
+              : "Paste the redirected callback URL below after approving Schwab consent.";
           statusOut.classList.remove("hidden");
           if (authUrl) {
             statusOut.replaceChildren(
               el("div", { class: "stack-xs" }, [
                 el("strong", { text: "Schwab OAuth2 Ready — Open in System Browser:" }),
+                el("div", { class: "small muted", text: listenerNote }),
                 el("a", {
                   href: authUrl,
                   target: "_blank",
@@ -616,14 +680,37 @@ function openBrokerModal(brokerKey) {
         }
       });
     });
-    body.replaceChildren(form, statusOut);
+
+    completeForm.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const btn = completeForm.querySelector("button[type=submit]");
+      await withBusy(btn, async () => {
+        try {
+          await api("/api/v1/brokers/schwab/complete", {
+            method: "POST",
+            body: JSON.stringify({
+              callback_url_or_code: completeForm.elements.callback_url_or_code.value.trim(),
+              redirect_uri: form.elements.redirect_uri.value.trim() || null,
+            }),
+          });
+          closeOverlay(modal);
+          toast("Charles Schwab OAuth2 completed & positions ready to sync.");
+          await loadPortfolio();
+          await refreshAll();
+        } catch (err) {
+          toast(err.message || "Could not complete Schwab OAuth exchange.", true);
+        }
+      });
+    });
+
+    body.replaceChildren(form, statusOut, completeForm);
   }
 
   openOverlay(modal);
 }
 
 /* ============================================================================
-   PART B: CREDIT & DEBT + HONEST 5-FACTOR SIMULATOR + CHASE 5/24
+   PART B: CREDIT & DEBT + FACTOR ANALYSIS + CHASE 5/24
    ============================================================================ */
 
 export async function loadCreditReport() {
@@ -674,7 +761,7 @@ function renderCreditReport(rep) {
   const tierLabels = {
     zero_inactivity_penalty: ["0% All-Zero Penalty", "pill-watch"],
     zero: ["0% Util", "pill-soft"],
-    optimal_800_tier: ["800+ Optimal (<9%)", "pill-calm"],
+    optimal_800_tier: ["Optimal (<9%)", "pill-calm"],
     good: ["Good (<29%)", "pill-blue"],
     score_drag: ["Score Drag (29-48%)", "pill-watch"],
     high_drag: ["High Drag (49-88%)", "pill-danger"],
@@ -690,7 +777,7 @@ function renderCreditReport(rep) {
   // Imported Actual Bureau Score (NEVER fabricated!)
   const reports = Array.isArray(rep.credit_reports) && rep.credit_reports.length
     ? rep.credit_reports
-    : (rep.factor_simulator && rep.factor_simulator.latest_actual_scores) || [];
+    : (rep.factor_analysis && rep.factor_analysis.latest_actual_scores) || [];
   const latestScore = reports.length ? reports[0] : null;
   const scoreEl = $("cred-bureau-score");
   const scoreMeta = $("cred-bureau-meta");
@@ -731,32 +818,30 @@ function renderCreditReport(rep) {
   const burnEl = $("cred-interest-burn");
   if (burnEl) burnEl.textContent = `${fmtMoney(rep.monthly_interest_burn_cents || 0)}/mo interest burn`;
 
-  // 2. Honest 5-Factor Simulator
-  renderFactorSimulator(rep);
+  // 2. Credit Factor Analysis
+  renderFactorAnalysis(rep);
 
   // 3. Chase 5/24 Velocity + Inquiries + Derogatories
   renderVelocityAndDropOffs(rep);
 
-  // 4. Alerts, AZEO, 4 Strategies, Credit Lines
+  // 4. Alerts, AZEO, Debt Payoff Strategies, Credit Lines
   renderCreditAlerts(rep.alerts || []);
   renderAzeoCalendar(rep.azeo_plan || []);
   renderDebtStrategies(rep.strategies || []);
   renderCreditLines(rep.credit_lines || []);
 }
 
-function renderFactorSimulator(rep) {
+function renderFactorAnalysis(rep) {
   const wrap = $("credit-factors-wrap");
-  const ctrlWrap = $("credit-sim-controls");
   if (!wrap) return;
 
-  const sim = rep.factor_simulator || {};
-  const disclaimer =
-    sim.disclaimer ||
-    "Directional factor simulator only — not an official FICO or VantageScore calculation.";
+  const factorData = rep.factor_analysis || {};
+  const factorSummaryNote =
+    "Weighted factor breakdown from your tracked credit lines, inquiries, and history (not an official bureau score).";
   const factors =
     portState.factorModel === "vantage3"
-      ? sim.vantage3_factors || []
-      : sim.fico8_factors || [];
+      ? factorData.vantage3_factors || []
+      : factorData.fico8_factors || [];
 
   const switcher = el("div", { class: "segmented segmented-sm", role: "group", "aria-label": "Scoring factor model" }, [
     el("button", {
@@ -776,7 +861,7 @@ function renderFactorSimulator(rep) {
     const btn = ev.target.closest("button[data-factor-model]");
     if (!btn) return;
     portState.factorModel = btn.dataset.factorModel;
-    renderFactorSimulator(rep);
+    renderFactorAnalysis(rep);
   });
 
   const statusMeta = {
@@ -796,8 +881,8 @@ function renderFactorSimulator(rep) {
               el("span", { class: "pill pill-soft", text: `${f.weight_pct}% WEIGHT` }),
             ]),
             el("span", { class: "row-gap", style: { gap: "6px" } }, [
-              f.estimated_delta_range
-                ? el("span", { class: "muted small tabular-nums", text: f.estimated_delta_range })
+              f.guidance
+                ? el("span", { class: "muted small tabular-nums", text: f.guidance })
                 : null,
               el("span", { class: `pill ${sm.cls}`, text: String(f.status || "fair").toUpperCase() }),
             ]),
@@ -815,92 +900,10 @@ function renderFactorSimulator(rep) {
 
   wrap.replaceChildren(
     el("div", { class: "item-row" }, [
-      el("span", { class: "muted small", text: disclaimer }),
+      el("span", { class: "muted small", text: factorSummaryNote }),
       switcher,
     ]),
     ...factorRows
-  );
-
-  // Interactive Utilization Paydown What-If + Server Simulated Action Deltas
-  if (!ctrlWrap) return;
-  const revBal = Number(rep.total_revolving_balance_cents || 0);
-  const revLim = Number(rep.total_revolving_limit_cents || 0);
-  const simActions = Array.isArray(sim.simulated_actions) ? sim.simulated_actions : [];
-
-  const maxPay = Math.max(500, Math.ceil(revBal / 100));
-  const sliderVal = Math.min(maxPay, portState.simPaydownDollars);
-  const simNewBal = Math.max(0, revBal - sliderVal * 100);
-  const simUtilPct = revLim > 0 ? (simNewBal / revLim) * 100 : 0;
-  const origUtilPct = Number(rep.aggregate_utilization_pct || 0);
-
-  const utilCliffTier = (u) => {
-    if (u <= 0) return 0;
-    if (u < 9) return 1;
-    if (u < 29) return 2;
-    if (u < 49) return 3;
-    if (u < 69) return 4;
-    if (u < 89) return 5;
-    return 6;
-  };
-  const cliffsCrossed = Math.max(0, utilCliffTier(origUtilPct) - utilCliffTier(simUtilPct));
-  const dirLabel =
-    sliderVal <= 0
-      ? "Slide to simulate a pre-statement-close paydown"
-      : cliffsCrossed > 0
-      ? `Crosses ${cliffsCrossed} utilization cliff${cliffsCrossed === 1 ? "" : "s"} (${origUtilPct.toFixed(1)}% -> ${simUtilPct.toFixed(1)}%): est. +${cliffsCrossed * 10} to +${cliffsCrossed * 22} pts directional`
-      : `Utilization shifts ${origUtilPct.toFixed(1)}% -> ${simUtilPct.toFixed(1)}% (marginal directional lift)`;
-
-  const slider = el("input", {
-    type: "range",
-    min: "0",
-    max: String(maxPay),
-    step: "25",
-    value: String(sliderVal),
-    "aria-label": "Simulate pre-statement paydown amount",
-  });
-  const sliderReadout = el("span", { class: "pill pill-blue", text: `Paydown: $${sliderVal.toLocaleString()}` });
-  const simImpactNote = el("div", { class: "micro-step", text: dirLabel });
-
-  slider.addEventListener("input", () => {
-    portState.simPaydownDollars = Number(slider.value) || 0;
-    const nextBal = Math.max(0, revBal - portState.simPaydownDollars * 100);
-    const nextUtil = revLim > 0 ? (nextBal / revLim) * 100 : 0;
-    const crossed = Math.max(0, utilCliffTier(origUtilPct) - utilCliffTier(nextUtil));
-    sliderReadout.textContent = `Paydown: $${portState.simPaydownDollars.toLocaleString()}`;
-    simImpactNote.textContent =
-      portState.simPaydownDollars <= 0
-        ? "Slide to simulate a pre-statement-close paydown"
-        : crossed > 0
-        ? `Crosses ${crossed} utilization cliff${crossed === 1 ? "" : "s"} (${origUtilPct.toFixed(1)}% -> ${nextUtil.toFixed(1)}%): est. +${crossed * 10} to +${crossed * 22} pts directional`
-        : `Utilization shifts ${origUtilPct.toFixed(1)}% -> ${nextUtil.toFixed(1)}% (marginal directional lift)`;
-  });
-
-  const actionCards = simActions.map((a) => {
-    const signMin = a.delta_min_pts >= 0 ? "+" : "";
-    const signMax = a.delta_max_pts >= 0 ? "+" : "";
-    const isPos = a.delta_max_pts >= 0;
-    return el("div", { class: "item-box" }, [
-      el("div", { class: "item-row" }, [
-        el("strong", { text: a.action }),
-        el("span", {
-          class: `pill ${isPos ? "pill-calm" : "pill-danger"}`,
-          text: `${signMin}${a.delta_min_pts} to ${signMax}${a.delta_max_pts} pts`,
-        }),
-      ]),
-      el("div", { class: "small muted", text: a.explanation }),
-    ]);
-  });
-
-  ctrlWrap.replaceChildren(
-    el("div", { class: "subpanel stack-xs" }, [
-      el("div", { class: "item-row" }, [
-        el("span", { class: "eyebrow", style: { marginBottom: "0" }, text: "LIVE UTILIZATION CLIFF SIMULATOR" }),
-        sliderReadout,
-      ]),
-      slider,
-      simImpactNote,
-    ]),
-    ...actionCards
   );
 }
 
@@ -1503,6 +1506,7 @@ function renderCreditApis(data) {
 
   list.replaceChildren(
     ...conns.map((c) => {
+      const needsReauth = c.status === "needs_reauth";
       const statusCls =
         c.status === "active"
           ? "pill-calm"
@@ -1512,6 +1516,8 @@ function renderCreditApis(data) {
       const statusLabel =
         c.status === "paused_locked"
           ? "VAULT LOCKED"
+          : needsReauth
+          ? "RECONNECT REQUIRED"
           : String(c.status || "active").replace(/_/g, " ").toUpperCase();
 
       const testBtn = el("button", { type: "button", class: "btn btn-ghost btn-xs", text: "Test" });
@@ -1554,6 +1560,7 @@ function renderCreditApis(data) {
           } catch (err) {
             setCreditApiStatus(err.message || "Credit Score API sync failed.", true);
             toast(err.message || "Credit Score API sync failed.", true);
+            await loadCreditApis();
           }
         })
       );
@@ -1576,10 +1583,8 @@ function renderCreditApis(data) {
         })
       );
 
-      const metaParts = [
-        `Vendor: ${String(c.vendor || "").toUpperCase()}`,
-        `Env: ${String(c.env || "sandbox").toUpperCase()}`,
-      ];
+      const metaParts = [`Vendor: ${String(c.vendor || "").toUpperCase()}`];
+      if (c.env && c.env !== "production") metaParts.push("TEST ENV (ISOLATED)");
       if (c.api_key_masked) metaParts.push(`Key: ${c.api_key_masked}`);
       if (c.user_id) metaParts.push(`User: ${c.user_id}`);
       if (c.vendor === "crs" && c.bureau) metaParts.push(`Bureau: ${String(c.bureau).toUpperCase()}`);
@@ -1597,6 +1602,7 @@ function renderCreditApis(data) {
               el("span", { class: `pill ${statusCls}`, text: statusLabel }),
             ]),
             el("div", { class: "muted small tabular-nums", text: metaParts.join(" · ") }),
+            c.last_error ? el("div", { class: "small error-text", text: c.last_error }) : null,
           ]),
           el("div", { class: "row-gap wrap" }, [testBtn, syncBtn, delBtn]),
         ]),
@@ -1847,7 +1853,7 @@ export function initPortfolioAndCredit() {
           const vendor = $("capi-vendor").value;
           const payload = {
             vendor,
-            env: $("capi-env").value || "sandbox",
+            env: "production",
             label: ($("capi-label") && $("capi-label").value.trim()) || "",
             api_key: ($("capi-api-key") && $("capi-api-key").value.trim()) || null,
             user_id: ($("capi-user-id") && $("capi-user-id").value.trim()) || null,
@@ -1933,15 +1939,18 @@ export function initPortfolioAndCredit() {
       const btn = btForm.querySelector("button[type=submit]");
       await withBusy(btn, async () => {
         try {
+          const postAprRaw = $("bt-post-apr") && $("bt-post-apr").value.trim();
+          const payload = {
+            balance_cents: dollarsToCents($("bt-balance").value),
+            current_apr_bps: Math.round((Number($("bt-apr").value) || 0) * 100),
+            transfer_fee_bps: Math.round((Number($("bt-fee").value) || 0) * 100),
+            promo_months: parseInt($("bt-months").value, 10) || 15,
+            monthly_payment_cents: dollarsToCents($("bt-pay").value),
+            post_promo_apr_bps: postAprRaw ? Math.round((Number(postAprRaw) || 0) * 100) : null,
+          };
           const res = await api("/api/v1/credit/balance-transfer", {
             method: "POST",
-            body: JSON.stringify({
-              balance_cents: dollarsToCents($("bt-balance").value),
-              current_apr_bps: Math.round((Number($("bt-apr").value) || 0) * 100),
-              transfer_fee_bps: Math.round((Number($("bt-fee").value) || 0) * 100),
-              promo_months: parseInt($("bt-months").value, 10) || 15,
-              monthly_payment_cents: dollarsToCents($("bt-pay").value),
-            }),
+            body: JSON.stringify(payload),
           });
           const box = $("bt-result");
           if (box) {
@@ -1953,7 +1962,12 @@ export function initPortfolioAndCredit() {
               el("p", { text: res.explanation, style: { margin: "8px 0 4px" } }),
               el("div", {
                 class: "muted small tabular-nums",
-                text: `Fee ${fmtMoney(res.transfer_fee_cents)} · Required to beat promo cliff: ${fmtMoney(res.required_monthly_to_clear_promo_cents)}/mo`,
+                text:
+                  `Fee ${fmtMoney(res.transfer_fee_cents)} · ` +
+                  `Required to clear before promo ends: ${fmtMoney(res.required_monthly_to_clear_promo_cents)}/mo` +
+                  (res.post_promo_apr_bps != null
+                    ? ` · Post-promo APR: ${(Number(res.post_promo_apr_bps) / 100).toFixed(2)}%`
+                    : ""),
               })
             );
           }

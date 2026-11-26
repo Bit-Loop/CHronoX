@@ -1,8 +1,8 @@
 /**
- * ChronoX Finance — Interactive Draggable Cashflow, Net Worth & What-If Timeline (ES Module)
+ * ChronoX Finance — Interactive Draggable Cashflow, Net Worth & Scenario Timeline (ES Module)
  * Pure zero-CDN SVG + Pointer Events direct manipulation:
  * - Zoom controls (30D | 90D | 1Y | 2Y) & Cashflow Runway / Total Net Worth toggle
- * - Non-destructive named What-If Scenarios comparing Live Baseline (dashed steel) vs Scenario Plan
+ * - Non-destructive named Forecast Scenarios comparing Live Baseline (dashed steel) vs Scenario Plan
  * - Crimson Safe-Runway Floor Band & live delta/nadir/ending KPIs
  * - Draggable diamond/chevron Goal Markers bending the projected curve in real time using
  *   server-provided `per_goal_series` (zero duplicated backend math!), committing via debounced
@@ -42,6 +42,7 @@ const ZOOM_DAYS = {
 const tlState = {
   mode: "cashflow", // "cashflow" | "net_worth"
   zoom: "90d",
+  reqSeq: 0,
   scenarios: [],
   activeScenarioId: null,
   adHocOverrides: {
@@ -56,6 +57,7 @@ const tlState = {
   scrubIdx: null,
   drag: null,
   commitTimer: null,
+  pendingShiftOrigins: {},
 };
 
 function parseIsoDay(iso) {
@@ -173,11 +175,13 @@ export async function loadScenarios() {
 export async function loadTimelineData() {
   if (state.vaultStatus !== "unlocked") return;
   syncModeAndZoomUI();
+  const reqSeq = ++tlState.reqSeq;
   const days = ZOOM_DAYS[tlState.zoom] || 90;
 
   if (tlState.mode === "net_worth") {
     try {
       const res = await api(`/api/v1/analytics/net-worth?days=${days}`);
+      if (reqSeq !== tlState.reqSeq) return;
       const pts = Array.isArray(res)
         ? res
         : Array.isArray(res && res.points)
@@ -190,6 +194,7 @@ export async function loadTimelineData() {
       tlState.netWorthSeries = pts;
       renderNetWorthTimeline(pts);
     } catch (err) {
+      if (reqSeq !== tlState.reqSeq) return;
       const fallback = (state.analytics && state.analytics.net_worth_series) || [];
       if (fallback.length) {
         tlState.netWorthSeries = fallback;
@@ -201,7 +206,7 @@ export async function loadTimelineData() {
     return;
   }
 
-  // Cashflow What-If simulation + Marginal-ROI forecast
+  // Cashflow scenario projection + Marginal-ROI forecast
   try {
     const payload = {
       horizon_days: days,
@@ -215,6 +220,7 @@ export async function loadTimelineData() {
       }),
       api(`/api/v1/quant/forecast?days=${Math.min(60, Math.max(30, days))}`).catch(() => null),
     ]);
+    if (reqSeq !== tlState.reqSeq) return;
     tlState.simResult = simRes;
     if (quantRes) {
       tlState.quantForecast = quantRes;
@@ -230,7 +236,8 @@ export async function loadTimelineData() {
     }
     renderCashflowTimeline(simRes);
   } catch (err) {
-    renderTimelineEmpty(err && err.message ? err.message : "Could not simulate cashflow timeline.");
+    if (reqSeq !== tlState.reqSeq) return;
+    renderTimelineEmpty(err && err.message ? err.message : "Could not project cashflow timeline.");
   }
 }
 
@@ -404,7 +411,7 @@ function renderCashflowTimeline(sim) {
   const basePts = Array.isArray(sim.baseline_points) ? sim.baseline_points : [];
   const scenPts = Array.isArray(sim.scenario_points) && sim.scenario_points.length ? sim.scenario_points : basePts;
   if (!basePts.length) {
-    renderTimelineEmpty("Add accounts, bills, or goals to simulate your forward cashflow timeline.");
+    renderTimelineEmpty("Add accounts, bills, or goals to project your forward cashflow timeline.");
     return;
   }
 
@@ -460,16 +467,20 @@ function renderCashflowTimeline(sim) {
 
   const liveNadir = Math.min(...liveBalances);
   const scenStrokeColor =
-    liveNadir < 0 ? "#ef4444" : liveNadir < floorCents ? "#f59e0b" : "#10b981";
+    liveNadir < 0
+      ? "var(--chart-def-stroke)"
+      : liveNadir < floorCents
+      ? "var(--chart-exp-stroke)"
+      : "var(--chart-inc-stroke)";
 
   const defs = svgEl("defs", {}, [
     svgEl("linearGradient", { id: "tlAreaGrad", x1: "0", y1: "0", x2: "0", y2: "1" }, [
-      svgEl("stop", { offset: "0%", "stop-color": "#10b981", "stop-opacity": "0.26" }),
-      svgEl("stop", { offset: "100%", "stop-color": "#10b981", "stop-opacity": "0.01" }),
+      svgEl("stop", { offset: "0%", "stop-color": "var(--chart-inc-stroke)", "stop-opacity": "0.26" }),
+      svgEl("stop", { offset: "100%", "stop-color": "var(--chart-inc-stroke)", "stop-opacity": "0.01" }),
     ]),
     svgEl("linearGradient", { id: "tlFloorGrad", x1: "0", y1: "0", x2: "0", y2: "1" }, [
-      svgEl("stop", { offset: "0%", "stop-color": "#ef4444", "stop-opacity": "0.18" }),
-      svgEl("stop", { offset: "100%", "stop-color": "#ef4444", "stop-opacity": "0.05" }),
+      svgEl("stop", { offset: "0%", "stop-color": "var(--chart-def-stroke)", "stop-opacity": "0.18" }),
+      svgEl("stop", { offset: "100%", "stop-color": "var(--chart-def-stroke)", "stop-opacity": "0.05" }),
     ]),
   ]);
 
@@ -539,7 +550,7 @@ function renderCashflowTimeline(sim) {
         y1: floorY.toFixed(1),
         x2: W - padR,
         y2: floorY.toFixed(1),
-        stroke: "#ef4444",
+        stroke: "var(--chart-def-stroke)",
         "stroke-width": "1.2",
         "stroke-dasharray": "5 3",
       })
@@ -548,7 +559,7 @@ function renderCashflowTimeline(sim) {
       svgEl("text", {
         x: W - padR - 4,
         y: (floorY - 5).toFixed(1),
-        fill: "#ef4444",
+        fill: "var(--chart-def-text)",
         "font-family": "var(--font-mono)",
         "font-size": "9.5",
         "font-weight": "700",
@@ -614,7 +625,7 @@ function renderCashflowTimeline(sim) {
           makeIcon("target", "ui-icon-sm"),
           dragBanner,
         ]),
-        el("span", { class: "muted small", text: "Release pointer to commit authoritative server simulation" })
+        el("span", { class: "muted small", text: "Release pointer to commit authoritative server projection" })
       );
       return;
     }
@@ -650,10 +661,16 @@ function renderCashflowTimeline(sim) {
   const snapStepDays = tlState.zoom === "30d" ? 1 : tlState.zoom === "2y" ? 30 : 7;
 
   const commitGoalShift = (goalSeries, prevTargetIso, newTargetIso) => {
+    const gKey = String(goalSeries.goal_id);
+    if (!(gKey in tlState.pendingShiftOrigins)) {
+      tlState.pendingShiftOrigins[gKey] = prevTargetIso;
+    }
     if (tlState.commitTimer) clearTimeout(tlState.commitTimer);
     tlState.commitTimer = setTimeout(async () => {
+      const originTargetIso = tlState.pendingShiftOrigins[gKey];
+      delete tlState.pendingShiftOrigins[gKey];
       const scen = getActiveScenario();
-      tlState.adHocOverrides.goal_date_shifts[String(goalSeries.goal_id)] = newTargetIso;
+      tlState.adHocOverrides.goal_date_shifts[gKey] = newTargetIso;
 
       if (!scen) {
         // Live baseline drag: persist target_date to live goal with 8s Undo toast + authoritative sim
@@ -662,16 +679,24 @@ function renderCashflowTimeline(sim) {
             method: "PATCH",
             body: JSON.stringify({ target_date: newTargetIso }),
           });
-          delete tlState.adHocOverrides.goal_date_shifts[String(goalSeries.goal_id)];
+          if (Array.isArray(state.dashboard && state.dashboard.goals)) {
+            const gObj = state.dashboard.goals.find((g) => Number(g.id) === Number(goalSeries.goal_id));
+            if (gObj) gObj.target_date = newTargetIso;
+          }
+          delete tlState.adHocOverrides.goal_date_shifts[gKey];
           toast(`Moved "${goalSeries.goal_name}" target date to ${newTargetIso}`, {
             durationMs: 8000,
             undoLabel: "Undo Shift",
             onUndo: async () => {
               await api(`/api/v1/goals/${goalSeries.goal_id}`, {
                 method: "PATCH",
-                body: JSON.stringify({ target_date: prevTargetIso }),
+                body: JSON.stringify({ target_date: originTargetIso }),
               });
-              toast(`Restored "${goalSeries.goal_name}" to ${prevTargetIso}`);
+              if (Array.isArray(state.dashboard && state.dashboard.goals)) {
+                const gObj = state.dashboard.goals.find((g) => Number(g.id) === Number(goalSeries.goal_id));
+                if (gObj) gObj.target_date = originTargetIso;
+              }
+              toast(`Restored "${goalSeries.goal_name}" to ${originTargetIso || "flexible timeline"}`);
               await loadTimelineData();
               await refreshAll();
             },
@@ -680,11 +705,11 @@ function renderCashflowTimeline(sim) {
           toast(err.message || "Could not update goal target date.", true);
         }
       } else {
-        toast(`What-If "${scen.name}": "${goalSeries.goal_name}" shifted to ${newTargetIso}`, {
+        toast(`Scenario "${scen.name}": "${goalSeries.goal_name}" shifted to ${newTargetIso}`, {
           durationMs: 8000,
           undoLabel: "Reset Shift",
           onUndo: async () => {
-            delete tlState.adHocOverrides.goal_date_shifts[String(goalSeries.goal_id)];
+            delete tlState.adHocOverrides.goal_date_shifts[gKey];
             await loadTimelineData();
           },
         });
@@ -712,6 +737,10 @@ function renderCashflowTimeline(sim) {
   );
 
   goals.forEach((gs, gIdx) => {
+    const liveGoal = Array.isArray(state.dashboard && state.dashboard.goals)
+      ? state.dashboard.goals.find((g) => Number(g.id) === Number(gs.goal_id))
+      : null;
+    const origServerTarget = liveGoal ? (liveGoal.target_date ?? null) : (gs.target_date ?? null);
     const origTarget = gs.target_date || addDaysIso(startIso, Math.min(totalDays, 90));
     const initialX = xForDate(origTarget);
     const labelY = gIdx % 2 === 1 ? railY + 33 : railY + 19;
@@ -720,7 +749,7 @@ function renderCashflowTimeline(sim) {
       y1: padT,
       x2: initialX.toFixed(1),
       y2: railY.toFixed(1),
-      stroke: "#06b6d4",
+      stroke: "var(--chart-sur-stroke)",
       "stroke-width": "1",
       "stroke-dasharray": "3 3",
       opacity: "0.55",
@@ -729,9 +758,18 @@ function renderCashflowTimeline(sim) {
     const diamondPts = (cx, cy, r = 8) =>
       `${cx.toFixed(1)},${(cy - r).toFixed(1)} ${(cx + r).toFixed(1)},${cy.toFixed(1)} ${cx.toFixed(1)},${(cy + r).toFixed(1)} ${(cx - r).toFixed(1)},${cy.toFixed(1)}`;
 
+    const hitCircle = svgEl("circle", {
+      class: "timeline-marker-hit",
+      cx: initialX.toFixed(1),
+      cy: railY.toFixed(1),
+      r: "28",
+      fill: "transparent",
+      "pointer-events": "all",
+    });
+
     const diamond = svgEl("polygon", {
       points: diamondPts(initialX, railY, 8),
-      fill: "#06b6d4",
+      fill: "var(--chart-sur-stroke)",
       stroke: "var(--bg)",
       "stroke-width": "1.6",
     });
@@ -740,7 +778,7 @@ function renderCashflowTimeline(sim) {
     const lblText = svgEl("text", {
       x: initialX.toFixed(1),
       y: labelY.toFixed(1),
-      fill: "#06b6d4",
+      fill: "var(--chart-sur-text)",
       "font-family": "var(--font-mono)",
       "font-size": "9.5",
       "font-weight": "700",
@@ -757,7 +795,7 @@ function renderCashflowTimeline(sim) {
         "aria-label": `Drag ${gs.goal_name} target date (currently ${origTarget}). Use Left/Right arrows to shift.`,
         "aria-valuetext": origTarget,
       },
-      [guideLine, diamond, lblText]
+      [guideLine, hitCircle, diamond, lblText]
     );
 
     let currentTargetIso = origTarget;
@@ -767,6 +805,7 @@ function renderCashflowTimeline(sim) {
       const nx = xForDate(nextIso);
       guideLine.setAttribute("x1", nx.toFixed(1));
       guideLine.setAttribute("x2", nx.toFixed(1));
+      hitCircle.setAttribute("cx", nx.toFixed(1));
       diamond.setAttribute("points", diamondPts(nx, railY, liveMode ? 10 : 8));
       lblText.setAttribute("x", nx.toFixed(1));
       lblText.setAttribute("text-anchor", goalLabelAnchor(nx));
@@ -778,7 +817,12 @@ function renderCashflowTimeline(sim) {
       const nextD = buildPath(liveBalances);
       const nextAreaD = `${nextD} L${xForIdx(liveBalances.length - 1).toFixed(1)},${baselineY.toFixed(1)} L${xForIdx(0).toFixed(1)},${baselineY.toFixed(1)} Z`;
       const nextNadir = Math.min(...liveBalances);
-      const nextColor = nextNadir < 0 ? "#ef4444" : nextNadir < floorCents ? "#f59e0b" : "#06b6d4";
+      const nextColor =
+        nextNadir < 0
+          ? "var(--chart-def-stroke)"
+          : nextNadir < floorCents
+          ? "var(--chart-exp-stroke)"
+          : "var(--chart-sur-stroke)";
       scenLinePath.setAttribute("d", nextD);
       scenLinePath.setAttribute("stroke", nextColor);
       scenAreaPath.setAttribute("d", nextAreaD);
@@ -790,15 +834,7 @@ function renderCashflowTimeline(sim) {
       }
     };
 
-    handleG.addEventListener("pointerdown", (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      handleG.setPointerCapture(ev.pointerId);
-      handleG.classList.add("is-dragging");
-      tlState.drag = { goalId: gs.goal_id, origTarget, pointerId: ev.pointerId };
-    });
-
-    handleG.addEventListener("pointermove", (ev) => {
+    const onDragMove = (ev) => {
       if (!tlState.drag || tlState.drag.goalId !== gs.goal_id) return;
       const svgRect = svg.getBoundingClientRect();
       if (!svgRect.width) return;
@@ -810,28 +846,52 @@ function renderCashflowTimeline(sim) {
       if (nextIso !== currentTargetIso) {
         applyLiveDragDate(nextIso, true);
       }
-    });
+    };
 
     const endDrag = (ev) => {
       if (!tlState.drag || tlState.drag.goalId !== gs.goal_id) return;
+      window.removeEventListener("pointermove", onDragMove);
+      window.removeEventListener("pointerup", endDrag);
+      window.removeEventListener("pointercancel", endDrag);
+      const capEl = tlState.drag.captureEl || handleG;
       try {
-        handleG.releasePointerCapture(ev.pointerId);
+        capEl.releasePointerCapture(ev.pointerId);
       } catch (_e) {
         // ignore
       }
       handleG.classList.remove("is-dragging");
-      const prevTarget = tlState.drag.origTarget;
+      const prevDisplayTarget = tlState.drag.origTarget;
+      const prevServerTarget = tlState.drag.origServerTarget;
       tlState.drag = null;
       diamond.setAttribute("points", diamondPts(xForDate(currentTargetIso), railY, 8));
-      if (currentTargetIso !== prevTarget) {
-        commitGoalShift(gs, prevTarget, currentTargetIso);
+      if (currentTargetIso !== prevDisplayTarget) {
+        commitGoalShift(gs, prevServerTarget, currentTargetIso);
       } else {
         updateScrub(tlState.scrubIdx ?? initIdx);
       }
     };
 
-    handleG.addEventListener("pointerup", endDrag);
-    handleG.addEventListener("pointercancel", endDrag);
+    handleG.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const capEl = ev.target && typeof ev.target.setPointerCapture === "function" ? ev.target : handleG;
+      try {
+        capEl.setPointerCapture(ev.pointerId);
+      } catch (_e) {
+        // Synthetic pointer events without an active OS pointer id skip capture safely
+      }
+      handleG.classList.add("is-dragging");
+      tlState.drag = {
+        goalId: gs.goal_id,
+        origTarget,
+        origServerTarget,
+        pointerId: ev.pointerId,
+        captureEl: capEl,
+      };
+      window.addEventListener("pointermove", onDragMove);
+      window.addEventListener("pointerup", endDrag);
+      window.addEventListener("pointercancel", endDrag);
+    });
 
     // Keyboard A11y: ArrowLeft / ArrowRight shifts target date by +/- 7d (or 30d with Shift)
     handleG.addEventListener("keydown", (ev) => {
@@ -843,7 +903,7 @@ function renderCashflowTimeline(sim) {
       const nextIso = addDaysIso(startIso, nextDayOffset);
       if (nextIso !== prev) {
         applyLiveDragDate(nextIso, true);
-        commitGoalShift(gs, prev, nextIso);
+        commitGoalShift(gs, origServerTarget, nextIso);
       }
     });
 
@@ -855,7 +915,7 @@ function renderCashflowTimeline(sim) {
     {
       viewBox: `0 0 ${W} ${H}`,
       role: "img",
-      "aria-label": "Interactive Cashflow and What-If Timeline with draggable goal markers",
+      "aria-label": "Interactive cashflow and scenario forecast chart with draggable goal markers",
     },
     [defs, ...gridNodes, ...floorNodes, scenAreaPath, baseLinePath, scenLinePath, crosshair, activeDot, markerGroup]
   );
@@ -921,8 +981,8 @@ function renderNetWorthTimeline(pts) {
 
   const defs = svgEl("defs", {}, [
     svgEl("linearGradient", { id: "nwAreaGrad", x1: "0", y1: "0", x2: "0", y2: "1" }, [
-      svgEl("stop", { offset: "0%", "stop-color": "#06b6d4", "stop-opacity": "0.28" }),
-      svgEl("stop", { offset: "100%", "stop-color": "#06b6d4", "stop-opacity": "0.02" }),
+      svgEl("stop", { offset: "0%", "stop-color": "var(--chart-sur-stroke)", "stop-opacity": "0.28" }),
+      svgEl("stop", { offset: "100%", "stop-color": "var(--chart-sur-stroke)", "stop-opacity": "0.02" }),
     ]),
   ]);
 
@@ -989,7 +1049,7 @@ function renderNetWorthTimeline(pts) {
     cx: xFor(initIdx).toFixed(1),
     cy: yFor(Number(pts[initIdx].net_worth_cents || 0)).toFixed(1),
     r: "5",
-    fill: "#06b6d4",
+    fill: "var(--chart-sur-stroke)",
     stroke: "var(--bg)",
     "stroke-width": "1.6",
   });
@@ -1006,10 +1066,10 @@ function renderNetWorthTimeline(pts) {
       scrubBar.replaceChildren(
         el("span", { class: "row-gap wrap", style: { gap: "12px" } }, [
           el("strong", { text: fmtDayDate(p.date) }),
-          el("span", { style: { color: "#06b6d4", fontWeight: "800" }, text: `Net Worth ${fmtMoney(p.net_worth_cents)}` }),
-          el("span", { style: { color: "#10b981" }, text: `Liquid ${fmtMoneyCompact(p.liquid_cents)}` }),
-          el("span", { style: { color: "#3b82f6" }, text: `Invest ${fmtMoneyCompact(p.investment_cents)}` }),
-          el("span", { style: { color: "#ef4444" }, text: `Debt ${fmtMoneyCompact(p.debt_cents)}` }),
+          el("span", { style: { color: "var(--chart-sur-text)", fontWeight: "800" }, text: `Net Worth ${fmtMoney(p.net_worth_cents)}` }),
+          el("span", { style: { color: "var(--chart-inc-text)", fontWeight: "700" }, text: `Liquid ${fmtMoneyCompact(p.liquid_cents)}` }),
+          el("span", { style: { color: "var(--chart-inv-text)", fontWeight: "700" }, text: `Invest ${fmtMoneyCompact(p.investment_cents)}` }),
+          el("span", { style: { color: "var(--chart-def-text)", fontWeight: "700" }, text: `Debt ${fmtMoneyCompact(p.debt_cents)}` }),
         ]),
         el("span", { class: "muted small", text: "Assets + Investments - Debt" })
       );
@@ -1023,10 +1083,10 @@ function renderNetWorthTimeline(pts) {
       defs,
       ...gridNodes,
       svgEl("path", { d: nwArea, fill: "url(#nwAreaGrad)" }),
-      svgEl("path", { d: pathFor("liquid_cents"), fill: "none", stroke: "#10b981", "stroke-width": "1.6" }),
-      svgEl("path", { d: pathFor("investment_cents"), fill: "none", stroke: "#3b82f6", "stroke-width": "1.6" }),
-      svgEl("path", { d: pathFor("debt_cents"), fill: "none", stroke: "#ef4444", "stroke-width": "1.5", "stroke-dasharray": "5 3" }),
-      svgEl("path", { d: nwPath, fill: "none", stroke: "#06b6d4", "stroke-width": "2.6" }),
+      svgEl("path", { d: pathFor("liquid_cents"), fill: "none", stroke: "var(--chart-inc-stroke)", "stroke-width": "1.6" }),
+      svgEl("path", { d: pathFor("investment_cents"), fill: "none", stroke: "var(--chart-inv-stroke)", "stroke-width": "1.6", "stroke-dasharray": "2.5 2.5" }),
+      svgEl("path", { d: pathFor("debt_cents"), fill: "none", stroke: "var(--chart-def-stroke)", "stroke-width": "1.5", "stroke-dasharray": "5 3" }),
+      svgEl("path", { d: nwPath, fill: "none", stroke: "var(--chart-sur-stroke)", "stroke-width": "2.6" }),
       crosshair,
       dot,
     ]
@@ -1197,7 +1257,7 @@ export function initTimeline() {
           tlState.adHocOverrides.goal_date_shifts = {};
           await loadScenarios();
           await loadTimelineData();
-          toast(`Created What-If scenario "${name}".`);
+          toast(`Created scenario "${name}".`);
         } catch (err) {
           toast(err.message || "Could not create scenario.", true);
         }
@@ -1216,7 +1276,7 @@ export function initTimeline() {
           tlState.adHocOverrides.goal_date_shifts = {};
           await loadScenarios();
           await loadTimelineData();
-          toast("Deleted What-If scenario.");
+          toast("Deleted scenario.");
         } catch (err) {
           toast(err.message || "Could not delete scenario.", true);
         }

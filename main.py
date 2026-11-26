@@ -45,9 +45,17 @@ class ChronoXOrchestrator:
     """
 
     def __init__(self, config_path: Optional[str] = None, init_trading_db: bool = False):
+        default_log_dir = PROJECT_ROOT / "logs"
+        try:
+            default_log_dir.mkdir(parents=True, exist_ok=True)
+            test_probe = default_log_dir / ".write_probe"
+            test_probe.write_text("", encoding="utf-8")
+            test_probe.unlink(missing_ok=True)
+        except OSError:
+            default_log_dir = Path.home() / ".chronox" / "logs"
         self.logger = setup_logging(
             name="ChronoX",
-            log_dir=PROJECT_ROOT / "logs",
+            log_dir=default_log_dir,
             level=logging.INFO,
         )
         self.config = ConfigManager(config_path)
@@ -244,8 +252,8 @@ def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--portfolio", action="store_true", help="Show Stocks & Crypto portfolio holdings")
     parser.add_argument("--usage", action="store_true", help="Show AI token usage, cache hit rate & verified savings")
     parser.add_argument("--days", type=int, default=30, help="Lookback/forecast horizon in days (default: 30)")
-    parser.add_argument("--credit", action="store_true", help="Show Credit Factor Simulator, Chase 5/24 & AZEO report")
-    parser.add_argument("--extra", type=float, default=250.0, help="Extra monthly dollars for --credit simulator")
+    parser.add_argument("--credit", action="store_true", help="Show Credit Factor Analysis, Chase 5/24 & AZEO debt plan")
+    parser.add_argument("--extra", type=float, default=250.0, help="Extra monthly dollars toward debt for --credit (default: 250)")
     parser.add_argument("--goal", nargs=2, metavar=("NAME", "PRICE"), help="Plan a credit-safe goal purchase")
 
     # Market data backfill options

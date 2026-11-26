@@ -298,6 +298,7 @@ class NormalizedAccount:
     balance_cents: int = 0
     available_cents: Optional[int] = None
     limit_cents: Optional[int] = None
+    credit_limit_cents: Optional[int] = None
     institution: str = ""
     official_name: str = ""
     mask: str = ""
@@ -305,6 +306,12 @@ class NormalizedAccount:
     currency: str = "USD"
     is_liquid: bool = True
     provider: str = ""
+
+    def __post_init__(self) -> None:
+        if self.credit_limit_cents is None and self.limit_cents is not None:
+            self.credit_limit_cents = self.limit_cents
+        elif self.limit_cents is None and self.credit_limit_cents is not None:
+            self.limit_cents = self.credit_limit_cents
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -318,6 +325,7 @@ class NormalizedTransaction:
     merchant: str
     amount_cents: int  # Always >= 0 integer cents; direction encoded in tx_type
     tx_type: str = "expense"  # expense | income | transfer
+    transfer_direction: str = ""  # out | in | ""
     memo: str = ""
     subcategory: str = ""
     pending: bool = False
@@ -363,6 +371,7 @@ class NormalizedHolding:
     quantity_e8: int = 0
     price_e8: int = 0
     cost_basis_cents: int = 0
+    cost_basis_known: Optional[bool] = None
     market_value_cents: int = 0
     external_account_id: str = ""
     currency: str = "USD"
@@ -373,6 +382,8 @@ class NormalizedHolding:
         self.symbol = (self.symbol or "").strip().upper()
         if self.market_value_cents == 0 and self.quantity_e8 != 0 and self.price_e8 != 0:
             self.market_value_cents = compute_market_value_cents(self.quantity_e8, self.price_e8)
+        if self.cost_basis_known is None:
+            self.cost_basis_known = bool(self.cost_basis_cents > 0 or self.asset_class == "cash")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -387,6 +398,7 @@ class NormalizedSyncResult:
     removed_external_ids: List[str] = field(default_factory=list)
     next_cursor: Optional[str] = None
     has_more: bool = False
+    transactions_update_status: str = ""
     warnings: List[str] = field(default_factory=list)
     synced_at: str = field(default_factory=utc_now_iso)
 

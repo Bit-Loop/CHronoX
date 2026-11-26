@@ -524,7 +524,7 @@
           <line x1="12" y1="20" x2="12" y2="4" />
           <line x1="6" y1="20" x2="6" y2="14" />
         </svg>
-        Analytics &amp; What-If
+        Analytics &amp; Forecast
       </button>
       <button id="tab-btn-portfolio" class="tab" data-tab="portfolio" role="tab" aria-selected="false" aria-controls="tab-portfolio">
         <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="square" aria-hidden="true">
@@ -679,7 +679,7 @@
               <button id="btn-open-reset-drawer" type="button" class="btn btn-soft btn-xs">
                 5-Min Reset <span id="badge-reset-triage" class="tab-badge hidden">0</span>
               </button>
-              <button type="button" class="btn btn-ghost btn-xs" data-goto-tab="analytics">What-If Timeline →</button>
+              <button type="button" class="btn btn-ghost btn-xs" data-goto-tab="analytics">Forecast Timeline →</button>
             </div>
           </div>
         </div>
@@ -725,7 +725,7 @@
     </main>
 
     <!-- =================================================================== -->
-    <!-- TAB 2: ANALYTICS & WHAT-IF (analytics — charts.js + timeline.js)    -->
+    <!-- TAB 2: ANALYTICS & FORECAST (analytics — charts.js + timeline.js)   -->
     <!-- =================================================================== -->
     <main id="tab-analytics" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-analytics">
       <!-- Unified Period / Zoom Control Bar -->
@@ -733,7 +733,7 @@
         <div class="section-head">
           <div>
             <span class="eyebrow">MONEYSTILL CASHFLOW TELEMETRY</span>
-            <h2>Analytics &amp; Interactive What-If Engine</h2>
+            <h2>Analytics &amp; Cashflow Forecast</h2>
           </div>
           <div class="row-gap wrap">
             <div id="analytics-period-switcher" class="segmented segmented-sm" role="group" aria-label="Analytics time period">
@@ -757,7 +757,7 @@
         <div class="section-head">
           <div>
             <h3>3-COLUMN CASHFLOW SANKEY</h3>
-            <span id="analytics-sankey-meta" class="muted small">Income Sources -> Total Income Hub -> Top Expenses, Others &amp; Savings/Invest</span>
+            <span id="analytics-sankey-meta" class="muted small">Income Sources -&gt; Cashflow Hub -&gt; Category Outflows, Verified Transfers &amp; Unallocated Surplus</span>
           </div>
           <div id="analytics-sankey-legend" class="row-gap wrap"></div>
         </div>
@@ -787,12 +787,12 @@
         </div>
       </section>
 
-      <!-- Interactive Draggable Cashflow, Net Worth & What-If Timeline (timeline.js) -->
+      <!-- Interactive Draggable Cashflow, Net Worth & Scenario Timeline (timeline.js) -->
       <section id="analytics-timeline-card" class="card section-block">
         <div class="section-head">
           <div>
             <span class="eyebrow">DIRECT MANIPULATION PROJECTION</span>
-            <h3>Interactive Cashflow, Net Worth &amp; What-If Timeline</h3>
+            <h3>Cashflow, Net Worth &amp; Scenario Forecast</h3>
             <p class="muted small">Drag goal markers horizontally along the X-axis to bend the projected balance curve in real time against your Safe-Runway floor.</p>
           </div>
           <div id="timeline-controls" class="row-gap wrap">
@@ -812,11 +812,11 @@
         <div class="row-gap wrap timeline-scenario-bar">
           <label class="field-inline">
             <span class="eyebrow">SCENARIO:</span>
-            <select id="timeline-scenario-select" aria-label="Active What-If scenario">
+            <select id="timeline-scenario-select" aria-label="Active forecast scenario">
               <option value="">Live Baseline (No Overrides)</option>
             </select>
           </label>
-          <button id="btn-timeline-new-scenario" type="button" class="btn btn-soft btn-xs">+ New What-If</button>
+          <button id="btn-timeline-new-scenario" type="button" class="btn btn-soft btn-xs">+ New Scenario</button>
           <button id="btn-timeline-delete-scenario" type="button" class="btn btn-ghost btn-xs hidden">Delete Scenario</button>
         </div>
 
@@ -826,7 +826,7 @@
             <input id="ts-monthly-delta" type="number" step="10" placeholder="Monthly delta ($; +/-)" value="0" />
             <input id="ts-oneoff-delta" type="number" step="10" placeholder="One-off expense/windfall ($)" value="0" />
             <input id="ts-oneoff-date" type="date" title="One-off event date" />
-            <button type="submit" class="btn btn-primary btn-sm">Save &amp; Simulate</button>
+            <button type="submit" class="btn btn-primary btn-sm">Save Scenario</button>
             <button id="btn-timeline-cancel-scenario" type="button" class="btn btn-ghost btn-sm">Cancel</button>
           </form>
         </div>
@@ -855,10 +855,10 @@
         </div>
 
         <div id="timeline-scrub-bar" class="quant-scrub-bar" aria-live="polite">
-          <span class="muted small">Hover timeline to inspect or drag any diamond goal marker to simulate target date shifts.</span>
+          <span class="muted small">Hover timeline to inspect or drag any diamond goal marker to project target date shifts.</span>
         </div>
 
-        <div id="timeline-svg-wrap" class="svg-stage svg-stage-timeline" aria-label="Interactive What-If timeline chart"></div>
+        <div id="timeline-svg-wrap" class="svg-stage svg-stage-timeline" aria-label="Interactive cashflow and scenario forecast chart"></div>
 
         <div class="quant-alloc-section">
           <div class="section-head">
@@ -1017,17 +1017,16 @@
         </div>
       </section>
 
-      <!-- Honest 5-Factor Credit Simulator + Chase 5/24 Velocity & Drop-Offs -->
-      <section id="credit-simulator-grid" class="two-col section-block">
+      <!-- Credit Factor Analysis + Chase 5/24 Velocity & Drop-Offs -->
+      <section id="credit-analysis-grid" class="two-col section-block">
         <div id="credit-factors-card" class="card">
           <div class="section-head">
             <div>
-              <h2>5-FACTOR CREDIT SIMULATOR</h2>
-              <span class="muted small">Directional FICO 8 / VantageScore 3.0 factor deltas &amp; ranges (not a fabricated bureau score)</span>
+              <h2>CREDIT FACTOR ANALYSIS</h2>
+              <span class="muted small">FICO 8 / VantageScore 3.0 factor breakdown &amp; utilization tiers (never a fabricated bureau score)</span>
             </div>
           </div>
           <div id="credit-factors-wrap" class="stack-sm"></div>
-          <div id="credit-sim-controls" class="stack-sm details-spacer"></div>
         </div>
 
         <div id="credit-velocity-card" class="card">
@@ -1141,13 +1140,6 @@
                 </select>
               </label>
               <label class="field">
-                <span>Environment</span>
-                <select id="capi-env">
-                  <option value="sandbox">Sandbox</option>
-                  <option value="production">Production</option>
-                </select>
-              </label>
-              <label class="field">
                 <span>Display Label (optional)</span>
                 <input id="capi-label" type="text" placeholder="e.g. Equifax Live Pull" maxlength="100" />
               </label>
@@ -1246,11 +1238,11 @@
         </div>
       </section>
 
-      <!-- 4-Strategy Debt Payoff Simulator -->
+      <!-- Debt Payoff Strategy Comparison -->
       <section id="credit-strategies-card" class="card section-block">
         <div class="section-head">
           <div>
-            <h2>4-STRATEGY DEBT PAYOFF SIMULATOR</h2>
+            <h2>DEBT PAYOFF STRATEGY COMPARISON</h2>
             <p class="muted small">Exact-cent monthly amortization comparing ADHD Hybrid, Credit-First, Avalanche &amp; Snowball.</p>
           </div>
           <form id="debt-extra-form" class="row-gap">
@@ -1281,7 +1273,7 @@
             </select>
             <input id="cl-balance" type="number" step="0.01" min="0" placeholder="Balance ($)" required />
             <input id="cl-limit" type="number" step="1" min="0" placeholder="Limit ($; 0 for loan)" value="0" />
-            <input id="cl-apr" type="number" step="0.01" min="0" max="99" placeholder="APR (%)" value="24.99" required />
+            <input id="cl-apr" type="number" step="0.01" min="0" max="99" placeholder="APR (%)" required />
             <input id="cl-close-day" type="number" min="1" max="31" placeholder="Stmt Close Day" value="15" />
             <input id="cl-due-day" type="number" min="1" max="31" placeholder="Due Day" value="10" />
             <select id="cl-autopay">
@@ -1308,11 +1300,12 @@
           <h2>0% BALANCE TRANSFER BREAKEVEN</h2>
           <p class="muted small">Check exact math before paying a 3-5% transfer fee.</p>
           <form id="bt-form" class="form-grid-compact">
-            <label class="field"><span>Balance ($)</span><input id="bt-balance" type="number" step="10" min="50" value="1680" required /></label>
-            <label class="field"><span>Current APR (%)</span><input id="bt-apr" type="number" step="0.01" min="0" value="26.99" required /></label>
+            <label class="field"><span>Balance ($)</span><input id="bt-balance" type="number" step="10" min="50" placeholder="e.g. 2500" required /></label>
+            <label class="field"><span>Current APR (%)</span><input id="bt-apr" type="number" step="0.01" min="0" placeholder="e.g. 22.99" required /></label>
             <label class="field"><span>Transfer Fee (%)</span><input id="bt-fee" type="number" step="0.1" min="0" max="15" value="3.0" required /></label>
             <label class="field"><span>0% Promo Months</span><input id="bt-months" type="number" min="3" max="36" value="15" required /></label>
-            <label class="field"><span>Planned $/mo</span><input id="bt-pay" type="number" step="10" min="25" value="200" required /></label>
+            <label class="field"><span>Post-Promo APR (%)</span><input id="bt-post-apr" type="number" step="0.01" min="0" max="99" placeholder="Same as current" /></label>
+            <label class="field"><span>Planned $/mo</span><input id="bt-pay" type="number" step="10" min="25" placeholder="e.g. 200" required /></label>
             <button type="submit" class="btn btn-soft align-end">Check Breakeven</button>
           </form>
           <div id="bt-result" class="coach-answer hidden" aria-live="polite"></div>
@@ -1362,7 +1355,7 @@
         </p>
         <form id="goal-plan-form" class="form-grid">
           <input id="gp-name" type="text" placeholder="What do you want? (e.g. $1000 Workstation)" required />
-          <input id="gp-price" type="number" step="0.01" min="1" placeholder="Target ($)" value="1000" required />
+          <input id="gp-price" type="number" step="0.01" min="1" placeholder="Target ($)" required />
           <input id="gp-saved" type="number" step="0.01" min="0" placeholder="Already saved ($)" value="0" />
           <input id="gp-date" type="date" title="Target date (optional)" />
           <button type="submit" class="btn btn-primary">Optimize Plan</button>
@@ -1471,15 +1464,23 @@
               <input id="csv-file-input" class="grow" type="file" accept=".csv,.tsv,.pdf,.ofx,.qfx,.qif,.json,text/csv,application/json,application/pdf" />
               <button id="btn-desktop-import-dialog" type="button" class="btn btn-ghost btn-sm hidden">Native Picker</button>
             </div>
-            <label class="field">
-              <span>Institution Profile (Optional)</span>
-              <select id="csv-institution">
-                <option value="auto">Auto-Detect (Recommended)</option>
-                <option value="navy_federal">Navy Federal Credit Union (CSV / PDF)</option>
-                <option value="plaid">Plaid Export (JSON / CSV)</option>
-                <option value="generic">Generic Bank / Credit Card</option>
-              </select>
-            </label>
+            <div class="row-gap">
+              <label class="field grow">
+                <span>Target Account</span>
+                <select id="csv-account-select">
+                  <option value="">Auto-Match from Statement / Default Checking</option>
+                </select>
+              </label>
+              <label class="field grow">
+                <span>Institution Profile (Optional)</span>
+                <select id="csv-institution">
+                  <option value="auto">Auto-Detect (Recommended)</option>
+                  <option value="navy_federal">Navy Federal Credit Union (CSV / PDF)</option>
+                  <option value="plaid">Plaid Export (JSON / CSV)</option>
+                  <option value="generic">Generic Bank / Credit Card</option>
+                </select>
+              </label>
+            </div>
             <div id="desktop-selected-statement" class="notice-bar hidden" aria-live="polite"></div>
             <label class="checkbox-row">
               <input id="csv-skip-pending" type="checkbox" checked />
@@ -1534,6 +1535,8 @@
             <select id="manual-tx-type">
               <option value="expense">Expense</option>
               <option value="income">Income</option>
+              <option value="transfer_out">Transfer Out (-)</option>
+              <option value="transfer_in">Transfer In (+)</option>
             </select>
             <input id="manual-tx-merchant" type="text" placeholder="Merchant / source" required />
             <input id="manual-tx-amount" type="number" step="0.01" min="0.01" placeholder="Amount ($)" required />
@@ -1742,6 +1745,7 @@
             </label>
             <button id="btn-reopen-onboarding" type="button" class="btn btn-ghost btn-sm">Open Data Setup Wizard</button>
           </div>
+          <div id="backup-preview-box" class="inline-editor hidden" aria-live="polite"></div>
         </div>
 
         <!-- ADHD Profile & Guardrails -->
@@ -1776,7 +1780,7 @@
               </label>
               <label class="field grow">
                 <span>Expected Paycheck ($)</span>
-                <input id="set-expected-paycheck" type="number" step="10" min="0" value="2200" />
+                <input id="set-expected-paycheck" type="number" step="10" min="0" value="0" placeholder="0 (auto-detect from deposits)" />
               </label>
             </div>
             <button type="submit" class="btn btn-primary btn-sm">Save ADHD Profile</button>
@@ -1807,19 +1811,10 @@
               Enter your own Plaid credentials (stored sealed in <code>secrets.enc</code>). Link opens in your system browser and polls automatically. Requests 730 days at Link time — existing items require re-Link to extend history.
             </p>
             <form id="plaid-config-form" class="stack-sm">
-              <div class="row-gap">
-                <label class="field grow">
-                  <span>Plaid Client ID</span>
-                  <input id="set-plaid-client-id" type="text" autocomplete="off" placeholder="Plaid client_id" />
-                </label>
-                <label class="field">
-                  <span>Environment</span>
-                  <select id="set-plaid-env">
-                    <option value="sandbox">Sandbox</option>
-                    <option value="production">Production</option>
-                  </select>
-                </label>
-              </div>
+              <label class="field">
+                <span>Plaid Client ID</span>
+                <input id="set-plaid-client-id" type="text" autocomplete="off" placeholder="Plaid client_id" />
+              </label>
               <label class="field">
                 <span>Plaid Secret (write-only)</span>
                 <input id="set-plaid-secret" type="password" autocomplete="off" placeholder="Paste Plaid secret" />
@@ -2023,13 +2018,13 @@
             <div id="codex-test-result" class="notice-bar hidden" aria-live="polite"></div>
           </div>
 
-          <!-- Durable Chat-Wrapper & Sandboxed Codex CLI -->
+          <!-- Durable Chat-Wrapper & Read-Only Codex CLI -->
           <div class="subpanel stack-sm">
             <div class="item-row">
               <h3>Chat-Wrapper &amp; Codex CLI</h3>
               <span id="wrapper-key-status-badge" class="pill pill-soft">Optional</span>
             </div>
-            <p class="muted small">LiteLLM / OpenRouter / Ollama gateway or sandboxed read-only local <code>codex exec</code>.</p>
+            <p class="muted small">LiteLLM / OpenRouter / Ollama gateway or isolated read-only local <code>codex exec</code>.</p>
             <form id="wrapper-settings-form" class="stack-sm">
               <label class="field">
                 <span>Wrapper API Key (optional for Ollama)</span>
@@ -2054,7 +2049,7 @@
               </label>
               <label class="checkbox-row">
                 <input id="set-codex-cli-enabled" type="checkbox" />
-                <span>Enable sandboxed local <code>codex exec --sandbox read-only</code></span>
+                <span>Enable isolated read-only local <code>codex exec</code></span>
               </label>
               <div class="row-gap wrap">
                 <button type="submit" class="btn btn-primary btn-sm">Save Wrapper &amp; CLI</button>

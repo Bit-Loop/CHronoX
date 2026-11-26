@@ -1,5 +1,5 @@
-"""Comprehensive unit tests for MoneyStill Analytics, What-If Simulator,
-Firefly Rule Engine & Split Validator, Honest 5-Factor Credit Simulator + 5/24,
+"""Comprehensive unit tests for MoneyStill Analytics, Scenario Projections,
+Firefly Rule Engine & Split Validator, 5-Factor Credit Analysis + 5/24,
 and 730-Day Variable Bill / Split-Aware Quant & AutoBudget upgrades."""
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from chronox_finance.engines.analytics import (
 )
 from chronox_finance.engines.autobudget import AutoBudgetEngine
 from chronox_finance.engines.credit_debt import (
-    FACTOR_SIMULATOR_DISCLAIMER,
+    FACTOR_ANALYSIS_DISCLAIMER,
     CreditDebtOptimizer,
     compute_derogatory_drop_off,
     compute_inquiry_dates,
@@ -422,7 +422,7 @@ class TestFireflyRuleEngineAndSplits:
         assert txs[0]["jar_id"] is None
 
 
-class TestHonestCreditFactorSimulatorAnd524:
+class TestCreditFactorAnalysisAnd524:
     def test_kind_dependent_drop_off_dates(self):
         assert compute_derogatory_drop_off("late_30", "2022-03-15") == "2029-03-15"
         assert compute_derogatory_drop_off("charge_off", "2021-06-01") == "2028-06-01"
@@ -434,7 +434,7 @@ class TestHonestCreditFactorSimulatorAnd524:
         assert counts_until == "2027-02-15"
         assert drops_off == "2028-02-15"
 
-    def test_honest_factor_simulator_524_au_toggle_and_goal_velocity_guard(self):
+    def test_factor_analysis_524_au_toggle_and_goal_velocity_guard(self):
         ref = date(2026, 11, 20)
         # 5 cards opened across DIFFERENT issuers in trailing 24m (1 is Authorized User!) + 1 older anchor card
         raw_lines = [
@@ -490,18 +490,21 @@ class TestHonestCreditFactorSimulatorAnd524:
         assert ftf_no_au.count_5_24 == 4
         assert ftf_no_au.under_5_24 is True
 
-        # Honest Factor Simulator checks
-        sim = rep_with_au.factor_simulator
-        assert sim is not None
-        assert sim.disclaimer == FACTOR_SIMULATOR_DISCLAIMER
-        assert len(sim.latest_actual_scores) == 1 and sim.latest_actual_scores[0].score == 742
-        assert sum(f.weight_pct for f in sim.fico8_factors) == 100
-        assert [f.weight_pct for f in sim.fico8_factors] == [35, 30, 15, 10, 10]
-        assert sum(f.weight_pct for f in sim.vantage3_factors) == 100
-        assert [f.weight_pct for f in sim.vantage3_factors] == [40, 21, 20, 11, 5, 3]
-        # Amex Blue is at 45% util -> simulated action recommends dropping to 0% with directional range
-        amex_sim = next(a for a in sim.simulated_actions if "Amex Blue" in a.action)
-        assert amex_sim.delta_min_pts > 0 and amex_sim.delta_max_pts >= amex_sim.delta_min_pts
+        # Deterministic 5-Factor Analysis checks (zero fabricated point deltas)
+        fa = rep_with_au.factor_analysis
+        assert fa is not None
+        assert not hasattr(rep_with_au, "factor_simulator")
+        assert not hasattr(fa, "simulated_actions")
+        assert fa.disclaimer == FACTOR_ANALYSIS_DISCLAIMER
+        assert len(fa.latest_actual_scores) == 1 and fa.latest_actual_scores[0].score == 742
+        assert sum(f.weight_pct for f in fa.fico8_factors) == 100
+        assert [f.weight_pct for f in fa.fico8_factors] == [35, 30, 15, 10, 10]
+        assert sum(f.weight_pct for f in fa.vantage3_factors) == 100
+        assert [f.weight_pct for f in fa.vantage3_factors] == [40, 21, 20, 11, 5, 3]
+        for f in list(fa.fico8_factors) + list(fa.vantage3_factors):
+            assert "pts" not in f.summary.lower()
+            assert "pts" not in f.guidance.lower()
+            assert "est." not in f.guidance.lower()
 
         # Derogatory drop-off auto-computed (+7y for late_30)
         assert rep_with_au.credit_derogatories[0].drops_off == "2030-05-01"
@@ -692,7 +695,7 @@ class Test730DayBackportVariableBillsAndSplitAwareBudgetQuant:
         assert empty_ov.sankey_links == []
         assert len(empty_ov.monthly_trends) == 24
 
-        # 2. Deficit month balances Sankey via "Cash Reserves Draw"
+        # 2. Deficit month without reserve transfer labels gap honestly as "Unfunded Gap" (Finding #18)
         deficit_txs = [
             {"id": 1, "tx_type": "income", "amount_cents": 100_000, "merchant": "Gig", "tx_date": "2026-11-05"},
             {"id": 2, "tx_type": "expense", "amount_cents": 140_000, "jar_id": 1, "merchant": "Rent", "tx_date": "2026-11-01"},
@@ -702,7 +705,8 @@ class Test730DayBackportVariableBillsAndSplitAwareBudgetQuant:
         in_sum = sum(lk.amount_cents for lk in def_ov.sankey_links if lk.target == "hub:total_income")
         out_sum = sum(lk.amount_cents for lk in def_ov.sankey_links if lk.source == "hub:total_income")
         assert in_sum == out_sum == 140_000
-        assert any(n.label == "Cash Reserves Draw" and n.amount_cents == 40_000 for n in def_ov.sankey_nodes)
+        assert any(n.label == "Unfunded Gap" and n.amount_cents == 40_000 for n in def_ov.sankey_nodes)
+        assert any(n.id == "hub:total_income" and n.label == "Total Outflow" for n in def_ov.sankey_nodes)
 
         # 3. RuleOut Pydantic model + JSON-string SQLite rule row (starts_with/amount_exact/account_id)
         rule_out = RuleOut(

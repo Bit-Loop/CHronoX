@@ -11,7 +11,7 @@ export const CRED_RING_CIRCUMFERENCE = 2 * Math.PI * 35;
 
 export const TAB_TITLES = {
   today: "Command",
-  analytics: "Analytics & What-If",
+  analytics: "Analytics & Forecast",
   portfolio: "Portfolio",
   credit: "Credit & Debt",
   goals: "Goals & Rules",
@@ -896,7 +896,16 @@ export async function api(path, options = {}) {
     setCsrfToken(data.csrf_token);
   }
 
-  if (resp.status === 401 && !isAuthExempt) {
+  const errCode = data && typeof data === "object" ? String(data.code || "") : "";
+  const isVault401 =
+    resp.status === 401 &&
+    !isAuthExempt &&
+    (!errCode ||
+      errCode === "vault_auth_required" ||
+      errCode === "vault_not_initialized" ||
+      errCode === "invalid_credentials");
+
+  if (isVault401) {
     const mode =
       data && typeof data === "object" && data.state === "needs_setup"
         ? "needs_setup"
@@ -1833,9 +1842,9 @@ function getBaseCommands() {
     {
       id: "nav-analytics",
       icon: "chart",
-      title: "Analytics & What-If Timeline",
-      sub: "MoneyStill Sankey, Expense Donut, 2Y Trend & Draggable What-If Runway",
-      keywords: "analytics sankey donut trend timeline scenario what-if net worth",
+      title: "Analytics & Forecast Timeline",
+      sub: "MoneyStill Sankey, Expense Donut, 2Y Trend & Draggable Cashflow Forecast",
+      keywords: "analytics sankey donut trend timeline scenario forecast net worth",
       run: () => switchTab("analytics"),
     },
     {
@@ -1849,8 +1858,8 @@ function getBaseCommands() {
     {
       id: "nav-credit",
       icon: "card",
-      title: "Credit & Debt Factor Simulator",
-      sub: "Bureau Scores, 5-Factor Simulator, Chase 5/24, AZEO & 4-Strategy Payoff",
+      title: "Credit & Debt Analysis",
+      sub: "Bureau Scores, Factor Breakdown, Chase 5/24, AZEO & Payoff Strategies",
       keywords: "credit debt fico vantage 5/24 azeo utilization bureau",
       run: () => switchTab("credit"),
     },

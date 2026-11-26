@@ -4,8 +4,8 @@ ChronoX Finance Service Facade.
 Coordinates envelope-encrypted secret vault (`LocalSecretStore` + `LocalVaultAuth`),
 SQLite WAL storage, 730-day self-updating auto-budgeting loop, Firefly III-inspired
 automation rules & exact-sum splits, Plaid Hosted Link & SimpleFIN banking connectors,
-opt-in read-only IMAP email scanner, MoneyStill analytics & What-If simulator,
-honest 5-factor Credit Simulator + Chase 5/24, Stocks & Crypto portfolio + official
+opt-in read-only IMAP email scanner, MoneyStill analytics & scenario projections,
+5-factor Credit Factor Analysis + Chase 5/24, Stocks & Crypto portfolio + official
 broker adapters (Coinbase read-only, Robinhood Crypto read-only, Charles Schwab OAuth2),
 and Multi-Provider AI Coaching + guarded Agentic Tool Coach (Preview -> Execute -> Undo).
 """
@@ -13,14 +13,26 @@ and Multi-Provider AI Coaching + guarded Agentic Tool Coach (Preview -> Execute 
 from __future__ import annotations
 
 import hashlib
+import html
+import ipaddress
 import json
 import logging
 import os
 import secrets
+import sqlite3
+import ssl
 import tempfile
+import threading
 from datetime import date, datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+from urllib.parse import parse_qs, unquote, urlparse
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
 from chronox_finance.ai.agent_tools import (
     AgentActionPlanner,
@@ -106,6 +118,7 @@ from chronox_finance.engines.rules import (
 from chronox_finance.models import (
     AccountCreate,
     AccountOut,
+    AccountType,
     ActiveProviderResolved,
     AgentExecuteResponse,
     AgentPlanRequest,
@@ -120,6 +133,7 @@ from chronox_finance.models import (
     BalanceTransferResult,
     BrokerCoinbaseConnectRequest,
     BrokerRobinhoodConnectRequest,
+    BrokerSchwabCompleteRequest,
     BrokerSchwabConnectRequest,
     BudgetAuditEvent,
     CoachAnswerResponse,
@@ -224,7 +238,7 @@ from chronox_finance.storage import FinanceStorage, compute_tx_fingerprint
 logger = logging.getLogger(__name__)
 
 _LOOKBACK_730D = 730
-_MAX_TX_LIMIT = 5000
+_MAX_TX_LIMIT = 250_000
 
 
 def _row_fingerprint(row: Optional[Dict[str, Any]], fields: Sequence[str]) -> str:
@@ -327,8 +341,28 @@ class FinanceService:
         self._imap_factory = imap_factory
 
         self._pending_schwab_states: Dict[str, Dict[str, Any]] = {}
+        self._schwab_callback_server: Optional[HTTPServer] = None
+        self._schwab_callback_port: Optional[int] = None
+        self._schwab_tls_dir: Optional[tempfile.TemporaryDirectory[str]] = None
+
+    def _stop_schwab_callback_server(self) -> None:
+        from contextlib import suppress
+
+        srv = self._schwab_callback_server
+        self._schwab_callback_server = None
+        self._schwab_callback_port = None
+        if srv is not None:
+            with suppress(Exception):
+                srv.shutdown()
+            with suppress(Exception):
+                srv.server_close()
+        if self._schwab_tls_dir is not None:
+            with suppress(OSError):
+                self._schwab_tls_dir.cleanup()
+            self._schwab_tls_dir = None
 
     def close(self) -> None:
+        self._stop_schwab_callback_server()
         self.storage.close()
         if self._temp_secret_dir is not None:
             try:
@@ -608,18 +642,24 @@ class FinanceService:
         return [c for c in ordered if c.is_configured]
 
     def _record_completion_usage(self, res: CompletionResult) -> None:
+        if getattr(self.storage, "_closed", False):
+            return
         provider = (res.provider or "unknown").strip().lower()
-        self.storage.record_ai_usage(
-            provider=provider,
-            model=res.model or "",
-            cached=bool(res.cached),
-            input_tokens=int(res.input_tokens),
-            output_tokens=int(res.output_tokens),
-            cached_tokens=int(res.cached_tokens),
-            cost_microdollars=int(res.cost_microdollars),
-            saved_microdollars=int(res.saved_microdollars),
-            latency_ms=int(res.latency_ms),
-        )
+        try:
+            self.storage.record_ai_usage(
+                provider=provider,
+                model=res.model or "",
+                cached=bool(res.cached),
+                input_tokens=int(res.input_tokens),
+                output_tokens=int(res.output_tokens),
+                cached_tokens=int(res.cached_tokens),
+                cost_microdollars=int(res.cost_microdollars),
+                saved_microdollars=int(res.saved_microdollars),
+                latency_ms=int(res.latency_ms),
+            )
+        except sqlite3.ProgrammingError:
+            # Graceful no-op if storage closed concurrently during shutdown
+            return
 
     def get_ai_status(self) -> Dict[str, Any]:
         settings = self.storage.get_settings()
@@ -782,7 +822,8 @@ class FinanceService:
 
     def _apply_month_rollover_if_needed(self, today: date) -> int:
         """
-        Automatically carry over prior-month jar surpluses when a new calendar month begins.
+        Automatically carry over prior-month cash-backed jar surpluses when a new calendar month begins.
+        Never rolls forward unfunded target/projected allocations when no cash or income arrived.
         Uses child splits when present so split transactions are never double-counted.
         """
         settings = self.storage.get_settings()
@@ -797,10 +838,16 @@ class FinanceService:
         prev_first = date(today.year, today.month, 1) - timedelta(days=1)
         prev_ym = current_cycle_ym(prev_first)
         since_prev = date(prev_first.year, prev_first.month, 1).isoformat()
-        txs = self.storage.list_transactions(limit=_MAX_TX_LIMIT, since_date=since_prev, include_splits=True)
+        txs = self.storage.list_transactions(limit=None, since_date=since_prev, include_splits=True)
         spent_prev: Dict[int, int] = {}
+        prev_income_cents = 0
         for t in txs:
-            if t.get("tx_type") != "expense" or str(t["tx_date"])[:7] != prev_ym:
+            if str(t["tx_date"])[:7] != prev_ym:
+                continue
+            if t.get("tx_type") == "income":
+                prev_income_cents += int(t["amount_cents"])
+                continue
+            if t.get("tx_type") != "expense":
                 continue
             child_splits = t.get("splits") or []
             if child_splits:
@@ -812,31 +859,61 @@ class FinanceService:
                 jid = int(t["jar_id"])
                 spent_prev[jid] = spent_prev.get(jid, 0) + int(t["amount_cents"])
 
+        profile_currency = str(settings.get("currency") or "USD").strip().upper() or "USD"
+        liquid_cash_cents = sum(
+            max(0, int(a["balance_cents"]))
+            for a in self.storage.list_accounts()
+            if a.get("is_liquid", 1)
+            and a.get("account_type") != AccountType.CREDIT.value
+            and (str(a.get("currency") or profile_currency).strip().upper() or profile_currency) == profile_currency
+        )
+
         jars = self.storage.list_jars()
+        if liquid_cash_cents <= 0:
+            for j in jars:
+                if int(j.get("rollover_cents", 0)) != 0:
+                    self.storage.update_jar(int(j["id"]), {"rollover_cents": 0})
+            self.storage.update_settings({"last_rollover_ym": ym_now})
+            return 0
+
+        total_auto_alloc = sum(max(0, int(j.get("auto_allocated_cents", 0))) for j in jars)
+        funding_basis = min(liquid_cash_cents, prev_income_cents) if prev_income_cents > 0 else liquid_cash_cents
+        alloc_scale = min(1.0, funding_basis / total_auto_alloc) if total_auto_alloc > 0 else 0.0
+
         safety_jar = next((j for j in jars if j["kind"] == JarKind.SAFETY.value), None)
         overflow_to_safety = 0
-        rolled_jars = 0
+        proposed_rollovers: Dict[int, int] = {}
 
         for j in jars:
             jid = int(j["id"])
             if not j.get("rollover_enabled", 1):
-                self.storage.update_jar(jid, {"rollover_cents": 0})
+                proposed_rollovers[jid] = 0
                 continue
-            prev_avail = int(j.get("auto_allocated_cents", 0)) + int(j.get("rollover_cents", 0)) - spent_prev.get(jid, 0)
+            funded_prev = int(round(max(0, int(j.get("auto_allocated_cents", 0))) * alloc_scale))
+            prev_avail = funded_prev + int(j.get("rollover_cents", 0)) - spent_prev.get(jid, 0)
             surplus = max(0, prev_avail)
             cap = j.get("rollover_cap_cents")
             if cap is not None and surplus > int(cap):
                 overflow_to_safety += surplus - int(cap)
                 surplus = int(cap)
-            self.storage.update_jar(jid, {"rollover_cents": surplus})
-            if surplus > 0:
-                rolled_jars += 1
+            proposed_rollovers[jid] = surplus
 
         if overflow_to_safety > 0 and safety_jar:
             sid = int(safety_jar["id"])
-            curr_safety = self.storage.get_jar(sid)
-            if curr_safety:
-                self.storage.update_jar(sid, {"rollover_cents": int(curr_safety["rollover_cents"]) + overflow_to_safety})
+            proposed_rollovers[sid] = proposed_rollovers.get(sid, 0) + overflow_to_safety
+
+        total_proposed = sum(proposed_rollovers.values())
+        if total_proposed > liquid_cash_cents > 0:
+            cap_ratio = liquid_cash_cents / total_proposed
+            for jid in list(proposed_rollovers.keys()):
+                proposed_rollovers[jid] = int(proposed_rollovers[jid] * cap_ratio)
+            overflow_to_safety = int(overflow_to_safety * cap_ratio)
+
+        rolled_jars = 0
+        for jid, roll_val in proposed_rollovers.items():
+            self.storage.update_jar(jid, {"rollover_cents": roll_val})
+            if roll_val > 0:
+                rolled_jars += 1
 
         self.storage.update_settings({"last_rollover_ym": ym_now})
         msg = f"Month rollover ({prev_ym} -> {ym_now}): rolled surplus across {rolled_jars} jar(s)"
@@ -851,21 +928,23 @@ class FinanceService:
 
     def _refresh_net_worth_snapshot_today(self, today: Optional[date] = None) -> None:
         ref = today or date.today()
-        accounts = self.storage.list_accounts()
-        holdings = self.storage.list_holdings()
-        credit_lines = self.storage.list_credit_lines(active_only=True)
-        liquid = sum(int(a["balance_cents"]) for a in accounts if a.get("is_liquid", 1))
-        invest = sum(
-            compute_holding_value_cents(int(h["quantity_e8"]), int(h["price_e8"]))
-            for h in holdings
+        pts = reconstruct_net_worth_timeline(
+            accounts=self.storage.list_accounts(),
+            transactions=[],
+            holdings=self.storage.list_holdings(),
+            credit_lines=self.storage.list_credit_lines(active_only=True),
+            existing_snapshots=None,
+            portfolio_snapshots=self.storage.list_portfolio_snapshots(limit=_LOOKBACK_730D),
+            days=1,
+            today=ref,
         )
-        debt = sum(int(cl["balance_cents"]) for cl in credit_lines)
+        pt = pts[-1]
         self.storage.upsert_net_worth_snapshot(
             snap_date=ref.isoformat(),
-            liquid_cents=liquid,
-            investment_cents=invest,
-            debt_cents=debt,
-            net_worth_cents=liquid + invest - debt,
+            liquid_cents=pt.liquid_cents,
+            investment_cents=pt.investment_cents,
+            debt_cents=pt.debt_cents,
+            net_worth_cents=pt.net_worth_cents,
         )
 
     def _backfill_net_worth_snapshots(self, days: int = _LOOKBACK_730D, today: Optional[date] = None) -> int:
@@ -877,6 +956,7 @@ class FinanceService:
             holdings=self.storage.list_holdings(),
             credit_lines=self.storage.list_credit_lines(active_only=True),
             existing_snapshots=self.storage.list_net_worth_snapshots(limit=days),
+            portfolio_snapshots=self.storage.list_portfolio_snapshots(limit=days),
             days=days,
             today=ref,
         )
@@ -942,14 +1022,16 @@ class FinanceService:
                 hike = dbill.amount_cents - dbill.previous_amount_cents
                 price_hikes_found.append(f"{saved['name']} (+${hike / 100:,.2f})")
 
+        user_cfg_payday = bool(settings.get("payday_user_configured", 0))
         payday = detect_payday_schedule(
             transactions=txs,
             fallback_cadence_days=int(settings.get("payday_cadence_days", 14)),
             fallback_payday_date=settings.get("next_payday_date"),
-            fallback_paycheck_cents=int(settings.get("expected_paycheck_cents", 220_000)),
+            fallback_paycheck_cents=int(settings.get("expected_paycheck_cents", 0)),
             today=ref,
+            user_configured_payday=user_cfg_payday,
         )
-        if payday.confidence >= 0.85:
+        if payday.confidence >= 0.85 and not user_cfg_payday:
             self.storage.update_settings(
                 {
                     "payday_cadence_days": payday.cadence_days,
@@ -1025,7 +1107,7 @@ class FinanceService:
             today=ref,
         )
 
-    # --- MoneyStill Analytics, Net Worth & What-If Scenarios ---
+    # --- MoneyStill Analytics, Net Worth & Scenario Projections ---
 
     def get_analytics_overview(
         self,
@@ -1034,7 +1116,13 @@ class FinanceService:
         today: Optional[date] = None,
     ) -> AnalyticsOverview:
         ref = today or date.today()
-        txs, splits_map = self._load_recent_transactions_with_splits(days=_LOOKBACK_730D, today=ref)
+        # Load full ledger history when 2y or YYYY-MM outside 730d is requested, with no 5,000-row cap
+        txs = self.storage.list_transactions(
+            limit=None,
+            include_splits=True,
+            include_tags=True,
+        )
+        splits_map = {int(t["id"]): list(t.get("splits") or []) for t in txs if t.get("splits")}
         return self.analytics_engine.build_overview(
             transactions=txs,
             jars=self.storage.list_jars(),
@@ -1042,6 +1130,7 @@ class FinanceService:
             holdings=self.storage.list_holdings(),
             credit_lines=self.storage.list_credit_lines(active_only=True),
             net_worth_snapshots=self.storage.list_net_worth_snapshots(limit=_LOOKBACK_730D),
+            portfolio_snapshots=self.storage.list_portfolio_snapshots(limit=_LOOKBACK_730D),
             splits_by_tx_id=splits_map,
             period=period,
             group_by=group_by,
@@ -1062,6 +1151,7 @@ class FinanceService:
             holdings=self.storage.list_holdings(),
             credit_lines=self.storage.list_credit_lines(active_only=True),
             existing_snapshots=self.storage.list_net_worth_snapshots(limit=_LOOKBACK_730D),
+            portfolio_snapshots=self.storage.list_portfolio_snapshots(limit=_LOOKBACK_730D),
             days=bounded,
             today=ref,
         )
@@ -1141,8 +1231,8 @@ class FinanceService:
             transactions=txs,
             credit_lines=credit_lines,
             payday_cadence_days=int(settings.get("payday_cadence_days", 14)),
-            next_payday_date=settings.get("next_payday_date"),
-            estimated_paycheck_cents=int(settings.get("expected_paycheck_cents", 220_000)),
+            next_payday_date=budget.safe_to_spend.next_payday_date,
+            estimated_paycheck_cents=budget.safe_to_spend.estimated_paycheck_cents,
             emergency_buffer_cents=int(settings.get("emergency_buffer_cents", 50_000)),
             horizon_days=req.horizon_days,
             overrides=merged_ov,
@@ -1153,6 +1243,7 @@ class FinanceService:
 
     def get_dashboard(self, today: Optional[date] = None) -> DashboardResponse:
         ref = today or date.today()
+        self._apply_month_rollover_if_needed(ref)
         settings = self.storage.get_settings()
         budget = self._compute_budget(today=ref)
 
@@ -1377,6 +1468,7 @@ class FinanceService:
         source: str = "manual",
         deduplicate: bool = False,
         external_id: str = "",
+        transfer_direction: str = "",
         adjust_balance: bool = True,
         run_auto_sync: bool = True,
         apply_rules: bool = True,
@@ -1386,6 +1478,7 @@ class FinanceService:
 
         confidence = 1.0
         needs_review = False
+        eff_transfer_dir = (transfer_direction or "").strip().lower()
 
         if tx_type == TransactionType.EXPENSE.value and jar_id is None:
             jars_by_slug = {j["slug"]: j for j in self.storage.list_jars()}
@@ -1403,6 +1496,12 @@ class FinanceService:
             jar_id = None
             if not subcategory:
                 subcategory = "Internal Transfer"
+            if not eff_transfer_dir and adjust_balance:
+                combined_low = f"{merchant} {memo}".lower()
+                if any(tok in combined_low for tok in ("transfer from", "xfer from", "from savings", "from checking", "inbound", "deposit from")):
+                    eff_transfer_dir = "in"
+                else:
+                    eff_transfer_dir = "out"
 
         fp = (
             compute_tx_fingerprint(acct_id, tx_date, tx_type, amount_cents, norm, memo, external_id=external_id)
@@ -1423,6 +1522,8 @@ class FinanceService:
             needs_review=needs_review,
             source=source,
             fingerprint=fp,
+            external_id=external_id,
+            transfer_direction=eff_transfer_dir,
             adjust_balance=adjust_balance,
         )
         if row is None:
@@ -1452,6 +1553,7 @@ class FinanceService:
             memo=req.memo,
             tx_date=req.tx_date,
             source=req.source,
+            transfer_direction=req.transfer_direction or "",
         )
         assert tx is not None
         return tx
@@ -1553,6 +1655,7 @@ class FinanceService:
         self,
         *,
         limit: int = 100,
+        offset: int = 0,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         account_id: Optional[int] = None,
@@ -1562,6 +1665,7 @@ class FinanceService:
     ) -> List[TransactionOut]:
         rows = self.storage.list_transactions(
             limit=max(1, min(_MAX_TX_LIMIT, int(limit))),
+            offset=max(0, int(offset)),
             start_date=start_date,
             end_date=end_date,
             account_id=account_id,
@@ -1712,6 +1816,8 @@ class FinanceService:
             status = "needs_reauth"
         if not self.secrets.is_unlocked() and status == "active":
             status = "paused_locked"
+        raw_bf = str(row.get("backfill_status") or "complete").strip().lower()
+        bf_status = raw_bf if raw_bf in ("complete", "backfill_pending", "partial") else "complete"
         return ConnectionOut(
             id=int(row["id"]),
             provider=provider,  # type: ignore[arg-type]
@@ -1724,6 +1830,10 @@ class FinanceService:
             last_synced_at=row.get("last_synced_at"),
             history_days_requested=hist_days,
             needs_relink_for_730d=(provider == "plaid" and hist_days < 730),
+            backfill_status=bf_status,  # type: ignore[arg-type]
+            imported_start_date=row.get("imported_start_date"),
+            imported_end_date=row.get("imported_end_date"),
+            last_error=str(row.get("last_error") or ""),
             created_at=str(row.get("created_at", "")),
             updated_at=str(row.get("updated_at", "")),
         )
@@ -1735,6 +1845,15 @@ class FinanceService:
         existing = self.storage.get_connection(connection_id)
         if not existing:
             return False
+        provider = str(existing.get("provider") or "")
+        if provider == "plaid":
+            # Confirm provider revocation via Plaid /item/remove BEFORE discarding local credentials
+            self._require_vault_unlocked()
+            creds = self.secrets.get_json(f"conn:{connection_id}")
+            if creds and creds.get("access_token"):
+                conn_env = str(existing.get("env") or creds.get("env") or "production").strip().lower()
+                plaid_client, _ = self._build_plaid_client(env_override=conn_env, creds_override=creds)
+                plaid_client.remove_item(str(creds["access_token"]))
         if self.secrets.is_unlocked():
             self.secrets.delete(f"conn:{connection_id}")
         ok = self.storage.delete_connection(connection_id)
@@ -1745,18 +1864,26 @@ class FinanceService:
             )
         return ok
 
-    def _build_plaid_client(self) -> Tuple[PlaidClient, str]:
+    def _build_plaid_client(
+        self,
+        *,
+        env_override: Optional[str] = None,
+        creds_override: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[PlaidClient, str]:
         self._require_vault_unlocked()
-        cfg = self.secrets.get_json("plaid:config")
-        if not cfg or not cfg.get("client_id") or not cfg.get("secret"):
+        cfg = self.secrets.get_json("plaid:config") or {}
+        cid = str((creds_override or {}).get("client_id") or cfg.get("client_id") or "").strip()
+        sec = str((creds_override or {}).get("secret") or cfg.get("secret") or "").strip()
+        if not cid or not sec:
             raise ConnectorError(
                 "Plaid BYOK credentials are not configured. Save your Plaid client_id and secret in Vault & Connectors first."
             )
-        env = str(cfg.get("env") or "sandbox").strip().lower()
+        raw_env = env_override or (creds_override or {}).get("env") or cfg.get("env") or "production"
+        env = str(raw_env).strip().lower()
         return (
             PlaidClient(
-                client_id=str(cfg["client_id"]),
-                secret=str(cfg["secret"]),
+                client_id=cid,
+                secret=sec,
                 env=env,
                 transport=self._plaid_transport,
             ),
@@ -1800,10 +1927,12 @@ class FinanceService:
             "institution_name": poll.institution_name,
             "institution": poll.institution_name or "Plaid Institution",
             "accounts": poll.accounts,
+            "error_message": poll.error_message,
         }
 
     def exchange_plaid_token(self, req: PlaidExchangeRequest) -> ConnectionOut:
         client, env = self._build_plaid_client()
+        cfg = self.secrets.get_json("plaid:config") or {}
         ex = client.exchange_public_token(req.public_token)
         row = self.storage.upsert_connection(
             {
@@ -1814,30 +1943,94 @@ class FinanceService:
                 "sync_cursor": "",
                 "status": "active",
                 "history_days_requested": 730,
+                "backfill_status": "backfill_pending",
+                "last_error": "",
             }
         )
         self.secrets.set_json(
             f"conn:{row['id']}",
-            {"access_token": ex.access_token, "item_id": ex.item_id},
+            {
+                "access_token": ex.access_token,
+                "item_id": ex.item_id,
+                "env": env,
+                "client_id": str(cfg.get("client_id") or ""),
+                "secret": str(cfg.get("secret") or ""),
+            },
         )
-        self.storage.log_budget_event("connector_added", f"Connected Plaid institution '{row['institution']}' (730d)")
+        self.storage.log_budget_event("connector_added", f"Connected Plaid institution '{row['institution']}' (730d requested)")
         return self._to_connection_out(row)
 
-    def _ensure_local_account_for_normalized(self, acct: NormalizedAccount) -> int:
+    def _ensure_local_account_for_normalized(
+        self,
+        acct: NormalizedAccount,
+        *,
+        connection_id: Optional[int] = None,
+    ) -> int:
         existing_accounts = self.storage.list_accounts()
-        for local in existing_accounts:
-            if (
-                local["name"].strip().lower() == acct.name.strip().lower()
-                and local.get("institution", "").strip().lower() == acct.institution.strip().lower()
-            ):
-                self.storage.set_account_balance(int(local["id"]), acct.balance_cents)
-                return int(local["id"])
+        ext_id = (acct.external_account_id or "").strip()
+        inst_low = (acct.institution or "").strip().lower()
+        name_low = (acct.name or "").strip().lower()
+        acct_type = (
+            acct.account_type
+            if acct.account_type in ("checking", "savings", "credit", "cash", "trading")
+            else "checking"
+        )
+        curr = (acct.currency or "USD").strip().upper()[:8] or "USD"
+
+        matched: Optional[Dict[str, Any]] = None
+        # 1. Exact provider external_account_id match (scoped to connection_id or institution)
+        if ext_id:
+            for local in existing_accounts:
+                loc_ext = str(local.get("external_id") or "").strip()
+                if not loc_ext or loc_ext != ext_id:
+                    continue
+                loc_cid = local.get("connection_id")
+                if connection_id is not None and loc_cid is not None and int(loc_cid) == int(connection_id):
+                    matched = local
+                    break
+                if loc_cid is None and local.get("institution", "").strip().lower() == inst_low:
+                    matched = local
+                    break
+
+        # 2. Fallback match ONLY for legacy/unlinked rows that do not yet have an external_id
+        if matched is None:
+            for local in existing_accounts:
+                if str(local.get("external_id") or "").strip():
+                    # Never collapse two distinct provider accounts that happen to share a display name!
+                    continue
+                if (
+                    local["name"].strip().lower() == name_low
+                    and local.get("institution", "").strip().lower() == inst_low
+                    and local.get("account_type") == acct_type
+                ):
+                    matched = local
+                    break
+
+        if matched is not None:
+            self.storage.set_account_balance(
+                int(matched["id"]),
+                acct.balance_cents,
+                available_cents=acct.available_cents,
+                credit_limit_cents=acct.credit_limit_cents,
+                currency=curr,
+                mask=acct.mask,
+                connection_id=connection_id,
+                external_id=ext_id or None,
+            )
+            return int(matched["id"])
+
         created = self.storage.create_account(
             name=acct.name[:80],
-            account_type=acct.account_type if acct.account_type in ("checking", "savings", "credit", "cash", "trading") else "checking",
+            account_type=acct_type,
             balance_cents=acct.balance_cents,
             institution=acct.institution[:80],
             is_liquid=acct.is_liquid,
+            currency=curr,
+            available_cents=acct.available_cents,
+            credit_limit_cents=acct.credit_limit_cents,
+            mask=acct.mask,
+            connection_id=connection_id,
+            external_id=ext_id,
         )
         return int(created["id"])
 
@@ -1860,7 +2053,12 @@ class FinanceService:
                 tx_indexes[acct_id] = self._load_account_tx_index(acct_id)
             norm = normalize_merchant(ntx.merchant)
             if self._matches_cross_source_duplicate(
-                tx_indexes[acct_id], ntx.tx_date, ntx.tx_type, ntx.amount_cents, norm
+                tx_indexes[acct_id],
+                ntx.tx_date,
+                ntx.tx_type,
+                ntx.amount_cents,
+                norm,
+                source_tag=source_tag,
             ):
                 duplicates += 1
                 continue
@@ -1875,6 +2073,7 @@ class FinanceService:
                 source=source_tag,
                 deduplicate=True,
                 external_id=ntx.external_id,
+                transfer_direction=ntx.transfer_direction,
                 adjust_balance=False,
                 run_auto_sync=False,
                 apply_rules=True,
@@ -1891,9 +2090,116 @@ class FinanceService:
                     pass
         return imported, duplicates
 
+    def _apply_modified_transactions(
+        self,
+        *,
+        acct_map: Dict[str, int],
+        modified: Sequence[NormalizedTransaction],
+        source_tag: str,
+    ) -> Tuple[int, int]:
+        """Apply provider `modified` deltas in place when `external_id` exists, or insert if unseen."""
+        updated_count = 0
+        inserted_count = 0
+        unseen: List[NormalizedTransaction] = []
+        for ntx in modified:
+            if ntx.pending:
+                if ntx.external_id:
+                    self.storage.delete_provider_transactions(
+                        external_ids=[ntx.external_id],
+                        account_ids=list(acct_map.values()) or None,
+                    )
+                continue
+            existing = (
+                self.storage.find_provider_transaction(
+                    external_id=ntx.external_id,
+                    account_id=acct_map.get(ntx.external_account_id),
+                )
+                if ntx.external_id
+                else None
+            )
+            if existing is None:
+                unseen.append(ntx)
+                continue
+            tx_id = int(existing["id"])
+            acct_id = acct_map.get(ntx.external_account_id, int(existing["account_id"]))
+            norm = normalize_merchant(ntx.merchant)
+            fp = compute_tx_fingerprint(
+                acct_id,
+                ntx.tx_date,
+                ntx.tx_type,
+                ntx.amount_cents,
+                norm,
+                ntx.memo,
+                external_id=ntx.external_id,
+            )
+            upd: Dict[str, Any] = {
+                "account_id": acct_id,
+                "tx_type": ntx.tx_type,
+                "amount_cents": ntx.amount_cents,
+                "merchant": ntx.merchant.strip(),
+                "normalized_merchant": norm,
+                "memo": ntx.memo.strip(),
+                "tx_date": ntx.tx_date,
+                "fingerprint": fp,
+                "transfer_direction": ntx.transfer_direction,
+            }
+            if ntx.subcategory:
+                upd["subcategory"] = ntx.subcategory
+            after = self.storage.update_transaction(tx_id, upd)
+            if after:
+                self._apply_active_rules_to_tx(after)
+                updated_count += 1
+        if unseen:
+            ins, _ = self._ingest_normalized_transactions(
+                acct_map=acct_map,
+                transactions=unseen,
+                source_tag=source_tag,
+            )
+            inserted_count += ins
+        return updated_count, inserted_count
+
+    @staticmethod
+    def _merge_tradeline_payload(
+        existing: Dict[str, Any],
+        incoming: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Safely merge an incoming synced tradeline into an existing `credit_lines` row without
+        clobbering user-configured APRs, promo settings, autopay, or custom closing/due days
+        when the provider omitted those fields.
+        """
+        merged: Dict[str, Any] = {
+            "balance_cents": max(0, int(incoming.get("balance_cents", existing.get("balance_cents", 0)))),
+            "is_overdue": bool(incoming.get("is_overdue", existing.get("is_overdue", False))),
+        }
+        inc_limit = int(incoming.get("credit_limit_cents") or 0)
+        if inc_limit > 0 or int(existing.get("credit_limit_cents") or 0) == 0:
+            merged["credit_limit_cents"] = inc_limit
+        inc_min = int(incoming.get("min_payment_cents") or 0)
+        if inc_min > 0 or int(existing.get("min_payment_cents") or 0) == 0:
+            merged["min_payment_cents"] = inc_min
+
+        inc_apr = int(incoming.get("apr_bps") or 0)
+        if inc_apr > 0:
+            merged["apr_bps"] = inc_apr
+        elif int(existing.get("apr_bps") or 0) == 0 and incoming.get("apr_provided"):
+            merged["apr_bps"] = 0
+
+        if incoming.get("closing_day_provided") is True:
+            merged["statement_closing_day"] = int(incoming["statement_closing_day"])
+        if incoming.get("due_day_provided") is True:
+            merged["payment_due_day"] = int(incoming["payment_due_day"])
+
+        for opt_k in ("issuer", "opened_date", "statement_balance_cents", "next_due_date", "external_account_id", "source"):
+            val = incoming.get(opt_k)
+            if val is not None and str(val).strip() != "":
+                merged[opt_k] = val
+        if incoming.get("is_authorized_user") is not None:
+            merged["is_authorized_user"] = bool(incoming["is_authorized_user"])
+        return merged
+
     def sync_plaid(self, connection_id: Optional[int] = None) -> Dict[str, Any]:
         self._require_vault_unlocked()
-        client, _env = self._build_plaid_client()
         all_conns = self.storage.list_connections()
         targets = [
             c
@@ -1904,84 +2210,229 @@ class FinanceService:
             raise ConnectorError("No linked Plaid connections found.")
 
         total_imported = 0
+        total_modified = 0
         total_dups = 0
         total_removed = 0
         liabilities_synced = 0
         holdings_synced = 0
+        backfill_statuses: List[str] = []
+        overall_min_date: Optional[str] = None
+        overall_max_date: Optional[str] = None
 
         for conn in targets:
             cid = int(conn["id"])
             creds = self.secrets.get_json(f"conn:{cid}")
             if not creds or not creds.get("access_token"):
-                self.storage.upsert_connection({"id": cid, "provider": "plaid", "status": "needs_reauth"})
+                self.storage.upsert_connection(
+                    {
+                        "id": cid,
+                        "provider": "plaid",
+                        "status": "needs_reauth",
+                        "last_error": "Missing sealed Plaid access_token; reconnect required.",
+                    }
+                )
                 continue
+            conn_env = str(conn.get("env") or creds.get("env") or "production").strip().lower()
+            client, _ = self._build_plaid_client(env_override=conn_env, creds_override=creds)
             access_token = str(creds["access_token"])
             cursor = str(conn.get("sync_cursor") or "") or None
             institution = str(conn.get("institution") or "Plaid")
 
-            sync_res = client.sync_transactions(access_token, cursor=cursor, institution=institution)
+            try:
+                sync_res = client.sync_transactions(access_token, cursor=cursor, institution=institution)
+            except ConnectorAuthError as exc:
+                self.storage.upsert_connection(
+                    {
+                        "id": cid,
+                        "provider": "plaid",
+                        "status": "needs_reauth",
+                        "last_error": str(exc)[:240],
+                    }
+                )
+                raise
+
             try:
                 bal_accounts = client.get_accounts_balances(access_token, institution=institution)
+            except ConnectorAuthError as exc:
+                self.storage.upsert_connection(
+                    {
+                        "id": cid,
+                        "provider": "plaid",
+                        "status": "needs_reauth",
+                        "last_error": str(exc)[:240],
+                    }
+                )
+                raise
             except ConnectorError:
                 bal_accounts = sync_res.accounts
 
-            acct_map: Dict[str, int] = {}
-            for na in bal_accounts or sync_res.accounts:
-                acct_map[na.external_id] = self._ensure_local_account_for_normalized(na)
-
-            imp, dups = self._ingest_normalized_transactions(
-                acct_map=acct_map,
-                transactions=list(sync_res.added) + list(sync_res.modified),
-                source_tag="plaid_sync",
-            )
-            total_imported += imp
-            total_dups += dups
-            total_removed += len(sync_res.removed_tx_ids)
-
-            # Optional Plaid Liabilities -> credit_lines
+            # Optional Plaid Liabilities & Investments fetched BEFORE committing cursor atomically
+            liabs_payloads: Optional[List[Dict[str, Any]]] = None
             try:
                 liabs = client.get_liabilities(access_token, institution=institution)
-                payloads = self.plaid_liabilities_adapter.to_credit_line_payloads(liabs)
-                existing_lines = {cl["name"].strip().lower(): cl for cl in self.storage.list_credit_lines(active_only=False)}
-                for pl in payloads:
-                    key = str(pl.get("name", "")).strip().lower()
-                    if key in existing_lines:
-                        self.storage.update_credit_line(int(existing_lines[key]["id"]), pl)
-                    else:
-                        self.storage.create_credit_line(pl)
-                    liabilities_synced += 1
+                liabs_payloads = self.plaid_liabilities_adapter.to_credit_line_payloads(liabs)
             except ConnectorError:
-                pass
+                liabs_payloads = None
 
-            # Optional Plaid Investments -> holdings
+            inv_holdings: Optional[List[NormalizedHolding]] = None
             try:
                 inv_holdings = client.get_investments_holdings(access_token)
-                for nh in inv_holdings:
-                    self._upsert_normalized_holding(nh, connection_id=cid, account_id=acct_map.get(nh.external_account_id))
-                    holdings_synced += 1
             except ConnectorError:
-                pass
+                inv_holdings = None
 
-            self.storage.upsert_connection(
-                {
-                    "id": cid,
-                    "provider": "plaid",
-                    "sync_cursor": sync_res.next_cursor or "",
-                    "status": "active",
-                    "last_synced_at": utc_now_iso(),
-                }
-            )
+            # Compute imported date window & honest backfill status
+            seen_dates = [
+                ntx.tx_date
+                for ntx in list(sync_res.added) + list(sync_res.modified)
+                if not ntx.pending and ntx.tx_date
+            ]
+            prev_min = conn.get("imported_start_date")
+            prev_max = conn.get("imported_end_date")
+            if prev_min:
+                seen_dates.append(str(prev_min))
+            if prev_max:
+                seen_dates.append(str(prev_max))
+            imp_start = min(seen_dates) if seen_dates else None
+            imp_end = max(seen_dates) if seen_dates else None
+            if imp_start and (overall_min_date is None or imp_start < overall_min_date):
+                overall_min_date = imp_start
+            if imp_end and (overall_max_date is None or imp_end > overall_max_date):
+                overall_max_date = imp_end
+
+            up_status = (sync_res.transactions_update_status or "").strip().upper()
+            hist_req = int(conn.get("history_days_requested", 730))
+            if up_status == "HISTORICAL_UPDATE_COMPLETE":
+                bf_status = "complete"
+            elif up_status in ("INITIAL_UPDATE_COMPLETE", "NOT_READY"):
+                bf_status = "backfill_pending"
+            elif cursor is None and hist_req >= 730:
+                if imp_start:
+                    try:
+                        span_days = (date.today() - date.fromisoformat(imp_start[:10])).days
+                    except ValueError:
+                        span_days = 0
+                    bf_status = "complete" if span_days >= 60 else "backfill_pending"
+                else:
+                    bf_status = "backfill_pending"
+            else:
+                bf_status = "complete" if str(conn.get("backfill_status") or "") == "complete" or cursor is not None else "backfill_pending"
+            backfill_statuses.append(bf_status)
+
+            # Commit accounts, added/modified/removed transactions, liabilities, holdings, and cursor atomically
+            with self.storage.transaction(immediate=True):
+                acct_map: Dict[str, int] = {}
+                for na in bal_accounts or sync_res.accounts:
+                    acct_map[na.external_account_id] = self._ensure_local_account_for_normalized(
+                        na, connection_id=cid
+                    )
+
+                imp, dups = self._ingest_normalized_transactions(
+                    acct_map=acct_map,
+                    transactions=list(sync_res.added),
+                    source_tag="plaid_sync",
+                )
+                mod_upd, mod_ins = self._apply_modified_transactions(
+                    acct_map=acct_map,
+                    modified=list(sync_res.modified),
+                    source_tag="plaid_sync",
+                )
+                rem_deleted = self.storage.delete_provider_transactions(
+                    external_ids=sync_res.removed_external_ids,
+                    account_ids=list(acct_map.values()) or None,
+                )
+                total_imported += imp + mod_ins
+                total_modified += mod_upd
+                total_dups += dups
+                total_removed += rem_deleted
+
+                if liabs_payloads is not None:
+                    is_sbx = conn_env == "sandbox"
+                    existing_lines_list = self.storage.list_credit_lines(
+                        active_only=False, include_sandbox=is_sbx
+                    )
+                    if is_sbx:
+                        existing_lines_list = [
+                            cl
+                            for cl in existing_lines_list
+                            if str(cl.get("source_env") or "production").lower() == "sandbox"
+                        ]
+                    by_ext = {
+                        str(cl.get("external_account_id") or "").strip(): cl
+                        for cl in existing_lines_list
+                        if str(cl.get("external_account_id") or "").strip()
+                    }
+                    by_name = {cl["name"].strip().lower(): cl for cl in existing_lines_list}
+                    for pl in liabs_payloads:
+                        clean_pl = {
+                            k: v
+                            for k, v in pl.items()
+                            if k not in ("apr_provided", "closing_day_provided", "due_day_provided")
+                        }
+                        clean_pl["is_sandbox"] = is_sbx
+                        clean_pl["source_env"] = conn_env
+                        ext_key = str(pl.get("external_account_id") or "").strip()
+                        name_key = str(pl.get("name") or "").strip().lower()
+                        target_cl = by_ext.get(ext_key) if ext_key else None
+                        if target_cl is None and name_key:
+                            target_cl = by_name.get(name_key)
+                        if target_cl is not None:
+                            merged_pl = self._merge_tradeline_payload(target_cl, pl)
+                            self.storage.update_credit_line(int(target_cl["id"]), merged_pl)
+                        else:
+                            created_cl = self.storage.create_credit_line(clean_pl)
+                            if ext_key:
+                                by_ext[ext_key] = created_cl
+                            if name_key:
+                                by_name[name_key] = created_cl
+                        liabilities_synced += 1
+
+                if inv_holdings is not None:
+                    keep_ids: List[int] = []
+                    for nh in inv_holdings:
+                        saved_h = self._upsert_normalized_holding(
+                            nh,
+                            connection_id=cid,
+                            account_id=acct_map.get(nh.external_account_id),
+                        )
+                        keep_ids.append(saved_h.id)
+                        holdings_synced += 1
+                    self.storage.prune_connection_holdings(cid, keep_ids)
+
+                self.storage.upsert_connection(
+                    {
+                        "id": cid,
+                        "provider": "plaid",
+                        "sync_cursor": sync_res.next_cursor or "",
+                        "status": "active",
+                        "backfill_status": bf_status,
+                        "imported_start_date": imp_start,
+                        "imported_end_date": imp_end,
+                        "last_error": "",
+                        "last_synced_at": utc_now_iso(),
+                    }
+                )
 
         self._backfill_net_worth_snapshots(days=_LOOKBACK_730D)
         sync_summary = self.run_self_updating_sync(reason=f"Plaid synced ({total_imported} new tx)")
+        any_pending = "backfill_pending" in backfill_statuses
+        range_str = f"{overall_min_date} to {overall_max_date}" if (overall_min_date and overall_max_date) else "no posted rows yet"
+        hist_note = (
+            f"Initial sync imported ({range_str}); 730-day historical backfill still pending from institution."
+            if any_pending
+            else f"Plaid sync complete ({range_str})."
+        )
         return {
             "synced_connections": len(targets),
             "imported_count": total_imported,
+            "modified_count": total_modified,
             "duplicate_count": total_dups,
             "removed_count": total_removed,
             "liabilities_synced": liabilities_synced,
             "holdings_synced": holdings_synced,
-            "history_note": "730-day history applies when linking new Items; existing Items require re-Link for 2-year backfill.",
+            "backfill_status": "backfill_pending" if any_pending else "complete",
+            "imported_start_date": overall_min_date,
+            "imported_end_date": overall_max_date,
+            "history_note": hist_note,
             "sync": sync_summary,
         }
 
@@ -1998,6 +2449,7 @@ class FinanceService:
                 "env": "production",
                 "status": "active",
                 "history_days_requested": 730,
+                "last_error": "",
             }
         )
         self.secrets.set_json(f"conn:{row['id']}", {"access_url": access_url})
@@ -2022,28 +2474,62 @@ class FinanceService:
             cid = int(conn["id"])
             creds = self.secrets.get_json(f"conn:{cid}")
             if not creds or not creds.get("access_url"):
-                self.storage.upsert_connection({"id": cid, "provider": "simplefin", "status": "needs_reauth"})
+                self.storage.upsert_connection(
+                    {
+                        "id": cid,
+                        "provider": "simplefin",
+                        "status": "needs_reauth",
+                        "last_error": "Missing sealed SimpleFIN access URL; reconnect required.",
+                    }
+                )
                 continue
-            res = client.fetch_accounts(str(creds["access_url"]), days=max(1, min(730, int(days))))
-            acct_map: Dict[str, int] = {}
-            for na in res.accounts:
-                acct_map[na.external_id] = self._ensure_local_account_for_normalized(na)
-                accounts_synced += 1
-            imp, dups = self._ingest_normalized_transactions(
-                acct_map=acct_map,
-                transactions=res.added,
-                source_tag="simplefin_sync",
-            )
-            total_imported += imp
-            total_dups += dups
-            self.storage.upsert_connection(
-                {
-                    "id": cid,
-                    "provider": "simplefin",
-                    "status": "active",
-                    "last_synced_at": utc_now_iso(),
-                }
-            )
+            try:
+                res = client.fetch_accounts(str(creds["access_url"]), days=max(1, min(730, int(days))))
+            except ConnectorAuthError as exc:
+                self.storage.upsert_connection(
+                    {
+                        "id": cid,
+                        "provider": "simplefin",
+                        "status": "needs_reauth",
+                        "last_error": str(exc)[:240],
+                    }
+                )
+                raise
+
+            seen_dates = [ntx.tx_date for ntx in res.added if not ntx.pending and ntx.tx_date]
+            if conn.get("imported_start_date"):
+                seen_dates.append(str(conn["imported_start_date"]))
+            if conn.get("imported_end_date"):
+                seen_dates.append(str(conn["imported_end_date"]))
+            imp_start = min(seen_dates) if seen_dates else None
+            imp_end = max(seen_dates) if seen_dates else None
+
+            with self.storage.transaction(immediate=True):
+                acct_map: Dict[str, int] = {}
+                for na in res.accounts:
+                    acct_map[na.external_account_id] = self._ensure_local_account_for_normalized(
+                        na, connection_id=cid
+                    )
+                    accounts_synced += 1
+                imp, dups = self._ingest_normalized_transactions(
+                    acct_map=acct_map,
+                    transactions=res.added,
+                    source_tag="simplefin_sync",
+                )
+                total_imported += imp
+                total_dups += dups
+                self.storage.upsert_connection(
+                    {
+                        "id": cid,
+                        "provider": "simplefin",
+                        "status": "active",
+                        "backfill_status": "complete",
+                        "imported_start_date": imp_start,
+                        "imported_end_date": imp_end,
+                        "last_error": "",
+                        "last_synced_at": utc_now_iso(),
+                    }
+                )
 
         self._backfill_net_worth_snapshots(days=_LOOKBACK_730D)
         sync_summary = self.run_self_updating_sync(reason=f"SimpleFIN synced ({total_imported} new tx)")
@@ -2254,18 +2740,94 @@ class FinanceService:
         tx_type: str,
         amount_cents: int,
         norm_merchant: str,
+        *,
+        source_tag: str = "",
+        consume: bool = True,
     ) -> bool:
-        """Detect same transaction across Plaid JSON vs Navy Federal CSV/PDF (±2d posting lag)."""
+        """
+        Detect same transaction across DIFFERENT ingestion sources (e.g., Plaid sync vs CSV/PDF/OFX
+        with ±2d posting lag). Never collapses two distinct transactions from the SAME source!
+        """
         try:
             cand_dt = date.fromisoformat(tx_date_str)
         except ValueError:
             return False
-        for ex_dt, ex_type, ex_amt, ex_norm, _ex_src in existing_index:
+        for idx, (ex_dt, ex_type, ex_amt, ex_norm, ex_src) in enumerate(existing_index):
+            if source_tag and ex_src == source_tag:
+                continue
             if ex_amt != amount_cents or ex_type != tx_type:
                 continue
             if abs((cand_dt - ex_dt).days) <= 2 and self._merchants_semantically_match(norm_merchant, ex_norm):
+                if consume:
+                    existing_index.pop(idx)
                 return True
         return False
+
+    def _resolve_statement_target_account_id(
+        self,
+        *,
+        explicit_account_id: Optional[int],
+        row_hint: str = "",
+        doc_hint: str = "",
+        doc_type: str = "",
+        institution: str = "",
+        allow_create: bool = True,
+    ) -> int:
+        if explicit_account_id is not None:
+            return int(explicit_account_id)
+
+        hint = (row_hint or doc_hint or "").strip()
+        hint_low = hint.lower()
+        inferred_type = (doc_type or "").strip().lower()
+        if "saving" in hint_low or "money market" in hint_low or "share" in hint_low:
+            inferred_type = "savings"
+        elif any(k in hint_low for k in ("credit card", "visa", "mastercard", "amex", "revolving")):
+            inferred_type = "credit"
+        elif "checking" in hint_low:
+            inferred_type = "checking"
+
+        if not hint and not inferred_type:
+            return self.storage.get_default_account_id()
+
+        accounts = self.storage.list_accounts()
+        # 1. Exact or substring name / mask match
+        if hint:
+            digits_tail = "".join(ch for ch in hint if ch.isdigit())[-4:]
+            for acct in accounts:
+                aname = str(acct.get("name") or "").strip().lower()
+                amask = str(acct.get("mask") or "").strip()
+                if aname == hint_low or (len(hint_low) >= 5 and (hint_low in aname or aname in hint_low)):
+                    if not inferred_type or acct.get("account_type") == inferred_type:
+                        return int(acct["id"])
+                if len(digits_tail) == 4 and amask == digits_tail:
+                    return int(acct["id"])
+
+        # 2. Match existing account of the same inferred account_type
+        if inferred_type:
+            typed_matches = [a for a in accounts if a.get("account_type") == inferred_type]
+            if typed_matches:
+                return int(typed_matches[0]["id"])
+            if allow_create and inferred_type in ("savings", "credit", "cash", "trading"):
+                clean_inst = (
+                    "Navy Federal"
+                    if institution == "navy_federal"
+                    else (institution.replace("_", " ").title() if institution and institution not in ("auto", "generic") else "")
+                )
+                acct_label = (
+                    hint[:60]
+                    if hint and not hint.isdigit()
+                    else (f"{clean_inst} {inferred_type.title()}".strip() or f"{inferred_type.title()} Account")
+                )
+                created = self.storage.create_account(
+                    name=acct_label,
+                    account_type=inferred_type,
+                    balance_cents=0,
+                    institution=clean_inst[:60],
+                    is_liquid=(inferred_type != "trading"),
+                )
+                return int(created["id"])
+
+        return self.storage.get_default_account_id()
 
     def preview_statement(
         self,
@@ -2286,23 +2848,54 @@ class FinanceService:
             institution=institution,
             skip_pending=skip_pending,
         )
-        acct_id = account_id if account_id is not None else self.storage.get_default_account_id()
+        source_tag = (
+            f"{res.detected_institution}_{res.format_detected}_import"
+            if res.detected_institution in ("navy_federal", "plaid")
+            else f"{res.format_detected}_import"
+        )
+        default_target_id = self._resolve_statement_target_account_id(
+            explicit_account_id=account_id,
+            doc_hint=res.detected_account_hint,
+            doc_type=res.detected_account_type,
+            institution=res.detected_institution,
+            allow_create=False,
+        )
         existing_fps = {
             r["fingerprint"]
             for r in self.storage._conn.execute("SELECT fingerprint FROM transactions WHERE fingerprint IS NOT NULL").fetchall()
         }
-        existing_index = self._load_account_tx_index(acct_id)
+        index_by_acct: Dict[int, List[Tuple[date, str, int, str, str]]] = {}
         dup_count = 0
         cross_source_dups = 0
         sample = []
         for r in res.rows:
+            row_acct_id = (
+                self._resolve_statement_target_account_id(
+                    explicit_account_id=account_id,
+                    row_hint=r.account_hint,
+                    doc_hint=res.detected_account_hint,
+                    doc_type=res.detected_account_type,
+                    institution=res.detected_institution,
+                    allow_create=False,
+                )
+                if account_id is None and r.account_hint
+                else default_target_id
+            )
+            if row_acct_id not in index_by_acct:
+                index_by_acct[row_acct_id] = self._load_account_tx_index(row_acct_id)
             norm = normalize_merchant(r.merchant)
             fp = compute_tx_fingerprint(
-                acct_id, r.tx_date, r.tx_type, r.amount_cents, norm, r.memo, external_id=r.external_id
+                row_acct_id, r.tx_date, r.tx_type, r.amount_cents, norm, r.memo, external_id=r.external_id
             )
             is_exact_dup = fp in existing_fps
             is_cross_dup = (not is_exact_dup) and self._matches_cross_source_duplicate(
-                existing_index, r.tx_date, r.tx_type, r.amount_cents, norm
+                index_by_acct[row_acct_id],
+                r.tx_date,
+                r.tx_type,
+                r.amount_cents,
+                norm,
+                source_tag=source_tag,
+                consume=True,
             )
             is_dup = is_exact_dup or is_cross_dup
             if is_dup:
@@ -2316,13 +2909,20 @@ class FinanceService:
                         "merchant": r.merchant,
                         "tx_type": r.tx_type,
                         "amount_cents": r.amount_cents,
+                        "account_hint": r.account_hint or res.detected_account_hint,
                         "duplicate": is_dup,
                         "cross_source_duplicate": is_cross_dup,
                     }
                 )
+        target_acct = self.storage.get_account(default_target_id)
         return {
             "format_detected": res.format_detected,
             "detected_institution": res.detected_institution,
+            "detected_account_hint": res.detected_account_hint,
+            "detected_account_type": res.detected_account_type,
+            "target_account_id": default_target_id,
+            "target_account_name": str(target_acct["name"]) if target_acct else "",
+            "parse_failed": bool(res.parse_failed),
             "total_parsed": len(res.rows),
             "new_count": max(0, len(res.rows) - dup_count),
             "duplicate_count": dup_count,
@@ -2355,9 +2955,15 @@ class FinanceService:
             institution=institution,
             skip_pending=skip_pending,
         )
-        acct_id = account_id if account_id is not None else self.storage.get_default_account_id()
+        default_acct_id = self._resolve_statement_target_account_id(
+            explicit_account_id=account_id,
+            doc_hint=res.detected_account_hint,
+            doc_type=res.detected_account_type,
+            institution=res.detected_institution,
+            allow_create=(account_id is None and len(res.rows) > 0),
+        )
         should_sync_balance = sync_balance if sync_balance is not None else sync_ofx_balance
-        existing_index = self._load_account_tx_index(acct_id)
+        index_by_acct: Dict[int, List[Tuple[date, str, int, str, str]]] = {}
         source_tag = (
             f"{res.detected_institution}_{res.format_detected}_import"
             if res.detected_institution in ("navy_federal", "plaid")
@@ -2366,14 +2972,44 @@ class FinanceService:
         imported = 0
         duplicates = 0
         cross_source_dups = 0
+        touched_accts: set[int] = set()
         for r in res.rows:
+            row_acct_id = (
+                self._resolve_statement_target_account_id(
+                    explicit_account_id=account_id,
+                    row_hint=r.account_hint,
+                    doc_hint=res.detected_account_hint,
+                    doc_type=res.detected_account_type,
+                    institution=res.detected_institution,
+                    allow_create=True,
+                )
+                if account_id is None and r.account_hint
+                else default_acct_id
+            )
+            touched_accts.add(row_acct_id)
+            if row_acct_id not in index_by_acct:
+                index_by_acct[row_acct_id] = self._load_account_tx_index(row_acct_id)
             norm = normalize_merchant(r.merchant)
-            if self._matches_cross_source_duplicate(existing_index, r.tx_date, r.tx_type, r.amount_cents, norm):
+            if self._matches_cross_source_duplicate(
+                index_by_acct[row_acct_id],
+                r.tx_date,
+                r.tx_type,
+                r.amount_cents,
+                norm,
+                source_tag=source_tag,
+                consume=True,
+            ):
                 duplicates += 1
                 cross_source_dups += 1
                 continue
+            row_syncs_doc_balance = (
+                should_sync_balance
+                and res.detected_balance_cents is not None
+                and row_acct_id == default_acct_id
+                and len(touched_accts) <= 1
+            )
             tx = self.add_transaction_raw(
-                account_id=acct_id,
+                account_id=row_acct_id,
                 tx_type=r.tx_type,
                 amount_cents=r.amount_cents,
                 merchant=r.merchant,
@@ -2382,7 +3018,8 @@ class FinanceService:
                 source=source_tag,
                 deduplicate=True,
                 external_id=r.external_id,
-                adjust_balance=not (should_sync_balance and res.detected_balance_cents is not None),
+                transfer_direction=r.transfer_direction,
+                adjust_balance=not row_syncs_doc_balance,
                 run_auto_sync=False,
                 apply_rules=True,
             )
@@ -2390,9 +3027,15 @@ class FinanceService:
                 duplicates += 1
             else:
                 imported += 1
+                try:
+                    index_by_acct[row_acct_id].append(
+                        (date.fromisoformat(r.tx_date), r.tx_type, r.amount_cents, norm, source_tag)
+                    )
+                except ValueError:
+                    pass
 
-        if should_sync_balance and res.detected_balance_cents is not None:
-            self.storage.set_account_balance(acct_id, res.detected_balance_cents)
+        if should_sync_balance and res.detected_balance_cents is not None and len(touched_accts) <= 1:
+            self.storage.set_account_balance(default_acct_id, res.detected_balance_cents)
 
         self._backfill_net_worth_snapshots(days=_LOOKBACK_730D)
         inst_label = (
@@ -2400,12 +3043,35 @@ class FinanceService:
             if res.detected_institution == "navy_federal"
             else ("Plaid" if res.detected_institution == "plaid" else res.format_detected.upper())
         )
-        sync = self.run_self_updating_sync(
-            reason=f"Imported {imported} {inst_label} ({res.format_detected.upper()}) transactions"
+        sync = (
+            self.run_self_updating_sync(
+                reason=f"Imported {imported} {inst_label} ({res.format_detected.upper()}) transactions"
+            )
+            if imported > 0 or (should_sync_balance and res.detected_balance_cents is not None)
+            else self._compute_budget()
         )
+        sync_dict = (
+            sync
+            if isinstance(sync, dict)
+            else {
+                "bills_detected": 0,
+                "jars_adjusted": 0,
+                "price_hikes": [],
+                "safe_to_spend_cents": sync.safe_to_spend.safe_to_spend_cents,
+                "daily_safe_to_spend_cents": sync.safe_to_spend.daily_safe_to_spend_cents,
+                "safe_to_invest_cents": sync.safe_to_invest_cents,
+            }
+        )
+        target_acct = self.storage.get_account(default_acct_id)
         return {
             "format_detected": res.format_detected,
             "detected_institution": res.detected_institution,
+            "detected_account_hint": res.detected_account_hint,
+            "detected_account_type": res.detected_account_type,
+            "target_account_id": default_acct_id,
+            "target_account_name": str(target_acct["name"]) if target_acct else "",
+            "parse_failed": bool(res.parse_failed),
+            "total_parsed": len(res.rows),
             "imported_count": imported,
             "duplicate_count": duplicates,
             "cross_source_duplicates": cross_source_dups,
@@ -2413,7 +3079,7 @@ class FinanceService:
             "transfers_detected": res.transfers_detected,
             "detected_balance_cents": res.detected_balance_cents,
             "warnings": res.warnings[:20],
-            "sync": sync,
+            "sync": sync_dict,
         }
 
     def import_csv(self, csv_text: str, account_id: Optional[int] = None, flip_expense_sign: bool = False) -> Dict[str, Any]:
@@ -2422,27 +3088,28 @@ class FinanceService:
         )
 
     def export_csv(self) -> str:
-        txs = self.storage.list_transactions(limit=_MAX_TX_LIMIT)
+        txs = self.storage.list_transactions(limit=None)
         return export_transactions_csv(txs)
 
-    # --- Credit Reports, Inquiries, Derogatories & Factor Simulator ---
+    # --- Credit Reports, Inquiries, Derogatories & Factor Analysis ---
 
     def get_credit_report(
         self,
         extra_monthly_budget_cents: int = 25_000,
         *,
         include_authorized_user: bool = True,
+        include_sandbox: bool = False,
         today: Optional[date] = None,
     ) -> CreditOptimizationReport:
         ref = today or date.today()
         budget = self._compute_budget(today=ref)
         return self.credit_optimizer.analyze(
-            raw_lines=self.storage.list_credit_lines(active_only=True),
+            raw_lines=self.storage.list_credit_lines(active_only=True, include_sandbox=include_sandbox),
             smoothed_monthly_income_cents=budget.smoothed_monthly_income_cents,
             extra_monthly_budget_cents=extra_monthly_budget_cents,
-            credit_reports=self.storage.list_credit_reports(),
-            credit_inquiries=self.storage.list_credit_inquiries(),
-            credit_derogatories=self.storage.list_credit_derogatories(active_only=False),
+            credit_reports=self.storage.list_credit_reports(include_sandbox=include_sandbox),
+            credit_inquiries=self.storage.list_credit_inquiries(include_sandbox=include_sandbox),
+            credit_derogatories=self.storage.list_credit_derogatories(active_only=False, include_sandbox=include_sandbox),
             include_authorized_user=include_authorized_user,
             today=ref,
         )
@@ -2474,8 +3141,8 @@ class FinanceService:
     def evaluate_balance_transfer(self, req: BalanceTransferRequest) -> BalanceTransferResult:
         return self.credit_optimizer.evaluate_balance_transfer(req)
 
-    def list_credit_reports(self) -> List[CreditReportOut]:
-        return [CreditReportOut(**r) for r in self.storage.list_credit_reports()]
+    def list_credit_reports(self, *, include_sandbox: bool = False) -> List[CreditReportOut]:
+        return [CreditReportOut(**r) for r in self.storage.list_credit_reports(include_sandbox=include_sandbox)]
 
     def create_credit_report(self, req: CreditReportCreate) -> CreditReportOut:
         saved = self.storage.create_credit_report(req.model_dump())
@@ -2484,10 +3151,10 @@ class FinanceService:
     def delete_credit_report(self, report_id: int) -> bool:
         return self.storage.delete_credit_report(report_id)
 
-    def list_credit_inquiries(self) -> List[CreditInquiryOut]:
+    def list_credit_inquiries(self, *, include_sandbox: bool = False) -> List[CreditInquiryOut]:
         today_str = date.today().isoformat()
         out = []
-        for r in self.storage.list_credit_inquiries():
+        for r in self.storage.list_credit_inquiries(include_sandbox=include_sandbox):
             out.append(
                 CreditInquiryOut(
                     id=int(r["id"]),
@@ -2519,8 +3186,11 @@ class FinanceService:
     def delete_credit_inquiry(self, inquiry_id: int) -> bool:
         return self.storage.delete_credit_inquiry(inquiry_id)
 
-    def list_credit_derogatories(self) -> List[CreditDerogatoryOut]:
-        return [CreditDerogatoryOut(**r) for r in self.storage.list_credit_derogatories(active_only=False)]
+    def list_credit_derogatories(self, *, include_sandbox: bool = False) -> List[CreditDerogatoryOut]:
+        return [
+            CreditDerogatoryOut(**r)
+            for r in self.storage.list_credit_derogatories(active_only=False, include_sandbox=include_sandbox)
+        ]
 
     def create_credit_derogatory(self, req: CreditDerogatoryCreate) -> CreditDerogatoryOut:
         saved = self.storage.create_credit_derogatory(req.model_dump())
@@ -2556,6 +3226,8 @@ class FinanceService:
                             "score": int(rep.score),
                             "pulled_date": rep.pulled_date,
                             "source": rep.source,
+                            "is_sandbox": False,
+                            "source_env": "production",
                         }
                     )
                     committed_counts["reports"] += 1
@@ -2567,6 +3239,8 @@ class FinanceService:
                         "inquiry_date": inq.inquiry_date,
                         "counts_until": inq.counts_until,
                         "drops_off": inq.drops_off,
+                        "is_sandbox": False,
+                        "source_env": "production",
                     }
                 )
                 committed_counts["inquiries"] += 1
@@ -2589,11 +3263,32 @@ class FinanceService:
                         "opened_date": der.opened_date,
                         "drops_off": der.drops_off,
                         "active": der.active,
+                        "is_sandbox": False,
+                        "source_env": "production",
                     }
                 )
                 committed_counts["derogatories"] += 1
+            existing_lines = {
+                str(cl["name"]).strip().lower(): cl
+                for cl in self.storage.list_credit_lines(active_only=False, include_sandbox=False)
+            }
             for tl in bundle.tradelines:
-                self.storage.create_credit_line(tl.to_credit_line_payload())
+                pl = tl.to_credit_line_payload()
+                name_key = str(pl.get("name") or "").strip().lower()
+                if name_key and name_key in existing_lines:
+                    merged_pl = self._merge_tradeline_payload(existing_lines[name_key], pl)
+                    self.storage.update_credit_line(int(existing_lines[name_key]["id"]), merged_pl)
+                else:
+                    clean_pl = {
+                        k: v
+                        for k, v in pl.items()
+                        if k not in ("apr_provided", "closing_day_provided", "due_day_provided")
+                    }
+                    clean_pl["is_sandbox"] = False
+                    clean_pl["source_env"] = "production"
+                    created_cl = self.storage.create_credit_line(clean_pl)
+                    if name_key:
+                        existing_lines[name_key] = created_cl
                 committed_counts["credit_lines"] += 1
             if sum(committed_counts.values()) > 0:
                 self.run_self_updating_sync(reason="Imported official credit report")
@@ -2616,7 +3311,7 @@ class FinanceService:
     ) -> BureauAPIAdapter:
         return BureauAPIAdapter(
             vendor=vendor,
-            env=env or "sandbox",
+            env=env or "production",
             api_base_url=creds.get("api_base_url"),
             api_key=creds.get("api_key"),
             api_secret=creds.get("api_secret"),
@@ -2644,7 +3339,7 @@ class FinanceService:
             vendor=vendor,  # type: ignore[arg-type]
             provider=provider,
             institution=str(row.get("institution") or CREDIT_API_VENDOR_SPECS[vendor]["display_name"]),
-            env=str(row.get("env", "sandbox")),
+            env=str(row.get("env", "production")),
             status=status,  # type: ignore[arg-type]
             api_key_masked=mask_secret(key_for_mask) if key_for_mask else "",
             has_credentials=bool(creds) if unlocked else True,
@@ -2652,6 +3347,7 @@ class FinanceService:
             has_report_key=bool(creds.get("report_key")) if unlocked else False,
             bureau=str(creds.get("bureau") or "equifax") if unlocked else "equifax",
             api_base_url=str(creds.get("api_base_url") or "") if unlocked else "",
+            last_error=str(row.get("last_error") or ""),
             last_synced_at=row.get("last_synced_at"),
             created_at=str(row.get("created_at", "")),
             updated_at=str(row.get("updated_at", "")),
@@ -2723,7 +3419,7 @@ class FinanceService:
             ]
         )
         item_key = hashlib.sha256(identity_seed.encode("utf-8")).hexdigest()[:16]
-        institution = req.label.strip() or f"{spec['display_name']} ({req.env.title()})"
+        institution = req.label.strip() or spec["display_name"]
         row = self.storage.upsert_connection(
             {
                 "provider": f"credit_api_{req.vendor}",
@@ -2731,6 +3427,7 @@ class FinanceService:
                 "institution": institution,
                 "env": req.env,
                 "status": "active",
+                "last_error": "",
             }
         )
         # Seal sensitive credentials strictly in secrets.enc (NEVER in SQLite)
@@ -2761,7 +3458,7 @@ class FinanceService:
                 "Encrypted credentials missing for this Credit Score API connection. Re-connect to seal new keys.",
                 provider=f"bureau_api_{vendor}",
             )
-        adapter = self._build_credit_api_adapter(vendor, str(conn.get("env") or "sandbox"), creds)
+        adapter = self._build_credit_api_adapter(vendor, str(conn.get("env") or "production"), creds)
         return conn, vendor, adapter
 
     def test_credit_api(self, connection_id: int) -> Dict[str, Any]:
@@ -2769,12 +3466,27 @@ class FinanceService:
         try:
             res = adapter.test_connection()
             self.storage.upsert_connection(
-                {"id": connection_id, "provider": conn["provider"], "status": "active"}
+                {"id": connection_id, "provider": conn["provider"], "status": "active", "last_error": ""}
             )
             return res
-        except ConnectorAuthError:
+        except ConnectorAuthError as exc:
             self.storage.upsert_connection(
-                {"id": connection_id, "provider": conn["provider"], "status": "needs_reauth"}
+                {
+                    "id": connection_id,
+                    "provider": conn["provider"],
+                    "status": "needs_reauth",
+                    "last_error": str(exc)[:240],
+                }
+            )
+            raise
+        except ConnectorError as exc:
+            self.storage.upsert_connection(
+                {
+                    "id": connection_id,
+                    "provider": conn["provider"],
+                    "status": "error",
+                    "last_error": str(exc)[:240],
+                }
             )
             raise
 
@@ -2784,6 +3496,8 @@ class FinanceService:
         req: Optional[CreditAPISyncRequest] = None,
     ) -> Dict[str, Any]:
         conn, vendor, adapter = self._load_credit_api_connection(connection_id)
+        conn_env = str(conn.get("env") or "production").strip().lower()
+        is_sbx = conn_env == "sandbox"
         effective = req or CreditAPISyncRequest()
         try:
             bundle = adapter.fetch_credit_snapshot(
@@ -2794,9 +3508,24 @@ class FinanceService:
                 option=effective.option,
                 consumer_profile=effective.consumer_profile,
             )
-        except ConnectorAuthError:
+        except ConnectorAuthError as exc:
             self.storage.upsert_connection(
-                {"id": connection_id, "provider": conn["provider"], "status": "needs_reauth"}
+                {
+                    "id": connection_id,
+                    "provider": conn["provider"],
+                    "status": "needs_reauth",
+                    "last_error": str(exc)[:240],
+                }
+            )
+            raise
+        except ConnectorError as exc:
+            self.storage.upsert_connection(
+                {
+                    "id": connection_id,
+                    "provider": conn["provider"],
+                    "status": "error",
+                    "last_error": str(exc)[:240],
+                }
             )
             raise
 
@@ -2811,9 +3540,14 @@ class FinanceService:
             "tradelines_updated": 0,
         }
 
+        partition_reports = [
+            r
+            for r in self.storage.list_credit_reports(include_sandbox=is_sbx)
+            if bool(r.get("is_sandbox", 0)) == is_sbx
+        ]
         existing_reports = {
             (str(r["bureau"]), str(r["model"]), int(r["score"]), str(r["pulled_date"]))
-            for r in self.storage.list_credit_reports()
+            for r in partition_reports
         }
         for rep in bundle.reports:
             if rep.score is None or not (300 <= int(rep.score) <= 850):
@@ -2830,14 +3564,21 @@ class FinanceService:
                     "score": int(rep.score),
                     "pulled_date": rep.pulled_date,
                     "source": rep.source or f"{vendor}_api",
+                    "is_sandbox": is_sbx,
+                    "source_env": conn_env,
                 }
             )
             existing_reports.add(rkey)
             counts["reports_added"] += 1
 
+        partition_inqs = [
+            i
+            for i in self.storage.list_credit_inquiries(include_sandbox=is_sbx)
+            if bool(i.get("is_sandbox", 0)) == is_sbx
+        ]
         existing_inqs = {
             (str(i["lender"]).strip().lower(), str(i["bureau"]), str(i["inquiry_date"]))
-            for i in self.storage.list_credit_inquiries()
+            for i in partition_inqs
         }
         for inq in bundle.inquiries:
             ikey = (inq.lender.strip().lower(), inq.bureau, inq.inquiry_date)
@@ -2851,6 +3592,8 @@ class FinanceService:
                     "inquiry_date": inq.inquiry_date,
                     "counts_until": inq.counts_until,
                     "drops_off": inq.drops_off,
+                    "is_sandbox": is_sbx,
+                    "source_env": conn_env,
                 }
             )
             existing_inqs.add(ikey)
@@ -2866,9 +3609,14 @@ class FinanceService:
             "bankruptcy_ch13",
             "other",
         }
+        partition_derogs = [
+            d
+            for d in self.storage.list_credit_derogatories(active_only=False, include_sandbox=is_sbx)
+            if bool(d.get("is_sandbox", 0)) == is_sbx
+        ]
         existing_derogs = {
             (str(d["kind"]), str(d.get("lender", "")).strip().lower(), str(d["opened_date"]))
-            for d in self.storage.list_credit_derogatories(active_only=False)
+            for d in partition_derogs
         }
         for der in bundle.derogatories:
             dkind = der.kind if der.kind in valid_derog else "other"
@@ -2884,27 +3632,53 @@ class FinanceService:
                     "opened_date": der.opened_date,
                     "drops_off": der.drops_off,
                     "active": der.active,
+                    "is_sandbox": is_sbx,
+                    "source_env": conn_env,
                 }
             )
             existing_derogs.add(dkey)
             counts["derogatories_added"] += 1
 
         if effective.sync_tradelines and bundle.tradelines:
+            partition_lines = [
+                cl
+                for cl in self.storage.list_credit_lines(active_only=False, include_sandbox=is_sbx)
+                if (str(cl.get("source_env") or "production").lower() == "sandbox") == is_sbx
+            ]
+            by_ext = {
+                str(cl.get("external_account_id") or "").strip(): cl
+                for cl in partition_lines
+                if str(cl.get("external_account_id") or "").strip()
+            }
             existing_lines = {
                 str(cl["name"]).strip().lower(): cl
-                for cl in self.storage.list_credit_lines(active_only=False)
+                for cl in partition_lines
             }
             for tl in bundle.tradelines:
                 payload = tl.to_credit_line_payload()
                 name_key = str(payload.get("name", "")).strip().lower()
+                ext_key = str(payload.get("external_account_id") or "").strip()
                 if not name_key:
                     continue
-                if name_key in existing_lines:
-                    self.storage.update_credit_line(int(existing_lines[name_key]["id"]), payload)
+                target_cl = by_ext.get(ext_key) if ext_key else None
+                if target_cl is None:
+                    target_cl = existing_lines.get(name_key)
+                if target_cl is not None:
+                    merged_pl = self._merge_tradeline_payload(target_cl, payload)
+                    self.storage.update_credit_line(int(target_cl["id"]), merged_pl)
                     counts["tradelines_updated"] += 1
                 else:
-                    created = self.storage.create_credit_line(payload)
+                    clean_pl = {
+                        k: v
+                        for k, v in payload.items()
+                        if k not in ("apr_provided", "closing_day_provided", "due_day_provided")
+                    }
+                    clean_pl["is_sandbox"] = is_sbx
+                    clean_pl["source_env"] = conn_env
+                    created = self.storage.create_credit_line(clean_pl)
                     existing_lines[name_key] = created
+                    if ext_key:
+                        by_ext[ext_key] = created
                     counts["tradelines_added"] += 1
 
         updated_conn = self.storage.upsert_connection(
@@ -2912,6 +3686,7 @@ class FinanceService:
                 "id": connection_id,
                 "provider": conn["provider"],
                 "status": "active",
+                "last_error": "",
                 "last_synced_at": utc_now_iso(),
             }
         )
@@ -2922,7 +3697,7 @@ class FinanceService:
             + counts["tradelines_added"]
             + counts["tradelines_updated"]
         )
-        if total_changes > 0:
+        if total_changes > 0 and not is_sbx:
             self.run_self_updating_sync(
                 reason=f"Synced Credit Score API ({conn.get('institution') or vendor})"
             )
@@ -2930,8 +3705,9 @@ class FinanceService:
         return {
             "connection": self._to_credit_api_connection_out(updated_conn).model_dump(),
             "synced_counts": counts,
+            "sandbox_isolated": is_sbx,
             "warnings": list(bundle.warnings),
-            "credit_report": self.get_credit_report().model_dump(),
+            "credit_report": self.get_credit_report(include_sandbox=is_sbx).model_dump(),
         }
 
     def disconnect_credit_api(self, connection_id: int) -> bool:
@@ -2948,22 +3724,29 @@ class FinanceService:
         price = int(row["price_e8"])
         mval = compute_holding_value_cents(qty, price)
         cb = int(row.get("cost_basis_cents", 0))
-        pnl = mval - cb if cb > 0 else 0
-        pnl_pct = round((pnl / cb) * 100.0, 2) if cb > 0 else 0.0
+        asset_cls = str(row.get("asset_class", "equity"))
+        raw_known = row.get("cost_basis_known")
+        cb_known = bool(raw_known) if raw_known is not None else (cb > 0 or asset_cls == "cash")
+        eff_cb = cb if cb_known else 0
+        pnl = (mval - eff_cb) if cb_known else 0
+        pnl_pct = round((pnl / eff_cb) * 100.0, 2) if (cb_known and eff_cb > 0) else 0.0
         return HoldingOut(
             id=int(row["id"]),
             account_id=int(row["account_id"]) if row.get("account_id") is not None else None,
             connection_id=int(row["connection_id"]) if row.get("connection_id") is not None else None,
+            external_account_id=str(row.get("external_account_id") or ""),
             symbol=str(row["symbol"]).upper(),
             name=str(row.get("name", "")),
-            asset_class=str(row.get("asset_class", "equity")),  # type: ignore[arg-type]
+            asset_class=asset_cls,  # type: ignore[arg-type]
             quantity_e8=qty,
-            cost_basis_cents=cb,
+            cost_basis_cents=eff_cb,
+            cost_basis_known=cb_known,
             price_e8=price,
             market_value_cents=mval,
             unrealized_pnl_cents=pnl,
             unrealized_pnl_pct=pnl_pct,
             source=str(row.get("source", "manual")),
+            created_at=str(row.get("created_at", "")),
             updated_at=str(row.get("updated_at", "")),
         )
 
@@ -2978,11 +3761,13 @@ class FinanceService:
             {
                 "account_id": account_id,
                 "connection_id": connection_id,
+                "external_account_id": nh.external_account_id,
                 "symbol": nh.symbol,
                 "name": nh.name,
                 "asset_class": nh.asset_class if nh.asset_class in ("equity", "etf", "crypto", "cash") else "equity",
                 "quantity_e8": nh.quantity_e8,
                 "cost_basis_cents": nh.cost_basis_cents,
+                "cost_basis_known": nh.cost_basis_known,
                 "price_e8": nh.price_e8,
                 "source": nh.source,
             }
@@ -2993,16 +3778,21 @@ class FinanceService:
         ref = today or date.today()
         holdings = [self._to_holding_out(r) for r in self.storage.list_holdings()]
         tot_val = sum(h.market_value_cents for h in holdings)
-        tot_cb = sum(h.cost_basis_cents for h in holdings)
+        tot_cb = sum(h.cost_basis_cents for h in holdings if h.cost_basis_known)
         self.storage.upsert_portfolio_snapshot(ref.isoformat(), tot_val, tot_cb)
         self._refresh_net_worth_snapshot_today(today=ref)
 
     def get_portfolio(self) -> PortfolioSummary:
         holdings = [self._to_holding_out(r) for r in self.storage.list_holdings()]
         tot_val = sum(h.market_value_cents for h in holdings)
-        tot_cb = sum(h.cost_basis_cents for h in holdings)
-        pnl = tot_val - tot_cb if tot_cb > 0 else 0
+        known_cnt = sum(1 for h in holdings if h.cost_basis_known)
+        unknown_cnt = len(holdings) - known_cnt
+        known_val = sum(h.market_value_cents for h in holdings if h.cost_basis_known)
+        unknown_val = max(0, tot_val - known_val)
+        tot_cb = sum(h.cost_basis_cents for h in holdings if h.cost_basis_known)
+        pnl = (known_val - tot_cb) if known_cnt > 0 else 0
         pnl_pct = round((pnl / tot_cb) * 100.0, 2) if tot_cb > 0 else 0.0
+        cov_pct = round((known_val / tot_val) * 100.0, 1) if tot_val > 0 else 100.0
 
         by_class: Dict[str, int] = {}
         sources = set()
@@ -3031,6 +3821,11 @@ class FinanceService:
             generated_at=utc_now_iso(),
             total_value_cents=tot_val,
             total_cost_basis_cents=tot_cb,
+            known_cost_basis_value_cents=known_val,
+            unknown_cost_basis_value_cents=unknown_val,
+            known_cost_basis_holdings_count=known_cnt,
+            unknown_cost_basis_holdings_count=unknown_cnt,
+            cost_basis_coverage_pct=cov_pct,
             unrealized_pnl_cents=pnl,
             unrealized_pnl_pct=pnl_pct,
             allocations=allocations,
@@ -3092,11 +3887,13 @@ class FinanceService:
                         "id": int(r["id"]),
                         "account_id": r.get("account_id"),
                         "connection_id": r.get("connection_id"),
+                        "external_account_id": r.get("external_account_id", ""),
                         "symbol": sym,
                         "name": r.get("name", ""),
                         "asset_class": r.get("asset_class", "equity"),
                         "quantity_e8": int(r["quantity_e8"]),
                         "cost_basis_cents": int(r["cost_basis_cents"]),
+                        "cost_basis_known": bool(r.get("cost_basis_known", 1)),
                         "price_e8": int(q.price_e8),
                         "source": str(r.get("source", "manual")),
                     }
@@ -3175,12 +3972,123 @@ class FinanceService:
         self.storage.log_budget_event("connector_added", f"Connected read-only Robinhood Crypto ({row['institution']})")
         return {"connection": self._to_connection_out(row).model_dump(), "account": info}
 
+    def _start_ephemeral_schwab_tls_server(self, redirect_uri: str) -> bool:
+        """
+        Start an ephemeral loopback HTTPS listener on `127.0.0.1:<port>` for Schwab's
+        fixed-port OAuth2 redirect URI, automatically shutting down once the callback completes.
+        """
+        parsed = urlparse(redirect_uri)
+        if parsed.scheme != "https" or (parsed.hostname or "") != "127.0.0.1" or parsed.port is None:
+            return False
+        port = int(parsed.port)
+        expected_path = parsed.path or "/api/v1/brokers/schwab/callback"
+
+        if self._schwab_callback_server is not None and self._schwab_callback_port == port:
+            return True
+        self._stop_schwab_callback_server()
+
+        try:
+            key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            now_utc = datetime.now(timezone.utc)
+            subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+            cert = (
+                x509.CertificateBuilder()
+                .subject_name(subject)
+                .issuer_name(issuer)
+                .public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(now_utc - timedelta(minutes=5))
+                .not_valid_after(now_utc + timedelta(days=2))
+                .add_extension(
+                    x509.SubjectAlternativeName(
+                        [
+                            x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+                            x509.DNSName("localhost"),
+                        ]
+                    ),
+                    critical=False,
+                )
+                .sign(key, hashes.SHA256())
+            )
+            tls_dir = tempfile.TemporaryDirectory(prefix="chronox_schwab_tls_")
+            cert_path = Path(tls_dir.name) / "cert.pem"
+            key_path = Path(tls_dir.name) / "key.pem"
+            cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+            key_path.write_bytes(
+                key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.TraditionalOpenSSL,
+                    serialization.NoEncryption(),
+                )
+            )
+            os.chmod(key_path, 0o600)
+
+            svc_ref = self
+
+            class _SchwabCallbackHandler(BaseHTTPRequestHandler):
+                def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                    return
+
+                def do_GET(self) -> None:  # noqa: N802
+                    req_parsed = urlparse(self.path)
+                    if req_parsed.path.rstrip("/") != expected_path.rstrip("/"):
+                        self.send_response(404)
+                        self.end_headers()
+                        return
+                    qs = parse_qs(req_parsed.query)
+                    code_val = unquote((qs.get("code") or [""])[0]).strip()
+                    state_val = (qs.get("state") or [""])[0].strip()
+                    if not code_val or not state_val:
+                        self.send_response(400)
+                        self.send_header("Content-Type", "text/plain; charset=utf-8")
+                        self.end_headers()
+                        self.wfile.write(b"Missing OAuth2 code or state parameter.")
+                        return
+                    try:
+                        conn_out = svc_ref.handle_schwab_callback(code_val, state_val)
+                        safe_inst = html.escape(str(conn_out.institution or "Charles Schwab"))
+                        body = (
+                            f"<!doctype html><html><head><meta charset='utf-8'><title>Schwab Connected</title></head>"
+                            f"<body style='background:#0b0e14;color:#e2e8f0;font-family:monospace;padding:32px;'>"
+                            f"<h2>Charles Schwab Connected ({safe_inst})</h2>"
+                            f"<p>Authorization complete. You may close this browser tab and return to ChronoX.</p>"
+                            f"</body></html>"
+                        ).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/html; charset=utf-8")
+                        self.end_headers()
+                        self.wfile.write(body)
+                    except Exception as cb_exc:
+                        err_body = f"Schwab OAuth callback failed: {cb_exc}".encode("utf-8", errors="replace")
+                        self.send_response(400)
+                        self.send_header("Content-Type", "text/plain; charset=utf-8")
+                        self.end_headers()
+                        self.wfile.write(err_body)
+
+            httpd = HTTPServer(("127.0.0.1", port), _SchwabCallbackHandler)
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ssl_ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+            httpd.socket = ssl_ctx.wrap_socket(httpd.socket, server_side=True)
+
+            self._schwab_tls_dir = tls_dir
+            self._schwab_callback_server = httpd
+            self._schwab_callback_port = port
+            t = threading.Thread(target=httpd.serve_forever, name="chronox-schwab-oauth-tls", daemon=True)
+            t.start()
+            return True
+        except Exception as exc:
+            logger.warning("Could not bind ephemeral Schwab HTTPS listener on %s: %s", redirect_uri, exc)
+            self._stop_schwab_callback_server()
+            return False
+
     def connect_schwab(self, req: BrokerSchwabConnectRequest) -> Dict[str, Any]:
         self._require_vault_unlocked()
+        redirect_clean = req.redirect_uri.strip()
         connector = SchwabConnector(
             client_id=req.client_id.strip(),
             client_secret=req.client_secret.strip(),
-            callback_url=req.redirect_uri.strip(),
+            callback_url=redirect_clean,
             transport=self._broker_transport,
         )
         oauth_state = secrets.token_urlsafe(24)
@@ -3188,16 +4096,25 @@ class FinanceService:
         self._pending_schwab_states[oauth_state] = {
             "client_id": req.client_id.strip(),
             "client_secret": req.client_secret.strip(),
-            "redirect_uri": req.redirect_uri.strip(),
+            "redirect_uri": redirect_clean,
             "label": req.label.strip() or "Charles Schwab",
             "created_at": utc_now_iso(),
         }
+        listener_active = (
+            self._start_ephemeral_schwab_tls_server(redirect_clean)
+            if req.start_callback_listener
+            else False
+        )
         return {
             "authorize_url": auth_url,
             "authorization_url": auth_url,
             "state": oauth_state,
-            "redirect_uri": req.redirect_uri.strip(),
-            "refresh_note": "Schwab refresh tokens expire every 7 days and require 1-click re-authentication.",
+            "redirect_uri": redirect_clean,
+            "callback_listener_active": listener_active,
+            "manual_completion_supported": True,
+            "refresh_note": (
+                "Schwab refresh tokens expire every 7 days. Complete login in your browser (or paste the redirect URL below if self-signed local TLS is blocked)."
+            ),
         }
 
     def handle_schwab_callback(self, code: str, state: str) -> ConnectionOut:
@@ -3211,7 +4128,7 @@ class FinanceService:
             callback_url=pending["redirect_uri"],
             transport=self._broker_transport,
         )
-        bundle = connector.exchange_code(code)
+        bundle = connector.exchange_code(unquote(code.strip()))
         item_key = hashlib.sha256(pending["client_id"].encode("utf-8")).hexdigest()[:16]
         row = self.storage.upsert_connection(
             {
@@ -3221,6 +4138,7 @@ class FinanceService:
                 "env": "production",
                 "status": "active",
                 "token_expires_at": bundle.refresh_expires_at,
+                "last_error": "",
             }
         )
         self.secrets.set_json(
@@ -3236,7 +4154,39 @@ class FinanceService:
             },
         )
         self.storage.log_budget_event("connector_added", f"Connected Charles Schwab OAuth2 ({row['institution']})")
+        if not self._pending_schwab_states:
+            threading.Thread(target=self._stop_schwab_callback_server, daemon=True).start()
         return self._to_connection_out(row)
+
+    def complete_schwab_oauth(self, req: BrokerSchwabCompleteRequest) -> ConnectionOut:
+        """
+        Complete Charles Schwab OAuth2 either from a pasted browser redirect URL
+        (`https://127.0.0.1:8787/api/v1/brokers/schwab/callback?code=...&state=...`)
+        or from explicit `code` + `state` fields.
+        """
+        self._require_vault_unlocked()
+        code = (req.code or "").strip()
+        state = (req.state or "").strip()
+        raw_input = (req.redirect_url or req.callback_url_or_code or "").strip()
+        if raw_input:
+            if "://" in raw_input or "code=" in raw_input or raw_input.startswith("?"):
+                q_source = raw_input if "://" in raw_input else f"https://127.0.0.1/?{raw_input.lstrip('?')}"
+                parsed = urlparse(q_source)
+                qs = parse_qs(parsed.query)
+                if not code and qs.get("code"):
+                    code = unquote(qs["code"][0]).strip()
+                if not state and qs.get("state"):
+                    state = qs["state"][0].strip()
+            elif not code:
+                code = unquote(raw_input)
+        if not state and len(self._pending_schwab_states) == 1:
+            state = next(iter(self._pending_schwab_states.keys()))
+        if not code or not state:
+            raise ConnectorAuthError(
+                "Paste the full Schwab redirect URL (containing ?code=...&state=...) or provide both code and state.",
+                provider="schwab",
+            )
+        return self.handle_schwab_callback(code, state)
 
     def sync_broker(self, connection_id: int) -> Dict[str, Any]:
         self._require_vault_unlocked()
@@ -3246,90 +4196,126 @@ class FinanceService:
         provider = str(conn["provider"])
         creds = self.secrets.get_json(f"conn:{connection_id}")
         if not creds:
-            self.storage.upsert_connection({"id": connection_id, "provider": provider, "status": "needs_reauth"})
+            self.storage.upsert_connection(
+                {
+                    "id": connection_id,
+                    "provider": provider,
+                    "status": "needs_reauth",
+                    "last_error": "Missing sealed credentials; reconnect required.",
+                }
+            )
             raise ConnectorAuthError(f"Missing sealed credentials for {provider} connection #{connection_id}")
 
         holdings: List[NormalizedHolding] = []
-        if provider == "coinbase":
-            cb = CoinbaseConnector(
-                api_key_name=str(creds["api_key_name"]),
-                private_key_pem=str(creds["private_key_pem"]),
-                transport=self._broker_transport,
-            )
-            holdings = cb.fetch_holdings(verify_permissions=True, fetch_prices=True)
-        elif provider == "robinhood":
-            rh = RobinhoodCryptoConnector(
-                api_key=str(creds["api_key"]),
-                private_key_b64=str(creds["private_key_b64"]),
-                declared_scopes=creds.get("declared_scopes"),
-                transport=self._broker_transport,
-            )
-            holdings = rh.fetch_holdings(fetch_prices=True)
-        elif provider == "schwab":
-            sc = SchwabConnector(
-                client_id=str(creds["client_id"]),
-                client_secret=str(creds["client_secret"]),
-                callback_url=str(creds.get("redirect_uri") or "https://127.0.0.1:8787/api/v1/brokers/schwab/callback"),
-                transport=self._broker_transport,
-            )
-            access_token = str(creds.get("access_token") or "")
-            access_exp = creds.get("access_expires_at")
-            refresh_exp = creds.get("refresh_expires_at")
-            rem_days = _days_until_iso_timestamp(refresh_exp)
-            if rem_days is not None and rem_days <= 0:
-                self.storage.upsert_connection({"id": connection_id, "provider": "schwab", "status": "needs_reauth"})
-                raise ConnectorAuthError("Schwab 7-day refresh token expired — please re-authenticate.")
-            # Refresh access token if expired or close to expiry
-            needs_refresh = not access_token
-            if access_exp and not needs_refresh:
-                try:
-                    exp_dt = datetime.fromisoformat(str(access_exp).replace("Z", "+00:00"))
-                    if exp_dt <= datetime.now(timezone.utc) + timedelta(minutes=2):
+        try:
+            if provider == "coinbase":
+                cb = CoinbaseConnector(
+                    api_key_name=str(creds["api_key_name"]),
+                    private_key_pem=str(creds["private_key_pem"]),
+                    transport=self._broker_transport,
+                )
+                holdings = cb.fetch_holdings(verify_permissions=True, fetch_prices=True)
+            elif provider == "robinhood":
+                rh = RobinhoodCryptoConnector(
+                    api_key=str(creds["api_key"]),
+                    private_key_b64=str(creds["private_key_b64"]),
+                    declared_scopes=creds.get("declared_scopes"),
+                    transport=self._broker_transport,
+                )
+                holdings = rh.fetch_holdings(fetch_prices=True)
+            elif provider == "schwab":
+                sc = SchwabConnector(
+                    client_id=str(creds["client_id"]),
+                    client_secret=str(creds["client_secret"]),
+                    callback_url=str(creds.get("redirect_uri") or "https://127.0.0.1:8787/api/v1/brokers/schwab/callback"),
+                    transport=self._broker_transport,
+                )
+                access_token = str(creds.get("access_token") or "")
+                access_exp = creds.get("access_expires_at")
+                refresh_exp = creds.get("refresh_expires_at")
+                rem_days = _days_until_iso_timestamp(refresh_exp)
+                if rem_days is not None and rem_days <= 0:
+                    raise ConnectorAuthError(
+                        "Schwab 7-day refresh token expired — please re-authenticate.",
+                        provider="schwab",
+                    )
+                # Refresh access token if expired or close to expiry
+                needs_refresh = not access_token
+                if access_exp and not needs_refresh:
+                    try:
+                        exp_dt = datetime.fromisoformat(str(access_exp).replace("Z", "+00:00"))
+                        if exp_dt <= datetime.now(timezone.utc) + timedelta(minutes=2):
+                            needs_refresh = True
+                    except ValueError:
                         needs_refresh = True
-                except ValueError:
-                    needs_refresh = True
-            if needs_refresh and creds.get("refresh_token"):
-                bundle = sc.refresh_access_token(
-                    str(creds["refresh_token"]),
-                    existing_refresh_expires_at=refresh_exp,
-                )
-                access_token = bundle.access_token
-                creds["access_token"] = bundle.access_token
-                creds["refresh_token"] = bundle.refresh_token
-                creds["access_expires_at"] = bundle.access_expires_at
-                creds["refresh_expires_at"] = bundle.refresh_expires_at
-                self.secrets.set_json(f"conn:{connection_id}", creds)
-                self.storage.upsert_connection(
-                    {
-                        "id": connection_id,
-                        "provider": "schwab",
-                        "token_expires_at": bundle.refresh_expires_at,
-                    }
-                )
-            holdings = sc.fetch_holdings(access_token)
-        elif provider == "plaid":
-            client, _env = self._build_plaid_client()
-            holdings = client.get_investments_holdings(str(creds["access_token"]))
-        else:
-            raise ConnectorError(f"Provider '{provider}' does not support brokerage holdings sync.")
+                if needs_refresh and creds.get("refresh_token"):
+                    bundle = sc.refresh_access_token(
+                        str(creds["refresh_token"]),
+                        existing_refresh_expires_at=refresh_exp,
+                    )
+                    access_token = bundle.access_token
+                    creds["access_token"] = bundle.access_token
+                    creds["refresh_token"] = bundle.refresh_token
+                    creds["access_expires_at"] = bundle.access_expires_at
+                    creds["refresh_expires_at"] = bundle.refresh_expires_at
+                    self.secrets.set_json(f"conn:{connection_id}", creds)
+                    self.storage.upsert_connection(
+                        {
+                            "id": connection_id,
+                            "provider": "schwab",
+                            "token_expires_at": bundle.refresh_expires_at,
+                        }
+                    )
+                holdings = sc.fetch_holdings(access_token)
+            elif provider == "plaid":
+                conn_env = str(conn.get("env") or creds.get("env") or "production").strip().lower()
+                client, _env = self._build_plaid_client(env_override=conn_env, creds_override=creds)
+                holdings = client.get_investments_holdings(str(creds["access_token"]))
+            else:
+                raise ConnectorError(f"Provider '{provider}' does not support brokerage holdings sync.")
+        except ConnectorAuthError as exc:
+            self.storage.upsert_connection(
+                {
+                    "id": connection_id,
+                    "provider": provider,
+                    "status": "needs_reauth",
+                    "last_error": str(exc)[:240],
+                }
+            )
+            raise
 
-        for nh in holdings:
-            self._upsert_normalized_holding(nh, connection_id=connection_id)
-
-        self.storage.upsert_connection(
-            {
-                "id": connection_id,
-                "provider": provider,
-                "status": "active",
-                "last_synced_at": utc_now_iso(),
+        with self.storage.transaction(immediate=True):
+            acct_by_ext = {
+                str(a.get("external_id") or "").strip(): int(a["id"])
+                for a in self.storage.list_accounts()
+                if str(a.get("external_id") or "").strip()
             }
-        )
+            keep_ids: List[int] = []
+            for nh in holdings:
+                saved_h = self._upsert_normalized_holding(
+                    nh,
+                    connection_id=connection_id,
+                    account_id=acct_by_ext.get(nh.external_account_id),
+                )
+                keep_ids.append(saved_h.id)
+            pruned_count = self.storage.prune_connection_holdings(connection_id, keep_ids)
+
+            self.storage.upsert_connection(
+                {
+                    "id": connection_id,
+                    "provider": provider,
+                    "status": "active",
+                    "last_error": "",
+                    "last_synced_at": utc_now_iso(),
+                }
+            )
         self._record_portfolio_snapshot()
         summary = self.get_portfolio()
         return {
             "connection_id": connection_id,
             "provider": provider,
             "holdings_synced": len(holdings),
+            "holdings_pruned": pruned_count,
             "total_value_cents": summary.total_value_cents,
         }
 
@@ -3373,7 +4359,10 @@ class FinanceService:
         return self._to_goal_out(saved)
 
     def update_goal(self, goal_id: int, req: GoalUpdate) -> Optional[GoalOut]:
-        updated = self.storage.update_goal(goal_id, req.model_dump(exclude_none=True))
+        updates = req.model_dump(exclude_none=True)
+        if "target_date" in req.model_fields_set and req.target_date is None:
+            updates["target_date"] = None
+        updated = self.storage.update_goal(goal_id, updates)
         return self._to_goal_out(updated) if updated else None
 
     def reorder_goals(self, req: GoalReorderRequest) -> List[GoalOut]:
@@ -3436,6 +4425,10 @@ class FinanceService:
             balance_cents=req.balance_cents,
             institution=req.institution.strip(),
             is_liquid=req.is_liquid,
+            currency=req.currency.strip().upper() or "USD",
+            available_cents=req.available_cents,
+            credit_limit_cents=req.credit_limit_cents,
+            mask=req.mask.strip(),
         )
         self.run_self_updating_sync(reason=f"Added account {acct['name']}")
         return AccountOut(**acct)
@@ -4621,7 +5614,7 @@ class FinanceService:
             default_cooling_hours=int(raw.get("default_cooling_hours", 48)),
             payday_cadence_days=int(raw.get("payday_cadence_days", 14)),
             next_payday_date=raw.get("next_payday_date"),
-            expected_paycheck_cents=int(raw.get("expected_paycheck_cents", 220_000)),
+            expected_paycheck_cents=int(raw.get("expected_paycheck_cents", 0)),
             calm_mode=bool(raw.get("calm_mode", 1)),
             auto_rebalance_enabled=bool(raw.get("auto_rebalance_enabled", 1)),
             onboarding_completed=bool(raw.get("onboarding_completed", 0)),
@@ -4697,6 +5690,21 @@ class FinanceService:
         ):
             if bool_k in data:
                 data[bool_k] = int(bool(data[bool_k]))
+
+        payday_keys = {"payday_cadence_days", "next_payday_date", "expected_paycheck_cents"}
+        if payday_keys & set(data.keys()):
+            curr_settings = self.storage.get_settings()
+            non_payday_keys = set(data.keys()) - payday_keys
+            payday_changed = (
+                ("payday_cadence_days" in data and int(data["payday_cadence_days"]) != int(curr_settings.get("payday_cadence_days", 14)))
+                or ("next_payday_date" in data and str(data["next_payday_date"] or "") != str(curr_settings.get("next_payday_date") or ""))
+                or ("expected_paycheck_cents" in data and int(data["expected_paycheck_cents"]) != int(curr_settings.get("expected_paycheck_cents", 0)))
+                or ("expected_paycheck_cents" in data and int(data["expected_paycheck_cents"]) > 0)
+            )
+            if payday_changed or not non_payday_keys:
+                data["payday_user_configured"] = 1
+        if "expected_paycheck_cents" in data:
+            data["income_configured"] = int(int(data["expected_paycheck_cents"]) > 0)
 
         budget_fields = {
             "currency",

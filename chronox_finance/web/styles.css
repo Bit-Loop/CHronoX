@@ -51,6 +51,16 @@
   --ring-track: #1c2430;
   --chart-grid: rgba(154, 167, 184, 0.15);
   --chart-crosshair: rgba(238, 242, 246, 0.45);
+  --chart-inc-text: #34d399;
+  --chart-exp-text: #fbbf24;
+  --chart-sur-text: #38bdf8;
+  --chart-def-text: #f87171;
+  --chart-inv-text: #60a5fa;
+  --chart-inc-stroke: #10b981;
+  --chart-exp-stroke: #f59e0b;
+  --chart-sur-stroke: #06b6d4;
+  --chart-def-stroke: #ef4444;
+  --chart-inv-stroke: #3b82f6;
   --overlay-bg: rgba(4, 6, 9, 0.86);
   --titlebar-h: 36px;
   --titlebar-bg: #080a0d;
@@ -118,6 +128,16 @@
   --ring-track: #d4dce6;
   --chart-grid: rgba(11, 17, 24, 0.12);
   --chart-crosshair: rgba(11, 17, 24, 0.42);
+  --chart-inc-text: #065f46;
+  --chart-exp-text: #9a3412;
+  --chart-sur-text: #155e75;
+  --chart-def-text: #991b1b;
+  --chart-inv-text: #1d4ed8;
+  --chart-inc-stroke: #047857;
+  --chart-exp-stroke: #b45309;
+  --chart-sur-stroke: #0e7490;
+  --chart-def-stroke: #b91c1c;
+  --chart-inv-stroke: #2563eb;
   --overlay-bg: rgba(11, 17, 24, 0.62);
   --titlebar-bg: #e2e7ee;
   --skeleton-base: #dde4ec;
@@ -1235,7 +1255,7 @@ input[type="file"] {
 }
 
 /* ============================================================================
-   Analytics, MoneyStill SVG Stages & Draggable What-If Timeline
+   Analytics, MoneyStill SVG Stages & Draggable Forecast Timeline
    ============================================================================ */
 .toolbar-card { border-top-color: var(--cyan); }
 .svg-stage {
@@ -1910,6 +1930,38 @@ input[type="file"] {
   }
   .recovery-key-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* Mobile Cashflow Sankey Layout (WCAG readable >= 12px at phone widths) */
+.sankey-mobile-stack {
+  display: none;
+  flex-direction: column;
+  gap: 12px;
+  padding: 10px 4px;
+}
+.sankey-mobile-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sankey-mobile-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--primary);
+  font-size: 0.82rem;
+}
+
+@media (max-width: 680px) {
+  .sankey-desktop-svg {
+    display: none !important;
+  }
+  .sankey-mobile-stack {
+    display: flex;
   }
 }
 

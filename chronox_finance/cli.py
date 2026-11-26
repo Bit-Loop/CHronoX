@@ -258,7 +258,7 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
     p_sug.add_argument("--mode", choices=mode_choices, default=None, dest="sub_mode")
     p_sug.add_argument("--provider", choices=provider_choices, default=None, dest="sub_provider")
 
-    p_cred = sub.add_parser("credit", help="Show Credit Factor Simulator, Chase 5/24 & AZEO debt plan")
+    p_cred = sub.add_parser("credit", help="Show Credit Factor Analysis, Chase 5/24 & AZEO debt plan")
     p_cred.add_argument("--extra", type=float, default=250.0, help="Extra monthly dollars toward debt (default: 250)")
 
     p_goal = sub.add_parser("goal", help="Optimize a credit-safe purchase plan (e.g. goal 'Mac Mini' 1000)")
@@ -326,7 +326,7 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
         elif cmd == "credit":
             rep = svc.get_credit_report(extra_monthly_budget_cents=int(round(args.extra * 100)))
             print(
-                f"\n[CREDIT SIMULATOR] Util: {rep.aggregate_utilization_pct:.1f}% ({rep.aggregate_tier}) "
+                f"\n[CREDIT ANALYSIS] Util: {rep.aggregate_utilization_pct:.1f}% ({rep.aggregate_tier}) "
                 f"| DTI: {rep.dti_pct:.1f}%"
             )
             print(

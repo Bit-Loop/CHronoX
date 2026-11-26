@@ -229,6 +229,9 @@ class CreditTradelineRecord:
     status: str = "open"
     external_account_id: str = ""
     source: str = "manual_import"
+    apr_provided: Optional[bool] = None
+    closing_day_provided: Optional[bool] = None
+    due_day_provided: Optional[bool] = None
 
     def to_credit_line_payload(self) -> Dict[str, Any]:
         """Convert to a payload compatible with ChronoX `CreditLineCreate` / `credit_lines`."""
@@ -249,6 +252,9 @@ class CreditTradelineRecord:
             "is_authorized_user": self.is_authorized_user,
             "external_account_id": self.external_account_id,
             "source": self.source,
+            "apr_provided": self.apr_provided,
+            "closing_day_provided": self.closing_day_provided,
+            "due_day_provided": self.due_day_provided,
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -395,6 +401,9 @@ class PlaidLiabilitiesAdapter:
                     is_overdue=bool(item.is_overdue),
                     external_account_id=item.external_account_id,
                     source=self.provider_name,
+                    apr_provided=int(item.apr_bps) > 0,
+                    closing_day_provided=bool(item.last_statement_issue_date),
+                    due_day_provided=bool(item.next_payment_due_date),
                 )
             )
             if item.is_overdue:
@@ -640,6 +649,11 @@ class OfficialCreditReportImporter:
                 else abs(decimal_to_cents(item.get("min_payment")))
             )
             opened = _parse_flexible_date(item.get("opened_date"))
+            has_apr = (
+                item.get("apr_bps") is not None
+                or item.get("apr") is not None
+                or item.get("apr_pct") is not None
+            )
             tradelines.append(
                 CreditTradelineRecord(
                     name=name,
@@ -656,6 +670,9 @@ class OfficialCreditReportImporter:
                     is_authorized_user=bool(item.get("is_authorized_user", False)),
                     status=str(item.get("status") or "open").lower(),
                     source="structured_credit_report",
+                    apr_provided=has_apr,
+                    closing_day_provided=item.get("statement_closing_day") is not None,
+                    due_day_provided=item.get("payment_due_day") is not None,
                 )
             )
 
@@ -867,6 +884,9 @@ class OfficialCreditReportImporter:
                     is_authorized_user=bool(current_tl.get("is_authorized_user", False)),
                     status=str(current_tl.get("status") or "open"),
                     source="annual_credit_report_pdf",
+                    apr_provided=False,
+                    closing_day_provided=False,
+                    due_day_provided=False,
                 )
             )
             current_tl = None
@@ -1202,7 +1222,7 @@ class BureauAPIAdapter:
         self,
         vendor: str = "crs",
         *,
-        env: str = "sandbox",
+        env: str = "production",
         api_base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
@@ -1224,7 +1244,7 @@ class BureauAPIAdapter:
         normalized = (vendor or "crs").strip().lower()
         if normalized not in self.SUPPORTED_VENDORS:
             raise ValueError(f"Unsupported bureau adapter '{vendor}'; choose from {self.SUPPORTED_VENDORS}")
-        norm_env = (env or "sandbox").strip().lower()
+        norm_env = (env or "production").strip().lower()
         if norm_env not in ("sandbox", "production"):
             raise ValueError("Environment must be 'sandbox' or 'production'")
 
@@ -1719,6 +1739,9 @@ class BureauAPIAdapter:
                             item.get("creditCardId") or item.get("liabilityId") or item.get("id") or ""
                         ),
                         source="spinwheel_api",
+                        apr_provided=(item.get("apr_bps") is not None or raw_apr is not None),
+                        closing_day_provided=(stmt_date is not None),
+                        due_day_provided=(due_date is not None),
                     )
                 )
 
@@ -1908,6 +1931,9 @@ class BureauAPIAdapter:
                     status="closed" if "closed" in status_raw else "open",
                     external_account_id=str(item.get("@CreditLiabilityID") or item.get("id") or ""),
                     source="array_api",
+                    apr_provided=(item.get("apr_bps") is not None or item.get("apr") is not None),
+                    closing_day_provided=False,
+                    due_day_provided=False,
                 )
             )
 
@@ -2112,6 +2138,9 @@ class BureauAPIAdapter:
                     status="closed" if "closed" in str(tl.get("status") or "open").lower() else "open",
                     external_account_id=str(tl.get("accountNumber") or tl.get("id") or ""),
                     source="crs_api",
+                    apr_provided=(tl.get("apr_bps") is not None or tl.get("apr") is not None),
+                    closing_day_provided=False,
+                    due_day_provided=False,
                 )
             )
 

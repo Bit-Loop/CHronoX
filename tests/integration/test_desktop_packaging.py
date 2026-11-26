@@ -407,8 +407,11 @@ class TestCrossPlatformPackagingConfiguration:
         for token in (
             'collect_dynamic_libs("cryptography")',
             'collect_data_files("cryptography")',
+            '"cryptography.x509"',
+            '"cryptography.x509.oid"',
             '"cryptography.hazmat.primitives.ciphers.aead"',
             '"cryptography.hazmat.primitives.asymmetric.ed25519"',
+            '"cryptography.hazmat.primitives.asymmetric.rsa"',
             '"imaplib"',
             'collect_submodules("chronox_finance.connectors")',
         ):

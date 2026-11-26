@@ -738,7 +738,8 @@ class TestCLIProductionSmoke:
         out = capsys.readouterr().out
         assert "CHRONOX QUANT FORECAST" in out
         assert "OPTIMAL SURPLUS ALLOCATION" in out
-        assert "[CREDIT SIMULATOR]" in out
+        assert "[CREDIT ANALYSIS]" in out
+        assert "[CREDIT SIMULATOR]" not in out
         assert "[GOAL PLAN] Studio Display" in out
         assert "CHRONOX PORTFOLIO" in out
         assert "CHRONOX AI USAGE" in out

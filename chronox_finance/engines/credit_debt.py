@@ -3,7 +3,7 @@ Research-Backed Credit Score & Debt Optimization Engine ("Niche Credit Advisor")
 
 Grounded in empirical FICO scoring mechanics and ADHD behavioral finance:
 1. Per-Card AND Aggregate Revolving Utilization Tracking (FICO 30% weight):
-   - Tiers: All-Zero Inactivity Penalty (0%), Optimal 800+ Sweet Spot (1%–8.9%),
+   - Tiers: All-Zero Inactivity Penalty (0%), Optimal Low-Utilization Band (1%–8.9%),
      Good (9%–28.9%), Score Drag (29%–48.9%), High Drag (49%–88.9%), Maxed (89%+).
 2. AZEO (All Zero Except One) Pre-Statement-Close Planner:
    - Targets reporting dates (`statement_closing_day`), NOT due dates!
@@ -13,7 +13,7 @@ Grounded in empirical FICO scoring mechanics and ADHD behavioral finance:
    - Warns when carrying a balance forfeits grace period on new charges.
    - Calculates exact monthly payoff needed to beat expiring 0% promo APR cliffs.
 4. Autopay Safety Audit & Average Age of Accounts (AAoA) Oldest-Card Shield.
-5. 4-Strategy Exact Integer-Cent Debt Payoff Simulator:
+5. 4-Strategy Exact Integer-Cent Debt Payoff Comparison:
    - ADHD Hybrid (Snowball smallest 1–2 clutter accounts -> Avalanche high APR)
    - Credit-First (Fix >29% utilization credit killers first -> Avalanche)
    - Avalanche (Lowest total interest paid)
@@ -41,16 +41,15 @@ from chronox_finance.models import (
     CreditLineOut,
     CreditOptimizationReport,
     CreditReportOut,
-    CreditSimulatedAction,
     DebtKind,
     DebtStrategyResult,
     FiveTwentyFourStatus,
     utc_now_iso,
 )
 
-MAX_SIM_MONTHS = 360  # 30-year safety cap
-FACTOR_SIMULATOR_DISCLAIMER = (
-    "Directional factor simulator only — not an official FICO or VantageScore calculation."
+MAX_AMORTIZATION_MONTHS = 360  # 30-year safety cap
+FACTOR_ANALYSIS_DISCLAIMER = (
+    "Weighted factor analysis from tracked accounts, inquiries, and history — not an official bureau score."
 )
 FICO_UTILIZATION_CLIFFS: Tuple[float, ...] = (1.0, 9.0, 29.0, 49.0, 69.0, 89.0)
 
@@ -359,16 +358,16 @@ def _util_cliff_band(util_pct: float) -> int:
     return 6
 
 
-class CreditFactorSimulator:
+class CreditFactorAnalyzer:
     """
-    Honest Directional 5-Factor Credit Simulator (FICO 8 + VantageScore 3.0 weights).
+    Deterministic 5-Factor Credit Analysis (FICO 8 + VantageScore 3.0 weights).
 
-    NEVER computes or displays a fabricated trademarked FICO/Vantage numeric score.
-    Instead, pairs imported actual bureau scores (`credit_reports`) with directional
-    factor health ratings and estimated action impact ranges (`delta_min_pts..delta_max_pts`).
+    NEVER computes or displays a fabricated bureau score or score-point delta estimate.
+    Pairs imported actual bureau scores (`credit_reports`) with factual factor health
+    ratings, utilization threshold positions, and statutory FCRA drop-off timelines.
     """
 
-    def simulate(
+    def analyze(
         self,
         *,
         credit_lines: Sequence[CreditLineOut],
@@ -422,26 +421,26 @@ class CreditFactorSimulator:
                 f"{len(active_derogs)} active derogatory mark(s) including severe item(s); "
                 f"next statutory drop-off on {earliest_drop}."
             )
-            pay_delta = "Severe drag until aged/dropped (+25 to +70 pts upon drop-off)"
+            pay_guidance = "FCRA statutory drop-off applies (+7y / +10y Ch. 7)"
         elif active_derogs:
             pay_status = "fair"
             earliest_drop = min(d.drops_off for d in active_derogs)
             pay_summary = (
                 f"{len(active_derogs)} active late-payment mark(s); drops off {earliest_drop} (+7y FCRA rule)."
             )
-            pay_delta = "Moderate drag fading with on-time months (+10 to +35 pts over time)"
+            pay_guidance = "FCRA 7-year reporting window"
         elif autopay_missing_count > 0:
             pay_status = "good"
             pay_summary = (
                 f"0 active derogatories, but {autopay_missing_count} account(s) lack autopay protection."
             )
-            pay_delta = "Clean record; enable autopay to eliminate -60 to -110 pt late-payment risk"
+            pay_guidance = "Enable autopay on all open accounts"
         else:
             pay_status = "optimal"
             pay_summary = "0 active derogatories and autopay shields active across tracked accounts."
-            pay_delta = "Optimal — 0 pts drag"
+            pay_guidance = "All tracked accounts protected by autopay"
 
-        # --- 2. Utilization / AZEO Cliffs (FICO 30% / Vantage 20%) ---
+        # --- 2. Utilization / AZEO Thresholds (FICO 30% / Vantage 20%) ---
         agg_band = _util_cliff_band(aggregate_utilization_pct)
         max_band = _util_cliff_band(max_card_util)
         worst_band = max(agg_band, max_band)
@@ -449,52 +448,52 @@ class CreditFactorSimulator:
         if all_zero_penalty_risk:
             util_status = "good"
             util_summary = (
-                "0.0% aggregate utilization across all cards triggers the FICO All-Zero inactivity dip."
+                "0.0% aggregate utilization across all cards triggers the All-Zero reporting penalty."
             )
-            util_delta = "Letting 1 card report 1%–4.9% (AZEO): est. +10 to +20 pts directional impact"
+            util_guidance = "Report 1%–4.9% on 1 primary card (AZEO)"
         elif worst_band <= 1:
             util_status = "optimal"
             util_summary = (
                 f"{aggregate_utilization_pct:.1f}% aggregate util (max card {max_card_util:.1f}%) — "
-                f"inside the 1%–8.9% top-tier AZEO band ({cards_with_bal}/{len(cards)} cards reporting)."
+                f"inside the 1%–8.9% AZEO target band ({cards_with_bal}/{len(cards)} cards reporting)."
             )
-            util_delta = "Optimal cliff tier (1%–8.9%)"
+            util_guidance = "Target band maintained (1%–8.9%)"
         elif worst_band == 2:
             util_status = "good"
             util_summary = (
                 f"{aggregate_utilization_pct:.1f}% aggregate util (max card {max_card_util:.1f}%) — "
-                f"below 29% cliff, room to optimize under 8.9% via AZEO."
+                f"below 29% threshold, room to optimize under 8.9% via AZEO."
             )
-            util_delta = "Crossing 9% cliff via AZEO: est. +6 to +18 pts directional impact"
+            util_guidance = "Pay down before statement close to reach <8.9%"
         elif worst_band == 3:
             util_status = "fair"
             util_summary = (
                 f"{aggregate_utilization_pct:.1f}% aggregate util (max card {max_card_util:.1f}%) — "
-                f"crossed the 29% FICO utilization cliff."
+                f"above the 29% utilization threshold."
             )
-            util_delta = "Dropping below 29% / 9% cliffs: est. +15 to +35 pts directional impact"
+            util_guidance = "Pay below 28.9% before statement close"
         else:
             util_status = "drag"
             util_summary = (
                 f"{aggregate_utilization_pct:.1f}% aggregate util (max card {max_card_util:.1f}%) — "
-                f"elevated utilization cliff drag (49%/69%/89% tiers)."
+                f"elevated utilization band (49%/69%/89% thresholds)."
             )
-            util_delta = "Paying high-util cards under 9% before close: est. +25 to +65 pts directional impact"
+            util_guidance = "Prioritize pre-close paydown below 28.9% / 8.9%"
 
         # --- 3. Length of Credit History: AAoA / AoOA (FICO 15%) ---
         aaoa = avg_account_age_months or 0.0
         if aaoa >= 84.0:
             age_status = "optimal"
-            age_delta = "Mature file (7+ yr AAoA)"
+            age_guidance = "7+ yr average account age"
         elif aaoa >= 48.0:
             age_status = "good"
-            age_delta = "Healthy aging trajectory (+3 to +10 pts over next 12–24m)"
+            age_guidance = "4+ yr average account age — keep anchor open"
         elif aaoa >= 24.0:
             age_status = "fair"
-            age_delta = "Young file — avoid unnecessary new cards or closing oldest line"
+            age_guidance = "Avoid closing oldest fee-free account"
         else:
             age_status = "drag"
-            age_delta = "Thin/young credit history — protect oldest account and let accounts age"
+            age_guidance = "Thin history — preserve oldest line and limit new openings"
         age_summary = (
             f"AAoA {aaoa:.1f} mo · AoOA {oldest_months} mo"
             + (f" (anchor: {oldest_account_name})." if oldest_account_name else ".")
@@ -505,16 +504,16 @@ class CreditFactorSimulator:
         inq_24m = sum(1 for q in credit_inquiries if q.drops_off > ref.isoformat())
         if inq_12m <= 1 and five_twenty_four.count_5_24 <= 2:
             new_status = "optimal"
-            new_delta = "Minimal new-credit drag"
+            new_guidance = "Low inquiry & new-account velocity"
         elif inq_12m <= 3 and five_twenty_four.count_5_24 <= 4:
             new_status = "good"
-            new_delta = "Light velocity (+3 to +8 pts as 12m inquiries age out)"
+            new_guidance = "Inquiries stop scoring at 12m, drop off at 24m"
         elif inq_12m <= 5 or five_twenty_four.count_5_24 >= 5:
             new_status = "fair"
-            new_delta = "Elevated new-account velocity (+5 to +15 pts after 12m inquiry aging)"
+            new_guidance = "Elevated velocity — pause new applications"
         else:
             new_status = "drag"
-            new_delta = "High inquiry drag — garden existing lines for 6–12 months"
+            new_guidance = "High velocity — pause new applications until inquiries age past 12m"
         new_summary = (
             f"{inq_12m} scoring inquiries (<12m), {inq_24m} on report (<24m), "
             f"Chase velocity {five_twenty_four.count_5_24}/24."
@@ -526,18 +525,18 @@ class CreditFactorSimulator:
         if has_rev and has_inst:
             mix_status = "optimal"
             mix_summary = f"Balanced mix: {len(cards)} revolving card(s) + {len(installments)} installment account(s)."
-            mix_delta = "Optimal credit mix"
+            mix_guidance = "Revolving + installment tradelines present"
         elif len(credit_lines) >= 2:
             mix_status = "good"
             mix_summary = (
                 f"{len(cards)} revolving card(s), {len(installments)} installment account(s) — "
                 f"solid profile (never take on interest just for mix)."
             )
-            mix_delta = "Strong mix — no need to borrow for mix"
+            mix_guidance = "Never borrow at interest solely for credit mix"
         else:
             mix_status = "fair"
             mix_summary = f"{len(credit_lines)} tracked tradeline(s); thin file mix."
-            mix_delta = "Thin file — improves naturally over time"
+            mix_guidance = "Thin tradeline count"
 
         fico8_factors = [
             CreditFactorItem(
@@ -546,7 +545,7 @@ class CreditFactorSimulator:
                 weight_pct=35,
                 status=pay_status,  # type: ignore[arg-type]
                 summary=pay_summary,
-                estimated_delta_range=pay_delta,
+                guidance=pay_guidance,
             ),
             CreditFactorItem(
                 factor="utilization",
@@ -554,7 +553,7 @@ class CreditFactorSimulator:
                 weight_pct=30,
                 status=util_status,  # type: ignore[arg-type]
                 summary=util_summary,
-                estimated_delta_range=util_delta,
+                guidance=util_guidance,
             ),
             CreditFactorItem(
                 factor="credit_age",
@@ -562,7 +561,7 @@ class CreditFactorSimulator:
                 weight_pct=15,
                 status=age_status,  # type: ignore[arg-type]
                 summary=age_summary,
-                estimated_delta_range=age_delta,
+                guidance=age_guidance,
             ),
             CreditFactorItem(
                 factor="new_credit",
@@ -570,7 +569,7 @@ class CreditFactorSimulator:
                 weight_pct=10,
                 status=new_status,  # type: ignore[arg-type]
                 summary=new_summary,
-                estimated_delta_range=new_delta,
+                guidance=new_guidance,
             ),
             CreditFactorItem(
                 factor="credit_mix",
@@ -578,11 +577,11 @@ class CreditFactorSimulator:
                 weight_pct=10,
                 status=mix_status,  # type: ignore[arg-type]
                 summary=mix_summary,
-                estimated_delta_range=mix_delta,
+                guidance=mix_guidance,
             ),
         ]
 
-        # VantageScore 3.0 directional weights (40 + 21 + 20 + 11 + 5 + 3 = 100%)
+        # VantageScore 3.0 published factor weights (40 + 21 + 20 + 11 + 5 + 3 = 100%)
         depth_status = "optimal" if (age_status == "optimal" and mix_status == "optimal") else (
             "good" if age_status in ("optimal", "good") else age_status
         )
@@ -597,7 +596,7 @@ class CreditFactorSimulator:
                 weight_pct=40,
                 status=pay_status,  # type: ignore[arg-type]
                 summary=pay_summary,
-                estimated_delta_range=pay_delta,
+                guidance=pay_guidance,
             ),
             CreditFactorItem(
                 factor="depth_of_credit",
@@ -605,7 +604,7 @@ class CreditFactorSimulator:
                 weight_pct=21,
                 status=depth_status,  # type: ignore[arg-type]
                 summary=f"{age_summary} {mix_summary}",
-                estimated_delta_range=age_delta,
+                guidance=age_guidance,
             ),
             CreditFactorItem(
                 factor="utilization",
@@ -613,7 +612,7 @@ class CreditFactorSimulator:
                 weight_pct=20,
                 status=util_status,  # type: ignore[arg-type]
                 summary=util_summary,
-                estimated_delta_range=util_delta,
+                guidance=util_guidance,
             ),
             CreditFactorItem(
                 factor="balances",
@@ -621,7 +620,7 @@ class CreditFactorSimulator:
                 weight_pct=11,
                 status=bal_status,  # type: ignore[arg-type]
                 summary=f"${total_debt_all / 100:,.2f} total debt (${total_bal / 100:,.2f} revolving).",
-                estimated_delta_range="Paying down revolving balances improves both utilization & total balance factor",
+                guidance="Lower revolving balances reduce utilization & balance load",
             ),
             CreditFactorItem(
                 factor="recent_credit",
@@ -629,7 +628,7 @@ class CreditFactorSimulator:
                 weight_pct=5,
                 status=new_status,  # type: ignore[arg-type]
                 summary=new_summary,
-                estimated_delta_range=new_delta,
+                guidance=new_guidance,
             ),
             CreditFactorItem(
                 factor="available_credit",
@@ -637,124 +636,15 @@ class CreditFactorSimulator:
                 weight_pct=3,
                 status=avail_status,  # type: ignore[arg-type]
                 summary=f"${available_credit / 100:,.2f} unused revolving credit across {len(cards)} card(s).",
-                estimated_delta_range="Higher unused credit buffers utilization swings",
+                guidance="Unused revolving credit headroom",
             ),
         ]
 
-        # --- Directional Simulated Action Deltas ---
-        simulated_actions: List[CreditSimulatedAction] = []
-
-        # Per-card pre-close drop actions (sorted by highest utilization cliff crossed)
-        high_util_cards = sorted(
-            [c for c in cards if (c.utilization_pct or 0.0) >= 9.0 and c.balance_cents > 0],
-            key=lambda c: -(c.utilization_pct or 0.0),
-        )
-        for c in high_util_cards[:3]:
-            u = c.utilization_pct or 0.0
-            band = _util_cliff_band(u)
-            if band >= 6:
-                d_min, d_max = 35, 65
-            elif band == 5:
-                d_min, d_max = 25, 50
-            elif band == 4:
-                d_min, d_max = 20, 40
-            elif band == 3:
-                d_min, d_max = 18, 35
-            else:
-                d_min, d_max = 6, 15
-            simulated_actions.append(
-                CreditSimulatedAction(
-                    action=f"Dropping {c.name} {u:.0f}% -> 0% before close",
-                    delta_min_pts=d_min,
-                    delta_max_pts=d_max,
-                    explanation=(
-                        f"Dropping {c.name} {u:.0f}% -> 0% before statement close ({c.next_statement_close_date}): "
-                        f"est. +{d_min} to +{d_max} pts directional impact by clearing FICO utilization cliff(s)."
-                    ),
-                )
-            )
-
-        if all_zero_penalty_risk:
-            simulated_actions.append(
-                CreditSimulatedAction(
-                    action="Report 1%–4.9% on 1 primary card (AZEO)",
-                    delta_min_pts=10,
-                    delta_max_pts=20,
-                    explanation=(
-                        "Moving from 0% across all cards to 1%–4.9% on one primary card removes the "
-                        "FICO All-Zero inactivity penalty: est. +10 to +20 pts directional impact."
-                    ),
-                )
-            )
-        elif cards_with_bal >= 2 and aggregate_utilization_pct >= 9.0:
-            simulated_actions.append(
-                CreditSimulatedAction(
-                    action="Apply full AZEO (1 card at 1%–4.9%, others $0)",
-                    delta_min_pts=12,
-                    delta_max_pts=30,
-                    explanation=(
-                        f"Reducing Accounts With Balances from {cards_with_bal} -> 1 and aggregate util "
-                        f"from {aggregate_utilization_pct:.1f}% -> <4.9% before close: est. +12 to +30 pts directional impact."
-                    ),
-                )
-            )
-
-        # Scoring inquiry aging milestone
-        scoring_inqs = sorted(
-            [q for q in credit_inquiries if q.is_scoring_active],
-            key=lambda q: q.counts_until,
-        )
-        if scoring_inqs:
-            oldest_inq = scoring_inqs[0]
-            simulated_actions.append(
-                CreditSimulatedAction(
-                    action=f"Hard inquiry aging past 12m ({oldest_inq.lender} on {oldest_inq.counts_until})",
-                    delta_min_pts=3,
-                    delta_max_pts=10,
-                    explanation=(
-                        f"FICO 8 stops scoring hard inquiries after 12 months ({oldest_inq.counts_until}); "
-                        f"full report drop-off occurs at 24 months ({oldest_inq.drops_off}): est. +3 to +10 pts."
-                    ),
-                )
-            )
-
-        # Derogatory drop-off milestone if any active derogatory exists
-        if active_derogs:
-            next_derog = min(active_derogs, key=lambda d: d.drops_off)
-            is_severe = next_derog.kind in ("charge_off", "collection", "bankruptcy_ch7", "bankruptcy_ch13", "late_90")
-            d_min, d_max = (25, 70) if is_severe else (10, 30)
-            simulated_actions.append(
-                CreditSimulatedAction(
-                    action=f"Derogatory drop-off: {next_derog.kind} ({next_derog.drops_off})",
-                    delta_min_pts=d_min,
-                    delta_max_pts=d_max,
-                    explanation=(
-                        f"Scheduled FCRA drop-off on {next_derog.drops_off} "
-                        f"({'10-year Ch7 rule' if next_derog.kind == 'bankruptcy_ch7' else '7-year rule'}): "
-                        f"est. +{d_min} to +{d_max} pts directional impact."
-                    ),
-                )
-            )
-
-        # Honest short-term cost of opening a new card
-        simulated_actions.append(
-            CreditSimulatedAction(
-                action="Opening a new credit card (hard pull + AAoA dilution)",
-                delta_min_pts=-12,
-                delta_max_pts=-3,
-                explanation=(
-                    f"Hard inquiry (-3 to -12 pts for 12m) plus AAoA reduction and +1 Chase 5/24 slot "
-                    f"(would move you from {five_twenty_four.count_5_24}/24 to {five_twenty_four.count_5_24 + 1}/24)."
-                ),
-            )
-        )
-
         return CreditFactorBreakdown(
-            disclaimer=FACTOR_SIMULATOR_DISCLAIMER,
+            disclaimer=FACTOR_ANALYSIS_DISCLAIMER,
             latest_actual_scores=latest_actual_scores,
             fico8_factors=fico8_factors,
             vantage3_factors=vantage3_factors,
-            simulated_actions=simulated_actions,
         )
 
 
@@ -887,7 +777,7 @@ class CreditDebtOptimizer:
             if d.autopay_mode == AutopayMode.NONE and (d.balance_cents > 0 or d.kind == DebtKind.CREDIT_CARD)
         )
 
-        # Normalize bureau reports, inquiries, derogatories & compute honest 5-factor + 5/24
+        # Normalize bureau reports, inquiries, derogatories & compute 5-factor analysis + 5/24
         norm_reports = _normalize_credit_reports(credit_reports)
         norm_inquiries = _normalize_credit_inquiries(credit_inquiries, ref)
         norm_derogs = _normalize_credit_derogatories(credit_derogatories)
@@ -898,7 +788,7 @@ class CreditDebtOptimizer:
             include_authorized_user=include_authorized_user,
             today=ref,
         )
-        factor_simulator = CreditFactorSimulator().simulate(
+        factor_analysis = CreditFactorAnalyzer().analyze(
             credit_lines=enriched,
             aggregate_utilization_pct=agg_util,
             all_zero_penalty_risk=all_zero_risk,
@@ -913,7 +803,7 @@ class CreditDebtOptimizer:
         )
 
         azeo_plan = self._build_azeo_plan(cards, total_rev_lim, ref)
-        strategies, rec_strategy = self._simulate_all_strategies(
+        strategies, rec_strategy = self._compare_all_strategies(
             enriched, max(0, int(extra_monthly_budget_cents)), ref
         )
         alerts = self._build_expert_alerts(
@@ -949,7 +839,7 @@ class CreditDebtOptimizer:
             strategies=strategies,
             recommended_strategy=rec_strategy,
             alerts=alerts,
-            factor_simulator=factor_simulator,
+            factor_analysis=factor_analysis,
             five_twenty_four=five_twenty_four,
             credit_reports=norm_reports,
             credit_inquiries=norm_inquiries,
@@ -1041,7 +931,7 @@ class CreditDebtOptimizer:
                             role="primary_reporting_card",
                             explanation=(
                                 f"Pay ${pay_amt / 100:,.2f} by {pay_by_dt.isoformat()} (3d before close on {close_dt.isoformat()}) "
-                                f"to report ${target_primary / 100:,.2f} ({(target_primary / card.credit_limit_cents) * 100:.1f}% util — 800+ FICO tier)."
+                                f"to report ${target_primary / 100:,.2f} ({(target_primary / card.credit_limit_cents) * 100:.1f}% util — <8.9% AZEO target band)."
                             ),
                         )
                     )
@@ -1081,7 +971,7 @@ class CreditDebtOptimizer:
                     )
         return actions
 
-    def _simulate_strategy(
+    def _amortize_strategy(
         self,
         debts: List[CreditLineOut],
         extra_monthly_cents: int,
@@ -1089,7 +979,7 @@ class CreditDebtOptimizer:
         today: date,
     ) -> Tuple[int, int, int, str, List[str]]:
         """
-        Exact integer-cent month-by-month amortization simulator.
+        Exact integer-cent month-by-month amortization schedule.
         Returns `(months, total_interest_cents, first_win_months, first_target_name, month_1_actions)`.
         """
         active = [
@@ -1150,7 +1040,7 @@ class CreditDebtOptimizer:
             return sorted(alive, key=_cf_key)
 
         months = 0
-        while any(d["bal"] > 0 for d in active) and months < MAX_SIM_MONTHS:
+        while any(d["bal"] > 0 for d in active) and months < MAX_AMORTIZATION_MONTHS:
             months += 1
             # 1. Apply monthly interest (handle promo APR expiration cleanly!)
             for d in active:
@@ -1210,7 +1100,7 @@ class CreditDebtOptimizer:
             first_target_name = active[0]["name"]
         return months, total_interest, first_win_months or months, first_target_name, month_1_actions[:5]
 
-    def _simulate_all_strategies(
+    def _compare_all_strategies(
         self,
         debts: List[CreditLineOut],
         extra_monthly_cents: int,
@@ -1221,7 +1111,7 @@ class CreditDebtOptimizer:
             return [], "debt_free"
 
         # Baseline: minimum payments only (0 extra)
-        _m0, base_interest, _w0, _t0, _a0 = self._simulate_strategy(nonzero, 0, "avalanche", today)
+        _m0, base_interest, _w0, _t0, _a0 = self._amortize_strategy(nonzero, 0, "avalanche", today)
 
         has_credit_killer = any(
             d.kind == DebtKind.CREDIT_CARD and (d.utilization_pct or 0.0) >= 29.0 for d in nonzero
@@ -1230,14 +1120,14 @@ class CreditDebtOptimizer:
 
         specs = [
             ("adhd_hybrid", "ADHD Hybrid (Dopamine + Math)", "Clears 1–2 small clutter debts fast, then crushes highest APR."),
-            ("credit_first", "Credit-First FICO Turbo", "Drops >29% cards below FICO cliff first to boost score, then Avalanche."),
+            ("credit_first", "Credit-First Utilization Priority", "Drops >29% cards below utilization threshold first, then Avalanche."),
             ("avalanche", "Debt Avalanche (Lowest Interest)", "Targets highest APR first for mathematical minimum interest."),
             ("snowball", "Debt Snowball (Fastest Wins)", "Targets smallest balance first for rapid closures & DTI drop."),
         ]
 
         results: List[DebtStrategyResult] = []
         for key, label, tagline in specs:
-            months, interest, first_win, first_target, m1 = self._simulate_strategy(
+            months, interest, first_win, first_target, m1 = self._amortize_strategy(
                 nonzero, extra_monthly_cents, key, today
             )
             results.append(
@@ -1279,8 +1169,8 @@ class CreditDebtOptimizer:
                         category="autopay_shield",
                         title=f"Turn On Autopay for {d.name}",
                         detail=(
-                            f"{d.name} has autopay OFF. A single forgotten 30-day late payment can drop FICO by 60–110 points "
-                            f"for 7 years—automating at least the minimum payment eliminates ADHD forgetfulness risk."
+                            f"{d.name} has autopay OFF. A missed 30-day payment remains on bureau credit reports "
+                            f"for 7 years—automating at least the minimum payment eliminates missed-due-date risk."
                         ),
                         micro_step=f"Set autopay to Statement Balance (or Minimum) on {d.name} before {d.next_due_date}.",
                         credit_line_id=d.id,
@@ -1348,8 +1238,8 @@ class CreditDebtOptimizer:
                     category="azeo_inactivity",
                     title="FICO All-Zero Penalty Active (0% Aggregate Util)",
                     detail=(
-                        "All your credit cards are reporting $0.00. FICO models apply a small 10–20 point inactivity dip "
-                        "when every revolving card reports $0; letting 1 card report 1%–4.9% (AZEO) maximizes score."
+                        "All your credit cards are reporting $0.00. Scoring models penalize all-zero revolving reporting "
+                        "when every card reports $0; letting 1 primary card report 1%–4.9% (AZEO) avoids the all-zero penalty."
                     ),
                     micro_step="Put one small recurring bill (e.g. $10–$25) on your primary card and autopay statement balance.",
                 )
@@ -1359,9 +1249,9 @@ class CreditDebtOptimizer:
                 CreditAdvisorAlert(
                     severity="info",
                     category="azeo_optimization",
-                    title=f"Unlock 800+ FICO Tier (Aggregate Util {agg_util:.1f}% → <8.9%)",
+                    title=f"Optimize Aggregate Utilization ({agg_util:.1f}% → <8.9%)",
                     detail=(
-                        "Under 30% prevents severe drag, but FICO's top tier rewards aggregate utilization between 1% and 8.9%. "
+                        "Under 30% prevents severe drag, while the lowest utilization band is between 1% and 8.9%. "
                         "Use the AZEO pre-statement paydown dates 30–60 days before any loan or apartment application."
                     ),
                     micro_step="Follow the AZEO pay-by dates below 3 days before each card's statement close.",
@@ -1435,61 +1325,139 @@ class CreditDebtOptimizer:
         return alerts[:10]
 
     def evaluate_balance_transfer(self, req: BalanceTransferRequest) -> BalanceTransferResult:
-        """Exact amortization breakeven analysis for a 0% balance transfer offer."""
+        """
+        Exact amortization breakeven analysis for a 0% balance transfer offer.
+
+        Explicitly detects zero/negative amortization (`monthly_payment_cents <= monthly_interest`)
+        instead of inventing arbitrary penalties, never recommends continuing non-amortizing
+        payments, and models an independent `post_promo_apr_bps` after the 0% window expires.
+        """
         fee_cents = int(round(req.balance_cents * (req.transfer_fee_bps / 10000.0)))
+        post_promo_apr_bps = (
+            int(req.post_promo_apr_bps)
+            if req.post_promo_apr_bps is not None
+            else int(req.current_apr_bps)
+        )
+        req_monthly_clear = int(math.ceil((req.balance_cents + fee_cents) / req.promo_months))
+
+        first_mo_interest_a = int(round(req.balance_cents * (req.current_apr_bps / 10000.0) / 12.0))
+        min_amortizing_cents = (
+            first_mo_interest_a + max(100, int(math.ceil(req.balance_cents * 0.01)))
+            if req.current_apr_bps > 0
+            else max(100, int(math.ceil(req.balance_cents / max(1, MAX_AMORTIZATION_MONTHS))))
+        )
 
         # Scenario A: Keep current card at current_apr_bps
         bal_a = req.balance_cents
         int_a = 0
-        m = 0
-        while bal_a > 0 and m < MAX_SIM_MONTHS:
-            m += 1
-            interest = int(round(bal_a * (req.current_apr_bps / 10000.0) / 12.0))
-            bal_a += interest
-            int_a += interest
-            if req.monthly_payment_cents <= interest:
-                int_a += interest * 24  # Unaffordable / negative amortization penalty
-                break
-            bal_a = max(0, bal_a - req.monthly_payment_cents)
+        m_a = 0
+        current_payoff_possible = True
+        if req.current_apr_bps > 0 and req.monthly_payment_cents <= first_mo_interest_a:
+            current_payoff_possible = False
+            # Bounded 60-month interest burn purely for factual display (never used as a fake finite payoff)
+            sim_bal = req.balance_cents
+            for _ in range(60):
+                mo_int = int(round(sim_bal * (req.current_apr_bps / 10000.0) / 12.0))
+                int_a += mo_int
+                sim_bal = max(0, sim_bal + mo_int - req.monthly_payment_cents)
+        else:
+            while bal_a > 0 and m_a < MAX_AMORTIZATION_MONTHS:
+                m_a += 1
+                interest = int(round(bal_a * (req.current_apr_bps / 10000.0) / 12.0))
+                if req.monthly_payment_cents <= interest:
+                    current_payoff_possible = False
+                    break
+                bal_a += interest
+                int_a += interest
+                bal_a = max(0, bal_a - req.monthly_payment_cents)
+            if bal_a > 0:
+                current_payoff_possible = False
 
-        # Scenario B: Transfer balance + fee at 0% for promo_months, then current_apr_bps thereafter
+        # Scenario B: Transfer balance + fee at 0% for promo_months, then post_promo_apr_bps thereafter
         bal_b = req.balance_cents + fee_cents
         int_b = 0
         m_b = 0
-        while bal_b > 0 and m_b < MAX_SIM_MONTHS:
+        transfer_payoff_possible = True
+        while bal_b > 0 and m_b < MAX_AMORTIZATION_MONTHS:
             m_b += 1
-            if m_b > req.promo_months:
-                interest = int(round(bal_b * (req.current_apr_bps / 10000.0) / 12.0))
+            if m_b > req.promo_months and post_promo_apr_bps > 0:
+                interest = int(round(bal_b * (post_promo_apr_bps / 10000.0) / 12.0))
+                if req.monthly_payment_cents <= interest:
+                    transfer_payoff_possible = False
+                    # Record remaining post-promo interest up to 60 total months for factual reporting
+                    rem_months = max(0, 60 - m_b + 1)
+                    sim_b = bal_b
+                    for _ in range(rem_months):
+                        mo_int_b = int(round(sim_b * (post_promo_apr_bps / 10000.0) / 12.0))
+                        int_b += mo_int_b
+                        sim_b = max(0, sim_b + mo_int_b - req.monthly_payment_cents)
+                    break
                 bal_b += interest
                 int_b += interest
-                if req.monthly_payment_cents <= interest:
-                    int_b += interest * 24
-                    break
             bal_b = max(0, bal_b - req.monthly_payment_cents)
+        if bal_b > 0 and transfer_payoff_possible:
+            transfer_payoff_possible = False
 
+        clears_promo = transfer_payoff_possible and m_b <= req.promo_months
         total_cost_b = fee_cents + int_b
-        net_savings = int_a - total_cost_b
-        req_monthly_clear = int(math.ceil((req.balance_cents + fee_cents) / req.promo_months))
-        clears_promo = m_b <= req.promo_months
 
-        if net_savings >= 15_000 and clears_promo:
-            verdict = "strong_yes"
+        if not current_payoff_possible and not transfer_payoff_possible:
+            verdict = "skip"
+            net_savings = 0
             expl = (
-                f"Strong YES: saves ${net_savings / 100:,.2f} net after the ${fee_cents / 100:,.2f} transfer fee "
-                f"and pays off cleanly inside the {req.promo_months}-month 0% window."
+                f"Payment warning: ${req.monthly_payment_cents / 100:,.2f}/mo does not amortize principal "
+                f"(current monthly interest is ${first_mo_interest_a / 100:,.2f}/mo, and post-promo interest at "
+                f"{post_promo_apr_bps / 100:.2f}% APR also exceeds ${req.monthly_payment_cents / 100:,.2f}/mo). "
+                f"Increase your monthly payment to at least ${min_amortizing_cents / 100:,.2f}/mo "
+                f"(or ${req_monthly_clear / 100:,.2f}/mo to clear inside the {req.promo_months}-month promo) before transferring."
             )
-        elif net_savings >= 5_000:
-            verdict = "marginal"
+        elif not current_payoff_possible and transfer_payoff_possible:
+            # Current card never pays down principal at this payment, whereas 0% promo reduces principal enough to amortize!
+            if m_b > 60 and req.current_apr_bps > 0:
+                int_a = 0
+                sim_bal = req.balance_cents
+                for _ in range(m_b):
+                    mo_int = int(round(sim_bal * (req.current_apr_bps / 10000.0) / 12.0))
+                    int_a += mo_int
+                    sim_bal = max(0, sim_bal + mo_int - req.monthly_payment_cents)
+            net_savings = max(0, int_a - total_cost_b)
+            verdict = "strong_yes" if clears_promo else "marginal"
             expl = (
-                f"Marginal win: saves ${net_savings / 100:,.2f} net, "
-                f"{'clearing within promo.' if clears_promo else f'but requires ${req_monthly_clear / 100:,.2f}/mo to beat the {req.promo_months}-mo promo cliff.'}"
+                f"Non-amortizing current payment alert: at ${req.monthly_payment_cents / 100:,.2f}/mo, your current "
+                f"{req.current_apr_bps / 100:.2f}% APR card charges ${first_mo_interest_a / 100:,.2f}/mo in interest "
+                f"and NEVER pays down principal. Moving to 0% for {req.promo_months} months applies every dollar to principal "
+                f"after the ${fee_cents / 100:,.2f} fee and pays off in {m_b} months (post-promo {post_promo_apr_bps / 100:.2f}% APR) — "
+                f"or raise payments to ${req_monthly_clear / 100:,.2f}/mo to finish before promo ends."
+            )
+        elif current_payoff_possible and not transfer_payoff_possible:
+            verdict = "skip"
+            net_savings = int_a - total_cost_b
+            expl = (
+                f"Skip this transfer: after {req.promo_months} months, the remaining balance hits a higher "
+                f"{post_promo_apr_bps / 100:.2f}% post-promo APR where ${req.monthly_payment_cents / 100:,.2f}/mo "
+                f"no longer covers monthly interest. Raise payments to ${req_monthly_clear / 100:,.2f}/mo or stay on your current card."
             )
         else:
-            verdict = "skip"
-            expl = (
-                f"Skip this transfer: the ${fee_cents / 100:,.2f} fee eats the interest savings "
-                f"(net impact: {'+' if net_savings >= 0 else '-'}${abs(net_savings) / 100:,.2f}). Just pay down your current card directly."
-            )
+            net_savings = int_a - total_cost_b
+            if net_savings >= 15_000 and clears_promo:
+                verdict = "strong_yes"
+                expl = (
+                    f"Strong YES: saves ${net_savings / 100:,.2f} net after the ${fee_cents / 100:,.2f} transfer fee "
+                    f"and pays off cleanly inside the {req.promo_months}-month 0% window."
+                )
+            elif net_savings >= 5_000:
+                verdict = "marginal"
+                expl = (
+                    f"Marginal win: saves ${net_savings / 100:,.2f} net (post-promo {post_promo_apr_bps / 100:.2f}% APR), "
+                    f"{'clearing within promo.' if clears_promo else f'but requires ${req_monthly_clear / 100:,.2f}/mo to beat the {req.promo_months}-mo promo cliff.'}"
+                )
+            else:
+                verdict = "skip"
+                expl = (
+                    f"Skip this transfer: the ${fee_cents / 100:,.2f} fee outweighs the interest savings "
+                    f"(net impact: {'+' if net_savings >= 0 else '-'}${abs(net_savings) / 100:,.2f}). "
+                    f"Apply ${req.monthly_payment_cents / 100:,.2f}/mo directly to principal ({m_a} months to payoff)."
+                )
 
         return BalanceTransferResult(
             verdict=verdict,  # type: ignore[arg-type]
@@ -1499,5 +1467,9 @@ class CreditDebtOptimizer:
             net_savings_cents=net_savings,
             required_monthly_to_clear_promo_cents=req_monthly_clear,
             clears_before_promo_ends=clears_promo,
+            post_promo_apr_bps=post_promo_apr_bps,
+            current_payoff_possible=current_payoff_possible,
+            transfer_payoff_possible=transfer_payoff_possible,
+            min_amortizing_payment_cents=min_amortizing_cents,
             explanation=expl,
         )

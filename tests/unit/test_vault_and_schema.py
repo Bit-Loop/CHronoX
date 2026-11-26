@@ -379,8 +379,9 @@ def test_pydantic_v2_phase0_contracts():
         with pytest.raises(ValidationError):
             AgentActionItem(action_type=forbidden, summary="Forbidden")
 
-    # Smoke-instantiate analytics, credit simulator, portfolio, goals, splits models
-    assert CreditFactorBreakdown().disclaimer.startswith("Directional factor simulator")
+    # Smoke-instantiate analytics, credit factor analysis, portfolio, goals, splits models
+    assert CreditFactorBreakdown().disclaimer.startswith("Weighted factor analysis")
+    assert "simulator" not in CreditFactorBreakdown().disclaimer.lower()
     assert FiveTwentyFourStatus().under_5_24 is True
     assert PortfolioSummary().total_value_cents == 0
     assert HoldingCreate(symbol=" btc ", quantity_e8=100_000_000, price_e8=6_500_000_000_000).symbol == "BTC"

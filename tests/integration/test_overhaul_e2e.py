@@ -532,12 +532,12 @@ class TestFireflyRulesSplitsTagsCommentsE2E:
 
 
 # =============================================================================
-# 5. Honest Credit Factor Simulator + 5/24 + Official Report Import
+# 5. Credit Factor Analysis + 5/24 + Official Report Import
 # =============================================================================
 
 
-class TestCreditSimulatorAndImportE2E:
-    def test_credit_factor_simulator_524_derogatories_and_pdf_review_gate(
+class TestCreditFactorAnalysisAndImportE2E:
+    def test_credit_factor_analysis_524_derogatories_and_pdf_review_gate(
         self, tmp_path, monkeypatch: pytest.MonkeyPatch
     ):
         client, svc = _make_locked_app(tmp_path, monkeypatch)
@@ -598,17 +598,19 @@ class TestCreditSimulatorAndImportE2E:
             assert r_der.status_code == 200
             assert r_der.json()["drops_off"].startswith("2030-")
 
-            # Full credit report with Honest Factor Simulator & Chase 5/24
+            # Full credit report with 5-Factor Analysis & Chase 5/24
             rep_with_au = client.get("/api/v1/credit/report?extra_monthly_cents=35000&include_au=true").json()
             rep_no_au = client.get("/api/v1/credit/report?extra_monthly_cents=35000&include_au=false").json()
 
-            fs = rep_with_au["factor_simulator"]
+            assert "factor_simulator" not in rep_with_au
+            fs = rep_with_au["factor_analysis"]
             assert fs is not None
-            assert "cannot reproduce" in fs["disclaimer"].lower() or "directional" in fs["disclaimer"].lower()
+            assert "simulated_actions" not in fs
+            assert "not an official bureau score" in fs["disclaimer"].lower()
+            assert "simulator" not in fs["disclaimer"].lower()
             assert any(s["score"] == 742 and s["bureau"] == "experian" for s in fs["latest_actual_scores"])
             assert len(fs["fico8_factors"]) == 5
             assert len(fs["vantage3_factors"]) >= 5
-            assert len(fs["simulated_actions"]) >= 1
 
             assert rep_with_au["five_twenty_four"]["count_5_24"] == rep_no_au["five_twenty_four"]["count_5_24"] + 1
             assert rep_with_au["five_twenty_four"]["inquiries_6m"] >= 1

@@ -1,5 +1,5 @@
 """
-Clean-Room MoneyStill-Inspired Analytics, Net Worth & What-If Scenario Engine.
+Clean-Room MoneyStill-Inspired Analytics, Net Worth & Scenario Forecast Engine.
 
 All calculations run strictly in exact integer cents (`int`) with zero IEEE-754
 floating-point penny drift and strict split-transaction awareness (reads child
@@ -11,7 +11,7 @@ Outputs align 1:1 with `chronox_finance.models`:
 3. Expense Distribution Donut (exact same categorical hex color map as Sankey)
 4. Monthly Trend Series (`month`, `income_cents`, `expense_cents`, `surplus_cents`, up to 24 months)
 5. Net Worth Timeline reconstructed across up to 730 days (`liquid + investment - debt`)
-6. Interactive What-If Scenario Simulator (`simulate_scenario`) returning `baseline_points`,
+6. Interactive Scenario Projection (`simulate_scenario`) returning `baseline_points`,
    `scenario_points`, `diff_ending_cents`, `diff_pct`, `safe_runway_floor_cents`, and
    `per_goal_series` for smooth client-side timeline drag + authoritative server commit.
 """
@@ -41,28 +41,39 @@ from chronox_finance.models import (
     compute_holding_value_cents,
 )
 
-# Dark-industrial tactical palette shared identically across Top 5, Sankey, and Donut
+# Accessible industrial palette — expense hues intentionally exclude emerald (income) and cyan (surplus)
 INCOME_PALETTE: Tuple[str, ...] = (
-    "#10b981",  # emerald
-    "#14b8a6",  # teal
-    "#34d399",  # mint emerald
-    "#059669",  # deep emerald
-    "#22c55e",  # signal green
+    "#047857",  # deep emerald (>= 5.1:1 on light, crisp on dark)
+    "#0f766e",  # deep teal
+    "#15803d",  # forest green
+    "#059669",  # emerald
+    "#0d9488",  # sea teal
 )
 EXPENSE_PALETTE: Tuple[str, ...] = (
-    "#f59e0b",  # amber
-    "#3b82f6",  # steel blue
-    "#a855f7",  # violet
-    "#ef4444",  # crimson
-    "#ec4899",  # magenta
-    "#f97316",  # orange
-    "#8b5cf6",  # indigo
-    "#eab308",  # ochre
+    "#b45309",  # burnt amber (>= 4.7:1 on light)
+    "#2563eb",  # royal blue
+    "#7c3aed",  # violet
+    "#dc2626",  # crimson
+    "#db2777",  # magenta
+    "#c2410c",  # rust orange
+    "#4f46e5",  # indigo
+    "#a16207",  # ochre
 )
-HUB_INCOME_COLOR = "#10b981"
+HUB_INCOME_COLOR = "#047857"
+HUB_CASHFLOW_COLOR = "#475569"
 OTHERS_EXPENSE_COLOR = "#64748b"
-SAVINGS_INVEST_COLOR = "#06b6d4"
-DEFICIT_DRAW_COLOR = "#f59e0b"
+SAVINGS_INVEST_COLOR = "#0e7490"
+UNALLOCATED_SURPLUS_COLOR = "#0369a1"
+DEFICIT_DRAW_COLOR = "#b91c1c"
+_RESERVED_SEMANTIC_COLORS = {
+    "#10b981",
+    "#047857",
+    "#34d399",
+    "#059669",
+    "#06b6d4",
+    "#0e7490",
+    "#2dd4bf",
+}
 
 _YM_RE = re.compile(r"^(\d{4})-(\d{2})$")
 _HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -153,6 +164,7 @@ def reconstruct_net_worth_timeline(
     holdings: Optional[Sequence[Any]] = None,
     credit_lines: Optional[Sequence[Any]] = None,
     existing_snapshots: Optional[Sequence[Any]] = None,
+    portfolio_snapshots: Optional[Sequence[Any]] = None,
     days: int = 730,
     today: Optional[date] = None,
 ) -> List[NetWorthPoint]:
@@ -170,12 +182,17 @@ def reconstruct_net_worth_timeline(
     # 1. Anchor current balances on `today`
     liquid_acct_ids: set[int] = set()
     credit_acct_ids: set[int] = set()
+    credit_acct_ext_ids: set[str] = set()
     current_liquid = 0
     current_trading_cash = 0
     current_debt = 0
 
     for acct in accounts:
+        curr = str(_get(acct, "currency", "USD") or "USD").strip().upper()
+        if curr != "USD":
+            continue
         aid = _get(acct, "id", None)
+        ext_id = str(_get(acct, "external_id", "") or "").strip()
         atype = _enum_val(_get(acct, "account_type", AccountType.CHECKING.value))
         bal = int(_get(acct, "balance_cents", 0) or 0)
         is_liq = bool(_get(acct, "is_liquid", True))
@@ -183,6 +200,8 @@ def reconstruct_net_worth_timeline(
         if atype == AccountType.CREDIT.value:
             if aid is not None:
                 credit_acct_ids.add(int(aid))
+            if ext_id:
+                credit_acct_ext_ids.add(ext_id)
             if bal < 0:
                 current_debt += abs(bal)
             elif bal > 0:
@@ -203,11 +222,15 @@ def reconstruct_net_worth_timeline(
             linked_id = _get(cl, "account_id", None)
             if linked_id is not None and int(linked_id) in credit_acct_ids:
                 continue
+            cl_ext = str(_get(cl, "external_account_id", "") or "").strip()
+            if cl_ext and cl_ext in credit_acct_ext_ids:
+                continue
             bal = max(0, int(_get(cl, "balance_cents", 0) or 0))
             current_debt += bal
 
     # Add exact holdings valuation (`quantity_e8 * price_e8` via ROUND_HALF_EVEN if needed)
     holdings_value = 0
+    holding_anchor_dates: List[date] = []
     if holdings:
         for h in holdings:
             mv = _get(h, "market_value_cents", None)
@@ -217,10 +240,16 @@ def reconstruct_net_worth_timeline(
                 q_e8 = int(_get(h, "quantity_e8", 0) or 0)
                 p_e8 = int(_get(h, "price_e8", 0) or 0)
                 holdings_value += compute_holding_value_cents(q_e8, p_e8)
+            raw_anchor = str(_get(h, "created_at", "") or _get(h, "updated_at", "") or "")[:10]
+            if len(raw_anchor) == 10:
+                try:
+                    holding_anchor_dates.append(date.fromisoformat(raw_anchor))
+                except ValueError:
+                    pass
 
     current_investments = holdings_value + current_trading_cash
 
-    # 2. Index persisted snapshots (if any)
+    # 2. Index persisted net-worth and portfolio snapshots (if any)
     snap_by_date: Dict[str, Tuple[int, int, int]] = {}
     if existing_snapshots:
         for snap in existing_snapshots:
@@ -232,9 +261,41 @@ def reconstruct_net_worth_timeline(
             dbt = int(_get(snap, "debt_cents", 0) or 0)
             snap_by_date[s_date] = (liq, inv, dbt)
 
+    port_snaps_sorted: List[Tuple[date, int]] = []
+    if portfolio_snapshots:
+        for ps in portfolio_snapshots:
+            p_date = str(_get(ps, "snap_date", "") or "")[:10]
+            if len(p_date) == 10:
+                try:
+                    p_dt = date.fromisoformat(p_date)
+                    port_snaps_sorted.append((p_dt, int(_get(ps, "total_value_cents", 0) or 0)))
+                except ValueError:
+                    continue
+        port_snaps_sorted.sort(key=lambda pair: pair[0])
+
+    earliest_inv_date: Optional[date] = None
+    candidate_inv_dates: List[date] = []
+    if port_snaps_sorted:
+        candidate_inv_dates.append(port_snaps_sorted[0][0])
+    if holding_anchor_dates:
+        candidate_inv_dates.append(min(holding_anchor_dates))
+    if candidate_inv_dates:
+        earliest_inv_date = min(candidate_inv_dates)
+    elif holdings_value > 0:
+        # Holdings have no historical timestamp or snapshot -> anchor to `ref` so today's
+        # valuation is NEVER projected backward into dates where no snapshot existed.
+        earliest_inv_date = ref
+
     # 3. Bucket daily net ledger flows within [start_dt, ref]
     liquid_delta_by_day: Dict[date, int] = defaultdict(int)
     debt_delta_by_day: Dict[date, int] = defaultdict(int)
+    trading_delta_by_day: Dict[date, int] = defaultdict(int)
+    trading_acct_ids = {
+        int(_get(a, "id"))
+        for a in accounts
+        if _get(a, "id", None) is not None
+        and _enum_val(_get(a, "account_type", "")) == AccountType.TRADING.value
+    }
 
     for tx in transactions:
         tx_date_str = str(_get(tx, "tx_date", "") or "")[:10]
@@ -248,44 +309,79 @@ def reconstruct_net_worth_timeline(
         if amt <= 0:
             continue
         ttype = _enum_val(_get(tx, "tx_type", "expense"))
+        xfer_dir = str(_get(tx, "transfer_direction", "") or "").strip().lower()
         acct_id = _get(tx, "account_id", None)
         is_credit_acct = acct_id is not None and int(acct_id) in credit_acct_ids
+        is_trading_acct = acct_id is not None and int(acct_id) in trading_acct_ids
 
         if is_credit_acct:
             if ttype == "expense":
                 debt_delta_by_day[tx_dt] += amt
             elif ttype in ("income", "transfer"):
                 debt_delta_by_day[tx_dt] -= amt
+        elif is_trading_acct:
+            if ttype == "income" or (ttype == "transfer" and xfer_dir == "in"):
+                trading_delta_by_day[tx_dt] += amt
+            elif ttype == "expense" or (ttype == "transfer" and xfer_dir == "out"):
+                trading_delta_by_day[tx_dt] -= amt
         else:
-            if ttype == "income":
+            if ttype == "income" or (ttype == "transfer" and xfer_dir == "in"):
                 liquid_delta_by_day[tx_dt] += amt
-            elif ttype == "expense":
+            elif ttype == "expense" or (ttype == "transfer" and xfer_dir == "out"):
                 liquid_delta_by_day[tx_dt] -= amt
+
+    def _historical_holdings_value(day_dt: date) -> int:
+        if day_dt >= ref:
+            return holdings_value
+        if earliest_inv_date is not None and day_dt < earliest_inv_date:
+            return 0
+        if port_snaps_sorted:
+            # Latest recorded portfolio snapshot on or before `day_dt`
+            chosen: Optional[int] = None
+            for s_dt, s_val in port_snaps_sorted:
+                if s_dt <= day_dt:
+                    chosen = s_val
+                else:
+                    break
+            if chosen is not None:
+                return chosen
+            return 0
+        return holdings_value if (earliest_inv_date is not None and day_dt >= earliest_inv_date) else 0
 
     # 4. Walk backward from `today` -> `start_dt` so `today` matches exact live balances
     points_rev: List[NetWorthPoint] = []
     run_liq = current_liquid
-    run_inv = current_investments
+    run_trading_cash = current_trading_cash
     run_debt = current_debt
 
     for offset in range(span):
         d = ref - timedelta(days=offset)
         iso = d.isoformat()
-        if iso in snap_by_date:
-            run_liq, run_inv, run_debt = snap_by_date[iso]
-        nw = run_liq + run_inv - run_debt
+        if offset == 0:
+            day_liq = current_liquid
+            day_inv = current_investments
+            day_debt = current_debt
+        elif iso in snap_by_date:
+            day_liq, day_inv, day_debt = snap_by_date[iso]
+            run_liq = day_liq
+            run_debt = day_debt
+        else:
+            day_liq = run_liq
+            day_inv = max(0, run_trading_cash) + _historical_holdings_value(d)
+            day_debt = run_debt
+
+        nw = day_liq + day_inv - day_debt
         points_rev.append(
             NetWorthPoint(
                 date=iso,
-                liquid_cents=run_liq,
-                investment_cents=run_inv,
-                debt_cents=run_debt,
+                liquid_cents=day_liq,
+                investment_cents=day_inv,
+                debt_cents=day_debt,
                 net_worth_cents=nw,
             )
         )
-        # Step backward to previous day's closing balance:
-        # closing(d) = closing(d - 1) + delta(d)  ==>  closing(d - 1) = closing(d) - delta(d)
         run_liq = run_liq - liquid_delta_by_day.get(d, 0)
+        run_trading_cash = run_trading_cash - trading_delta_by_day.get(d, 0)
         run_debt = max(0, run_debt - debt_delta_by_day.get(d, 0))
 
     points_rev.reverse()
@@ -378,7 +474,7 @@ def _build_goal_contribution_schedule(
 
 
 class AnalyticsEngine:
-    """Clean-room MoneyStill Analytics & Interactive What-If Scenario Engine."""
+    """Clean-room MoneyStill Analytics & Scenario Forecast Engine."""
 
     def build_overview(
         self,
@@ -389,6 +485,7 @@ class AnalyticsEngine:
         holdings: Optional[Sequence[Any]] = None,
         credit_lines: Optional[Sequence[Any]] = None,
         net_worth_snapshots: Optional[Sequence[Any]] = None,
+        portfolio_snapshots: Optional[Sequence[Any]] = None,
         splits_by_tx_id: Optional[Dict[int, List[Any]]] = None,
         period: str = "1y",
         group_by: Literal["jar", "subcategory"] = "jar",
@@ -397,15 +494,16 @@ class AnalyticsEngine:
         """
         Compute unified MoneyStill Analytics dashboard payload in exact integer cents:
         - Top 3 KPIs (`savings_rate_pct`, `avg_monthly_surplus_cents`, `top_5_expenses`)
-        - 3-Column Cashflow Sankey (Income Sources -> Total Income Hub -> Top 5 + Others + Savings & Invest)
+        - 3-Column Cashflow Sankey (honest source/destination labels: Unfunded Gap / Unallocated Surplus)
         - Expense Distribution Donut (exact shared color palette with Sankey)
-        - Monthly Trend Series (up to 24 months)
+        - Monthly Trend Series (clamped to exact date filter on rolling periods; never plots future months)
         - Net Worth Timeline reconstructed across up to 730 days
         """
         ref = today or date.today()
         norm_period, start_dt, end_dt, canonical_months = resolve_period(period, today=ref)
         start_iso = start_dt.isoformat()
         end_iso = end_dt.isoformat()
+        is_single_month = bool(_YM_RE.match(norm_period))
 
         jars_by_id: Dict[int, Dict[str, Any]] = {}
         for j in jars:
@@ -418,14 +516,28 @@ class AnalyticsEngine:
                     "color": str(_get(j, "color", "")),
                 }
 
-        # Determine trend window (up to 24 months; single YYYY-MM shows that year's 12 months)
-        if _YM_RE.match(norm_period):
+        acct_type_by_id: Dict[int, str] = {}
+        if accounts:
+            for a in accounts:
+                aid = _get(a, "id", None)
+                if aid is not None:
+                    acct_type_by_id[int(aid)] = _enum_val(_get(a, "account_type", ""))
+
+        # Determine trend window:
+        # - Single YYYY-MM drilldown shows that calendar year's elapsed months up to `min(Dec 31, max(ref, end_dt))`
+        #   so future unelapsed months are NEVER plotted as fake $0 inactivity.
+        # - Rolling windows (`30d`, `90d`, `1y`, `2y`) strictly bound trend rows to `[start_iso, end_iso]`
+        #   so chart totals ALWAYS equal KPI totals!
+        if is_single_month:
             yr = start_dt.year
             trend_start = date(yr, 1, 1)
-            trend_end = date(yr, 12, 31)
+            year_cap = date(yr, 12, 31)
+            trend_end = min(year_cap, max(ref, end_dt)) if yr >= ref.year else year_cap
         else:
             trend_start = start_dt
             trend_end = end_dt
+        trend_start_iso = trend_start.isoformat()
+        trend_end_iso = trend_end.isoformat()
         trend_months = _calendar_months_between(trend_start, trend_end, max_months=24)
         trend_month_set = set(trend_months)
         monthly_income: Dict[str, int] = defaultdict(int)
@@ -434,6 +546,8 @@ class AnalyticsEngine:
         # Period totals (split-aware — ZERO double-counting!)
         total_income_cents = 0
         total_expense_cents = 0
+        verified_reserve_draw_cents = 0
+        verified_savings_transfer_cents = 0
         income_by_source: Dict[str, int] = defaultdict(int)
         expense_by_cat: Dict[str, int] = defaultdict(int)
         cat_slug_map: Dict[str, str] = {}
@@ -446,9 +560,32 @@ class AnalyticsEngine:
             ym = tx_date_str[:7]
             ttype = _enum_val(_get(tx, "tx_type", "expense"))
             in_period = start_iso <= tx_date_str <= end_iso
-            in_trend = ym in trend_month_set
+            in_trend = (ym in trend_month_set) and (trend_start_iso <= tx_date_str <= trend_end_iso)
 
             if not in_period and not in_trend:
+                continue
+
+            if ttype == "transfer" and in_period:
+                amt = int(_get(tx, "amount_cents", 0) or 0)
+                if amt > 0:
+                    merch_low = f"{_get(tx, 'merchant', '')} {_get(tx, 'memo', '')}".lower()
+                    xfer_dir = str(_get(tx, "transfer_direction", "") or "").strip().lower()
+                    acct_id = _get(tx, "account_id", None)
+                    atype = acct_type_by_id.get(int(acct_id), "") if acct_id is not None else ""
+                    if (
+                        (atype in ("savings", "trading") and xfer_dir == "in")
+                        or (
+                            atype == "checking"
+                            and xfer_dir == "out"
+                            and any(k in merch_low for k in ("saving", "hysa", "invest", "broker", "schwab", "coinbase", "robinhood", "ira", "401k"))
+                        )
+                    ):
+                        verified_savings_transfer_cents += amt
+                    elif (
+                        (atype == "savings" and xfer_dir == "out")
+                        or (atype == "checking" and xfer_dir == "in" and any(k in merch_low for k in ("saving", "reserve", "hysa")))
+                    ):
+                        verified_reserve_draw_cents += amt
                 continue
 
             if ttype == "income":
@@ -502,7 +639,10 @@ class AnalyticsEngine:
                     expense_by_cat[label] += alloc_amt
                     if jar_info:
                         cat_slug_map.setdefault(label, jar_info["slug"])
-                        if _HEX_COLOR_RE.match(jar_info["color"]):
+                        if (
+                            _HEX_COLOR_RE.match(jar_info["color"])
+                            and jar_info["color"].lower() not in _RESERVED_SEMANTIC_COLORS
+                        ):
                             cat_preferred_color.setdefault(label, jar_info["color"])
 
         # --- KPIs ---
@@ -564,13 +704,13 @@ class AnalyticsEngine:
                 )
             )
 
-        # --- 3-Column Cashflow Sankey ---
+        # --- 3-Column Cashflow Sankey (Honest Source & Destination Labels) ---
         sankey_nodes: List[SankeyNode] = []
         sankey_links: List[SankeyLink] = []
         hub_total_cents = max(total_income_cents, total_expense_cents)
+        has_deficit = total_expense_cents > total_income_cents
 
         if hub_total_cents > 0:
-            # Column 0: Income Sources (cap at Top 5 + "Other Income" for ADHD visual clarity)
             ranked_incomes = sorted(income_by_source.items(), key=lambda kv: (-kv[1], kv[0]))
             top_incomes = ranked_incomes[:5]
             other_inc_cents = sum(v for _, v in ranked_incomes[5:])
@@ -580,13 +720,18 @@ class AnalyticsEngine:
             ]
             if other_inc_cents > 0:
                 col0_items.append(("Other Income", other_inc_cents, "#047857"))
-            if total_expense_cents > total_income_cents:
+            if has_deficit:
                 deficit_cents = total_expense_cents - total_income_cents
-                col0_items.append(("Cash Reserves Draw", deficit_cents, DEFICIT_DRAW_COLOR))
+                verified_draw = min(deficit_cents, verified_reserve_draw_cents)
+                unfunded_gap = deficit_cents - verified_draw
+                if verified_draw > 0:
+                    col0_items.append(("Cash Reserves Draw", verified_draw, "#b45309"))
+                if unfunded_gap > 0:
+                    col0_items.append(("Unfunded Gap", unfunded_gap, DEFICIT_DRAW_COLOR))
 
             for idx, (lbl, amt, color) in enumerate(col0_items):
                 nid = f"inc:{idx}"
-                pct = round((amt / income_denom) * 100.0, 1)
+                pct = round((amt / hub_total_cents) * 100.0, 1) if has_deficit else round((amt / income_denom) * 100.0, 1)
                 sankey_nodes.append(
                     SankeyNode(
                         id=nid,
@@ -607,19 +752,23 @@ class AnalyticsEngine:
                     )
                 )
 
-            # Column 1: Center Hub
+            # Column 1: Center Hub — never call a deficit-inflated sum "Total Income"!
+            hub_label = "Total Outflow" if has_deficit else "Total Income"
+            hub_color = HUB_CASHFLOW_COLOR if has_deficit else HUB_INCOME_COLOR
             sankey_nodes.append(
                 SankeyNode(
                     id="hub:total_income",
-                    label="Total Income",
+                    label=hub_label,
                     column=1,
                     amount_cents=hub_total_cents,
-                    pct_of_income=100.0 if total_income_cents > 0 else 0.0,
-                    color=HUB_INCOME_COLOR,
+                    pct_of_income=100.0 if total_income_cents > 0 and not has_deficit else (
+                        round((total_income_cents / hub_total_cents) * 100.0, 1) if hub_total_cents > 0 else 0.0
+                    ),
+                    color=hub_color,
                 )
             )
 
-            # Column 2: Top 5 Expense Categories + Others + Savings & Invest
+            # Column 2: Top 5 Expense Categories + Others + Verified Savings / Unallocated Surplus
             for idx, item in enumerate(top_5_expenses):
                 nid = f"exp:{idx}"
                 sankey_nodes.append(
@@ -665,26 +814,71 @@ class AnalyticsEngine:
                 )
 
             if net_surplus_cents > 0:
-                pct_sav = round((net_surplus_cents / income_denom) * 100.0, 1)
-                sankey_nodes.append(
-                    SankeyNode(
-                        id="out:savings_invest",
-                        label="Savings & Invest",
-                        column=2,
-                        amount_cents=net_surplus_cents,
-                        pct_of_income=pct_sav,
-                        color=SAVINGS_INVEST_COLOR,
+                verified_sav = min(net_surplus_cents, verified_savings_transfer_cents)
+                unallocated = net_surplus_cents - verified_sav
+                if verified_sav > 0:
+                    pct_sav = round((verified_sav / income_denom) * 100.0, 1)
+                    sankey_nodes.append(
+                        SankeyNode(
+                            id="out:savings_invest",
+                            label="Savings & Invest",
+                            column=2,
+                            amount_cents=verified_sav,
+                            pct_of_income=pct_sav,
+                            color=SAVINGS_INVEST_COLOR,
+                        )
                     )
-                )
-                sankey_links.append(
-                    SankeyLink(
-                        source="hub:total_income",
-                        target="out:savings_invest",
-                        amount_cents=net_surplus_cents,
-                        pct_of_income=pct_sav,
-                        color=SAVINGS_INVEST_COLOR,
+                    sankey_links.append(
+                        SankeyLink(
+                            source="hub:total_income",
+                            target="out:savings_invest",
+                            amount_cents=verified_sav,
+                            pct_of_income=pct_sav,
+                            color=SAVINGS_INVEST_COLOR,
+                        )
                     )
-                )
+                    if unallocated > 0:
+                        pct_unalloc = round((unallocated / income_denom) * 100.0, 1)
+                        sankey_nodes.append(
+                            SankeyNode(
+                                id="out:unallocated_surplus",
+                                label="Unallocated Surplus",
+                                column=2,
+                                amount_cents=unallocated,
+                                pct_of_income=pct_unalloc,
+                                color=UNALLOCATED_SURPLUS_COLOR,
+                            )
+                        )
+                        sankey_links.append(
+                            SankeyLink(
+                                source="hub:total_income",
+                                target="out:unallocated_surplus",
+                                amount_cents=unallocated,
+                                pct_of_income=pct_unalloc,
+                                color=UNALLOCATED_SURPLUS_COLOR,
+                            )
+                        )
+                else:
+                    pct_sur = round((net_surplus_cents / income_denom) * 100.0, 1)
+                    sankey_nodes.append(
+                        SankeyNode(
+                            id="out:savings_invest",
+                            label="Unallocated Surplus",
+                            column=2,
+                            amount_cents=net_surplus_cents,
+                            pct_of_income=pct_sur,
+                            color=UNALLOCATED_SURPLUS_COLOR,
+                        )
+                    )
+                    sankey_links.append(
+                        SankeyLink(
+                            source="hub:total_income",
+                            target="out:savings_invest",
+                            amount_cents=net_surplus_cents,
+                            pct_of_income=pct_sur,
+                            color=UNALLOCATED_SURPLUS_COLOR,
+                        )
+                    )
 
         # --- Monthly Trend Series (up to 24 months) ---
         monthly_trends: List[MonthlyTrendPoint] = [
@@ -705,6 +899,7 @@ class AnalyticsEngine:
             holdings=holdings,
             credit_lines=credit_lines,
             existing_snapshots=net_worth_snapshots,
+            portfolio_snapshots=portfolio_snapshots,
             days=nw_days,
             today=ref,
         )
@@ -744,7 +939,7 @@ class AnalyticsEngine:
         today: Optional[date] = None,
     ) -> ScenarioSimResult:
         """
-        Run baseline vs What-If scenario projection across 30..730 days in exact integer cents.
+        Run baseline vs scenario projection across 30..730 days in exact integer cents.
 
         Returns `baseline_points`, `scenario_points`, `diff_ending_cents`, `diff_pct`,
         `safe_runway_floor_cents`, and `per_goal_series` (so UI timeline drag can smoothly

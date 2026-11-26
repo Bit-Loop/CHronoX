@@ -104,6 +104,25 @@ class TestMonthEndRolloverAndSeededRadar:
     def test_automatic_month_rollover_with_cap_overflow_to_safety(self, tmp_path, monkeypatch):
         _client, svc, _ = _make_client(tmp_path, monkeypatch)
         try:
+            # Seed actual October cash & payroll so rollover carries cash-backed surplus (Finding #16)
+            acct = svc.storage.create_account(
+                name="Primary Checking",
+                account_type="checking",
+                balance_cents=500_000,
+                institution="Local Bank",
+                is_liquid=True,
+            )
+            svc.add_transaction_raw(
+                account_id=int(acct["id"]),
+                tx_type="income",
+                amount_cents=500_000,
+                merchant="October Payroll",
+                tx_date="2026-10-15",
+                source="manual",
+                adjust_balance=False,
+                run_auto_sync=False,
+            )
+
             # Initialize cycle in October 2026
             oct_day = date(2026, 10, 28)
             svc.run_self_updating_sync(reason="Oct init", today=oct_day)

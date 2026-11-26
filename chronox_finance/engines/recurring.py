@@ -193,29 +193,41 @@ def _add_months(dt: date, months: int, anchor_day: int) -> date:
     return date(year, month, min(anchor_day, max_day))
 
 
+def _step_semimonthly_forward(dt: date, low_day: int = 1, high_day: int = 15) -> date:
+    """Advance to the next semi-monthly calendar date (e.g. 1st -> 15th -> next month 1st, or 15th -> month-end -> next 15th)."""
+    lo = max(1, min(16, int(low_day)))
+    hi = max(lo + 10, min(31, int(high_day)))
+    max_this = calendar.monthrange(dt.year, dt.month)[1]
+    eff_hi = min(hi, max_this)
+    if dt.day < lo:
+        return date(dt.year, dt.month, lo)
+    if dt.day < eff_hi:
+        return date(dt.year, dt.month, eff_hi)
+    nxt = _add_months(date(dt.year, dt.month, 1), 1, lo)
+    return nxt
+
+
+def _step_semimonthly_back(dt: date, low_day: int = 1, high_day: int = 15) -> date:
+    lo = max(1, min(16, int(low_day)))
+    hi = max(lo + 10, min(31, int(high_day)))
+    max_this = calendar.monthrange(dt.year, dt.month)[1]
+    eff_hi = min(hi, max_this)
+    if dt.day > eff_hi:
+        return date(dt.year, dt.month, eff_hi)
+    if dt.day > lo:
+        return date(dt.year, dt.month, lo)
+    prev_first = _add_months(date(dt.year, dt.month, 1), -1, 1)
+    max_prev = calendar.monthrange(prev_first.year, prev_first.month)[1]
+    return date(prev_first.year, prev_first.month, min(hi, max_prev))
+
+
 def advance_due_date(last_date: date, cadence: RecurrenceCadence, today: Optional[date] = None) -> date:
     """Project the next due date on or after `today`, preserving calendar day anchors cleanly."""
     ref = today or date.today()
-    month_steps = {
-        RecurrenceCadence.MONTHLY: 1,
-        RecurrenceCadence.BIMONTHLY: 2,
-        RecurrenceCadence.QUARTERLY: 3,
-        RecurrenceCadence.SEMIANNUAL: 6,
-        RecurrenceCadence.ANNUAL: 12,
-    }
-    day_steps = {
-        RecurrenceCadence.WEEKLY: 7,
-        RecurrenceCadence.BIWEEKLY: 14,
-        RecurrenceCadence.SEMIMONTHLY: 15,
-    }
-
     due = last_date
     guard = 0
     while due < ref and guard < 120:
-        if cadence in month_steps:
-            due = _add_months(due, month_steps[cadence], last_date.day)
-        else:
-            due = due + timedelta(days=day_steps[cadence])
+        due = _step_cycle_forward(due, cadence, last_date.day)
         guard += 1
     return due
 
@@ -224,6 +236,10 @@ DEFAULT_RECURRING_LOOKBACK_DAYS = 730
 
 
 def _step_cycle_back(dt: date, cadence: RecurrenceCadence, anchor_day: int) -> date:
+    if cadence == RecurrenceCadence.SEMIMONTHLY:
+        if anchor_day >= 25:
+            return _step_semimonthly_back(dt, 15, 31)
+        return _step_semimonthly_back(dt, 1, 15)
     month_steps = {
         RecurrenceCadence.MONTHLY: -1,
         RecurrenceCadence.BIMONTHLY: -2,
@@ -234,7 +250,6 @@ def _step_cycle_back(dt: date, cadence: RecurrenceCadence, anchor_day: int) -> d
     day_steps = {
         RecurrenceCadence.WEEKLY: -7,
         RecurrenceCadence.BIWEEKLY: -14,
-        RecurrenceCadence.SEMIMONTHLY: -15,
     }
     if cadence in month_steps:
         return _add_months(dt, month_steps[cadence], anchor_day)
@@ -242,6 +257,10 @@ def _step_cycle_back(dt: date, cadence: RecurrenceCadence, anchor_day: int) -> d
 
 
 def _step_cycle_forward(dt: date, cadence: RecurrenceCadence, anchor_day: int) -> date:
+    if cadence == RecurrenceCadence.SEMIMONTHLY:
+        if anchor_day >= 25:
+            return _step_semimonthly_forward(dt, 15, 31)
+        return _step_semimonthly_forward(dt, 1, 15)
     month_steps = {
         RecurrenceCadence.MONTHLY: 1,
         RecurrenceCadence.BIMONTHLY: 2,
@@ -252,11 +271,15 @@ def _step_cycle_forward(dt: date, cadence: RecurrenceCadence, anchor_day: int) -
     day_steps = {
         RecurrenceCadence.WEEKLY: 7,
         RecurrenceCadence.BIWEEKLY: 14,
-        RecurrenceCadence.SEMIMONTHLY: 15,
     }
     if cadence in month_steps:
         return _add_months(dt, month_steps[cadence], anchor_day)
     return dt + timedelta(days=day_steps.get(cadence, 30))
+
+
+def step_bill_due_date(dt: date, cadence: RecurrenceCadence, anchor_day: int) -> date:
+    """Public calendar-accurate cycle stepper for recurring bills & payday schedules."""
+    return _step_cycle_forward(dt, cadence, anchor_day)
 
 
 def forecast_bill_amount_cents(
@@ -640,58 +663,170 @@ def detect_bill_anomalies(
     return anomalies[:12]
 
 
+def _is_semimonthly_payroll(dates: List[date], deltas: List[int]) -> Optional[Tuple[int, int]]:
+    """
+    Detect semi-monthly payroll (e.g. 1st & 15th, or 15th & last day of month)
+    from >= 2 deposits and return `(low_day, high_day)` anchors when matched.
+    """
+    if len(dates) < 2 or not deltas:
+        return None
+    if not all(12 <= d <= 18 for d in deltas):
+        return None
+    days = [d.day for d in dates]
+    # Pattern A: 1st & 15th (allowing weekend banking shift: 1..3 or 28..31 paired with 13..16)
+    near_first_or_mid = all((1 <= dom <= 3) or (13 <= dom <= 16) for dom in days)
+    has_first = any(1 <= dom <= 3 for dom in days)
+    has_mid = any(13 <= dom <= 16 for dom in days)
+    if near_first_or_mid and has_first and has_mid:
+        return (1, 15)
+    # Pattern B: 15th & end-of-month (13..16 paired with 28..31)
+    near_mid_or_end = all((13 <= dom <= 16) or (28 <= dom <= 31) for dom in days)
+    has_end = any(28 <= dom <= 31 for dom in days)
+    if near_mid_or_end and has_mid and has_end:
+        return (15, 31)
+    if len(dates) >= 4 and _is_semimonthly(dates, deltas):
+        lo = int(round(mean([dom for dom in days if dom <= 14]))) if any(dom <= 14 for dom in days) else 1
+        hi = int(round(mean([dom for dom in days if dom >= 15]))) if any(dom >= 15 for dom in days) else 15
+        return (lo, hi)
+    return None
+
+
 def detect_payday_schedule(
     transactions: List[Dict[str, Any]],
     fallback_cadence_days: int = 14,
     fallback_payday_date: Optional[str] = None,
-    fallback_paycheck_cents: int = 220_000,
+    fallback_paycheck_cents: int = 0,
     today: Optional[date] = None,
+    user_configured_payday: bool = False,
 ) -> DetectedPayday:
-    """Infer next payday and expected paycheck amount from historical income inflows."""
+    """
+    Infer next payday and expected paycheck amount from recent historical income inflows.
+
+    Guarantees:
+    - Never invents default paycheck income when `fallback_paycheck_cents == 0` and no recent payroll exists.
+    - Respects `user_configured_payday=True` so explicit user payday settings are never overwritten.
+    - Discounts stale deposits (>95 days old) so year-old deposits never get high confidence.
+    - Preserves calendar anchors on semi-monthly (1st & 15th / 15th & month-end) payrolls.
+    """
     ref = today or date.today()
-    incomes = [
-        t for t in transactions
-        if t.get("tx_type") == "income" and int(t.get("amount_cents", 0)) >= 20_000
-    ]
-    incomes.sort(key=lambda t: t["tx_date"])
 
-    if len(incomes) >= 2:
-        dates = [date.fromisoformat(t["tx_date"]) for t in incomes[-6:]]
-        deltas = [(dates[i + 1] - dates[i]).days for i in range(len(dates) - 1) if (dates[i + 1] - dates[i]).days >= 5]
-        if deltas:
-            avg_d = int(round(mean(deltas)))
-            if 6 <= avg_d <= 8:
-                cadence_days = 7
-            elif 12 <= avg_d <= 16:
-                cadence_days = 14
-            elif 14 <= avg_d <= 17:
-                cadence_days = 15
-            elif 27 <= avg_d <= 33:
-                cadence_days = 30
+    def _step_fallback_date(start_dt: date, cad_days: int) -> date:
+        nxt = start_dt
+        guard = 0
+        while nxt <= ref and guard < 240:
+            if cad_days == 15:
+                lo_anchor, hi_anchor = (1, 15) if start_dt.day <= 20 else (15, 31)
+                nxt = _step_semimonthly_forward(nxt, lo_anchor, hi_anchor)
+            elif cad_days in (30, 31):
+                nxt = _add_months(nxt, 1, start_dt.day)
             else:
-                cadence_days = max(7, min(31, avg_d))
+                nxt += timedelta(days=max(7, cad_days))
+            guard += 1
+        return nxt
 
-            next_dt = dates[-1]
-            while next_dt <= ref:
-                next_dt += timedelta(days=cadence_days)
-            est_cents = int(median([int(t["amount_cents"]) for t in incomes[-4:]]))
+    all_incomes: List[Tuple[date, Dict[str, Any]]] = []
+    for t in transactions:
+        if t.get("tx_type") != "income" or int(t.get("amount_cents", 0)) < 20_000:
+            continue
+        try:
+            dt = date.fromisoformat(str(t["tx_date"])[:10])
+        except ValueError:
+            continue
+        if dt <= ref:
+            all_incomes.append((dt, t))
+    all_incomes.sort(key=lambda pair: pair[0])
+
+    # Only use recent payroll history (within trailing 95 days) for active schedule inference
+    recent_cutoff = ref - timedelta(days=95)
+    recent_pairs = [(dt, t) for dt, t in all_incomes if dt >= recent_cutoff]
+
+    if user_configured_payday and fallback_payday_date:
+        try:
+            cfg_dt = _step_fallback_date(date.fromisoformat(fallback_payday_date), fallback_cadence_days)
+            cfg_paycheck = max(0, int(fallback_paycheck_cents))
+            if cfg_paycheck == 0 and len(recent_pairs) >= 2:
+                cfg_paycheck = int(median([int(t["amount_cents"]) for _, t in recent_pairs[-4:]]))
+            return DetectedPayday(
+                cadence_days=fallback_cadence_days,
+                next_payday_date=cfg_dt.isoformat(),
+                estimated_paycheck_cents=cfg_paycheck,
+                confidence=0.95 if cfg_paycheck > 0 else 0.7,
+            )
+        except ValueError:
+            pass
+
+    if len(recent_pairs) >= 2:
+        sample_pairs = recent_pairs[-6:]
+        dates = [dt for dt, _ in sample_pairs]
+        deltas = [
+            (dates[i + 1] - dates[i]).days
+            for i in range(len(dates) - 1)
+            if (dates[i + 1] - dates[i]).days >= 5
+        ]
+        if deltas:
+            days_since_last = (ref - dates[-1]).days
+            semi_anchors = _is_semimonthly_payroll(dates, deltas)
+            avg_d = int(round(mean(deltas)))
+            spread = max(deltas) - min(deltas) if len(deltas) >= 2 else 0
+
+            if semi_anchors is not None:
+                cadence_days = 15
+                lo_day, hi_day = semi_anchors
+                next_dt = dates[-1]
+                guard = 0
+                while next_dt <= ref and guard < 48:
+                    next_dt = _step_semimonthly_forward(next_dt, lo_day, hi_day)
+                    guard += 1
+            else:
+                if 6 <= avg_d <= 8:
+                    cadence_days = 7
+                elif 12 <= avg_d <= 16:
+                    cadence_days = 14
+                elif 27 <= avg_d <= 33:
+                    cadence_days = 30
+                else:
+                    cadence_days = max(7, min(31, avg_d))
+
+                next_dt = dates[-1]
+                guard = 0
+                while next_dt <= ref and guard < 120:
+                    if cadence_days == 30:
+                        next_dt = _add_months(next_dt, 1, dates[-1].day)
+                    else:
+                        next_dt += timedelta(days=cadence_days)
+                    guard += 1
+
+            est_cents = int(median([int(t["amount_cents"]) for _, t in sample_pairs[-4:]]))
+
+            # Calibrated confidence: requires >=3 recent, regular deposits and fresh last deposit
+            if days_since_last > max(40, cadence_days * 2 + 7):
+                conf = 0.35
+            elif len(sample_pairs) >= 3 and (semi_anchors is not None or spread <= 4):
+                conf = 0.90
+            elif len(sample_pairs) >= 3 and spread <= 7:
+                conf = 0.78
+            else:
+                # Only 2 deposits or wide interval spread -> moderate confidence (never overwrites settings)
+                conf = 0.62
+
             return DetectedPayday(
                 cadence_days=cadence_days,
                 next_payday_date=next_dt.isoformat(),
                 estimated_paycheck_cents=est_cents,
-                confidence=0.92,
+                confidence=conf,
             )
+
+    # Stale historical deposits (>95 days old): never claim high confidence or project active payroll
+    has_only_stale = len(all_incomes) >= 2 and len(recent_pairs) < 2
 
     if fallback_payday_date:
         try:
-            next_dt = date.fromisoformat(fallback_payday_date)
-            while next_dt <= ref:
-                next_dt += timedelta(days=max(7, fallback_cadence_days))
+            next_dt = _step_fallback_date(date.fromisoformat(fallback_payday_date), fallback_cadence_days)
             return DetectedPayday(
                 cadence_days=fallback_cadence_days,
                 next_payday_date=next_dt.isoformat(),
-                estimated_paycheck_cents=fallback_paycheck_cents,
-                confidence=0.6,
+                estimated_paycheck_cents=max(0, int(fallback_paycheck_cents)),
+                confidence=0.20 if has_only_stale else (0.60 if fallback_paycheck_cents > 0 else 0.0),
             )
         except ValueError:
             pass
@@ -700,6 +835,6 @@ def detect_payday_schedule(
     return DetectedPayday(
         cadence_days=fallback_cadence_days,
         next_payday_date=next_dt.isoformat(),
-        estimated_paycheck_cents=fallback_paycheck_cents,
-        confidence=0.4,
+        estimated_paycheck_cents=max(0, int(fallback_paycheck_cents)),
+        confidence=0.15 if has_only_stale else (0.40 if fallback_paycheck_cents > 0 else 0.0),
     )

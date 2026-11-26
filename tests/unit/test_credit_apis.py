@@ -576,8 +576,13 @@ def test_credit_api_fastapi_e2e_vault_lifecycle_idempotency_and_zero_secret_leak
         assert sc2["tradelines_added"] == 0
         assert sc2["tradelines_updated"] == 1
 
-        # Verify Credit Optimization Report & Simulator reflect live synced scores + tradeline + 5/24
-        credit_rep = client.get("/api/v1/credit/report").json()
+        # Verify production credit report isolates sandbox Spinwheel pull by default (Finding #10),
+        # while `?include_sandbox=true` reflects both live + sandbox scores, tradeline, inquiry & derogatory.
+        prod_only_rep = client.get("/api/v1/credit/report").json()
+        assert len(prod_only_rep["credit_reports"]) == 1
+        assert prod_only_rep["credit_reports"][0]["score"] == 788
+
+        credit_rep = client.get("/api/v1/credit/report?include_sandbox=true").json()
         assert len(credit_rep["credit_reports"]) == 2
         assert credit_rep["credit_reports"][0]["score"] == 788  # Most recent pulled_date (2026-11-23)
         assert credit_rep["credit_reports"][0]["bureau"] == "experian"
