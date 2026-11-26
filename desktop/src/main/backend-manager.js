@@ -5,6 +5,7 @@ const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
 const http = require("http");
 const net = require("net");
+const os = require("os");
 const path = require("path");
 
 const MAX_LOG_LINES = 250;
@@ -110,6 +111,134 @@ function fileExistsExecutable(candidate) {
   } catch {
     return false;
   }
+}
+
+function dirExists(candidate) {
+  try {
+    if (!candidate || !fs.existsSync(candidate)) return false;
+    return fs.statSync(candidate).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function compareSemverDirDesc(a, b) {
+  const numsA = (String(a).match(/\d+/g) || []).map((n) => Number.parseInt(n, 10));
+  const numsB = (String(b).match(/\d+/g) || []).map((n) => Number.parseInt(n, 10));
+  const maxLen = Math.max(numsA.length, numsB.length);
+  for (let i = 0; i < maxLen; i += 1) {
+    const diff = (numsB[i] || 0) - (numsA[i] || 0);
+    if (diff !== 0) return diff;
+  }
+  return String(b).localeCompare(String(a));
+}
+
+function listVersionedSubdirs(parentDir, suffixParts) {
+  if (!dirExists(parentDir)) return [];
+  try {
+    const entries = fs.readdirSync(parentDir, { withFileTypes: true });
+    const dirs = entries
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort(compareSemverDirDesc);
+    const out = [];
+    for (const verName of dirs) {
+      const candidate = path.join(parentDir, verName, ...suffixParts);
+      if (dirExists(candidate)) out.push(candidate);
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Augment PATH with user-local AI CLI install directories so GUI-launched
+ * Electron backends inherit `opencode`, `claude`, `codex`, `agy`, and node shims.
+ */
+function buildAugmentedCliPath(basePath, options = {}) {
+  const sourceEnv = options.env || process.env;
+  const platform = options.platform || process.platform;
+  const homeDir = options.homeDir || sourceEnv.HOME || sourceEnv.USERPROFILE || os.homedir();
+  const isWin = platform === "win32";
+  const delimiter = options.delimiter || (isWin ? ";" : ":");
+  const pathLib = isWin ? path.win32 : path.posix;
+  const onlyExisting = options.onlyExisting !== false;
+
+  const extraCandidates = [];
+  if (homeDir) {
+    extraCandidates.push(
+      pathLib.join(homeDir, ".opencode", "bin"),
+      pathLib.join(homeDir, ".local", "bin"),
+      pathLib.join(homeDir, ".claude", "local"),
+      pathLib.join(homeDir, ".claude", "bin")
+    );
+    extraCandidates.push(
+      ...listVersionedSubdirs(pathLib.join(homeDir, ".nvm", "versions", "node"), ["bin"]),
+      ...listVersionedSubdirs(
+        pathLib.join(homeDir, ".local", "share", "fnm", "node-versions"),
+        ["installation", "bin"]
+      )
+    );
+    extraCandidates.push(
+      pathLib.join(homeDir, ".volta", "bin"),
+      pathLib.join(homeDir, ".bun", "bin"),
+      pathLib.join(homeDir, ".cargo", "bin"),
+      pathLib.join(homeDir, ".npm-global", "bin")
+    );
+  }
+
+  if (!isWin) {
+    extraCandidates.push("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin");
+  }
+
+  const appData = String(sourceEnv.APPDATA || "").trim();
+  if (appData) {
+    extraCandidates.push(pathLib.join(appData, "npm"));
+  }
+
+  const localAppData = String(sourceEnv.LOCALAPPDATA || "").trim();
+  if (localAppData) {
+    const programsDir = pathLib.join(localAppData, "Programs");
+    if (dirExists(programsDir)) {
+      try {
+        const entries = fs.readdirSync(programsDir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (!entry.isDirectory()) continue;
+          const progDir = pathLib.join(programsDir, entry.name);
+          extraCandidates.push(progDir);
+          const binSubdir = pathLib.join(progDir, "bin");
+          if (dirExists(binSubdir)) {
+            extraCandidates.push(binSubdir);
+          }
+        }
+      } catch {
+        // Ignore unreadable system directories.
+      }
+    }
+  }
+
+  const seen = new Set();
+  const merged = [];
+  const addEntry = (entry, checkExists) => {
+    const cleaned = String(entry || "").trim();
+    if (!cleaned) return;
+    const key = isWin ? cleaned.toLowerCase() : cleaned;
+    if (seen.has(key)) return;
+    if (checkExists && !dirExists(cleaned)) return;
+    seen.add(key);
+    merged.push(cleaned);
+  };
+
+  const initialParts = String(basePath || "").split(delimiter);
+  for (const seg of initialParts) {
+    addEntry(seg, false);
+  }
+  for (const cand of extraCandidates) {
+    addEntry(cand, onlyExisting);
+  }
+
+  return merged.join(delimiter);
 }
 
 class BackendManager extends EventEmitter {
@@ -320,6 +449,11 @@ class BackendManager extends EventEmitter {
       CHRONOX_FINANCE_PORT: String(port),
       CHRONOX_FINANCE_DB_PATH: this.dbPath,
     };
+    const augmentedPath = buildAugmentedCliPath(env.PATH || env.Path || "", { env });
+    env.PATH = augmentedPath;
+    if (process.platform === "win32" && Object.prototype.hasOwnProperty.call(env, "Path")) {
+      env.Path = augmentedPath;
+    }
     if (includeRepoPythonPath) {
       env.PYTHONPATH = env.PYTHONPATH
         ? `${this.repoRoot}${path.delimiter}${env.PYTHONPATH}`
@@ -618,6 +752,7 @@ class BackendManager extends EventEmitter {
 
 module.exports = {
   BackendManager,
+  buildAugmentedCliPath,
   findFreePort,
   scrubSecrets,
 };

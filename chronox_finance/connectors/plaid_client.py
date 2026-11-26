@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -52,6 +52,7 @@ PLAID_ENV_URLS: Dict[str, str] = {
 }
 
 DEFAULT_DAYS_REQUESTED = 730
+DEFAULT_HOSTED_LINK_URL_LIFETIME_SECONDS = 3600
 PLAID_HISTORY_NOTE = (
     "Plaid applies transactions.days_requested=730 only when a bank Item is linked. "
     "Existing Items connected with a shorter history window must be re-Linked to fetch 2 years."
@@ -66,6 +67,21 @@ _AUTH_ERROR_CODES = frozenset(
         "INVALID_PUBLIC_TOKEN",
         "PUBLIC_TOKEN_EXPIRED",
         "LINK_TOKEN_EXPIRED",
+    }
+)
+
+_OPTIONAL_PRODUCT_RETRY_CODES = frozenset(
+    {
+        "INVALID_PRODUCT",
+        "PRODUCTS_NOT_SUPPORTED",
+    }
+)
+
+_REDIRECT_URI_RETRY_CODES = frozenset(
+    {
+        "INVALID_FIELD",
+        "INVALID_CONFIGURATION",
+        "INVALID_REDIRECT_URI",
     }
 )
 
@@ -91,7 +107,9 @@ class PlaidLinkPollResult:
     institution_id: str = ""
     institution_name: str = ""
     accounts: List[Dict[str, Any]] = field(default_factory=list)
+    items: List[Dict[str, Any]] = field(default_factory=list)
     error_message: str = ""
+    error_code: str = ""
     request_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -235,6 +253,98 @@ def _normalize_plaid_transaction(raw: Dict[str, Any]) -> NormalizedTransaction:
         source="plaid",
         raw_category=detailed_cat or primary_cat,
     )
+
+
+def _extract_session_items(session: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract all linked item dicts (`public_token` + institution/accounts) from one Link session."""
+    extracted: List[Dict[str, Any]] = []
+
+    results = session.get("results")
+    if isinstance(results, dict):
+        item_results = results.get("item_add_results")
+        if isinstance(item_results, list):
+            for item_res in item_results:
+                if not isinstance(item_res, dict):
+                    continue
+                pub = str(item_res.get("public_token") or "").strip()
+                if not pub:
+                    continue
+                meta = item_res.get("metadata") if isinstance(item_res.get("metadata"), dict) else {}
+                inst = (
+                    item_res.get("institution")
+                    if isinstance(item_res.get("institution"), dict)
+                    else (meta.get("institution") if isinstance(meta.get("institution"), dict) else {})
+                )
+                raw_accts = item_res.get("accounts")
+                if not isinstance(raw_accts, list) or not raw_accts:
+                    raw_accts = meta.get("accounts")
+                accounts = list(raw_accts) if isinstance(raw_accts, list) else []
+                extracted.append(
+                    {
+                        "public_token": pub,
+                        "institution_id": str(inst.get("institution_id") or "").strip(),
+                        "institution_name": sanitize_untrusted_text(str(inst.get("name") or ""), max_len=80),
+                        "accounts": accounts,
+                    }
+                )
+
+    on_success = session.get("on_success")
+    if isinstance(on_success, dict):
+        pub = str(on_success.get("public_token") or "").strip()
+        if pub:
+            meta = on_success.get("metadata") if isinstance(on_success.get("metadata"), dict) else {}
+            inst = (
+                on_success.get("institution")
+                if isinstance(on_success.get("institution"), dict)
+                else (meta.get("institution") if isinstance(meta.get("institution"), dict) else {})
+            )
+            raw_accts = on_success.get("accounts")
+            if not isinstance(raw_accts, list) or not raw_accts:
+                raw_accts = meta.get("accounts")
+            accounts = list(raw_accts) if isinstance(raw_accts, list) else []
+            extracted.append(
+                {
+                    "public_token": pub,
+                    "institution_id": str(inst.get("institution_id") or "").strip(),
+                    "institution_name": sanitize_untrusted_text(str(inst.get("name") or ""), max_len=80),
+                    "accounts": accounts,
+                }
+            )
+
+    return extracted
+
+
+def _extract_session_exit(session: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str, str]:
+    """
+    Extract terminal exit object, `error_code`, and `error_message` from a Link session.
+    Checks `session.exit`, `session.on_exit`, and `session.results.exit`.
+    """
+    results = session.get("results") if isinstance(session.get("results"), dict) else {}
+    candidates: List[Dict[str, Any]] = []
+    for raw in (session.get("exit"), session.get("on_exit"), results.get("exit")):
+        if isinstance(raw, dict) and raw:
+            candidates.append(raw)
+
+    if not candidates:
+        return (None, "", "")
+
+    chosen: Optional[Dict[str, Any]] = None
+    chosen_code = ""
+    chosen_msg = ""
+    for cand in candidates:
+        err = cand.get("error") if isinstance(cand.get("error"), dict) else {}
+        code = str(err.get("error_code") or "").strip()
+        msg = str(err.get("display_message") or err.get("error_message") or "").strip()
+        if code or msg:
+            chosen = cand
+            chosen_code = code
+            chosen_msg = sanitize_untrusted_text(msg, max_len=240) if msg else ""
+            break
+
+    if chosen is None:
+        chosen = candidates[0]
+
+    return (chosen, chosen_code, chosen_msg)
 
 
 class PlaidClient:
@@ -381,26 +491,56 @@ class PlaidClient:
         optional_products: Sequence[str] = ("liabilities", "investments"),
         access_token: Optional[str] = None,
         hosted_link: Optional[Dict[str, Any]] = None,
+        completion_redirect_uri: Optional[str] = None,
+        url_lifetime_seconds: Optional[int] = None,
     ) -> PlaidLinkTokenResult:
         """
         Create a Plaid Hosted Link token for authentication in the user's system browser.
 
-        Always configures `transactions: {"days_requested": 730}` (clamped 1..730),
+        Configures `transactions: {"days_requested": 730}` (clamped 1..730),
         `products: ["transactions"]`, `optional_products: ["liabilities", "investments"]`,
-        and `hosted_link: {}` so OAuth institutions (Chase, BofA, etc.) complete cleanly
-        without requiring a local HTTPS redirect_uri.
+        and `hosted_link` so OAuth institutions (Chase, BofA, etc.) complete cleanly.
+
+        Built-in resilience fallbacks:
+        1. If Plaid rejects `optional_products` (`INVALID_PRODUCT` / `PRODUCTS_NOT_SUPPORTED`),
+           automatically retries once without `optional_products`.
+        2. If `completion_redirect_uri` is rejected (`INVALID_FIELD` / `INVALID_CONFIGURATION`),
+           automatically retries once with `completion_redirect_uri` removed.
 
         Note: `days_requested` applies at Link creation time; existing Items need re-Link
         to expand their historical window to 730 days.
         """
         clamped_days = max(1, min(int(days_requested), 730))
+        cleaned_redirect_uri = (completion_redirect_uri or "").strip()
+
+        if hosted_link is not None:
+            hosted_link_cfg: Dict[str, Any] = dict(hosted_link)
+            if url_lifetime_seconds is not None and "url_lifetime_seconds" not in hosted_link_cfg:
+                hosted_link_cfg["url_lifetime_seconds"] = max(60, int(url_lifetime_seconds))
+            if cleaned_redirect_uri and "completion_redirect_uri" not in hosted_link_cfg:
+                hosted_link_cfg["completion_redirect_uri"] = cleaned_redirect_uri
+        elif cleaned_redirect_uri or url_lifetime_seconds is not None:
+            lifetime = max(
+                60,
+                int(
+                    url_lifetime_seconds
+                    if url_lifetime_seconds is not None
+                    else DEFAULT_HOSTED_LINK_URL_LIFETIME_SECONDS
+                ),
+            )
+            hosted_link_cfg = {"url_lifetime_seconds": lifetime}
+            if cleaned_redirect_uri:
+                hosted_link_cfg["completion_redirect_uri"] = cleaned_redirect_uri
+        else:
+            hosted_link_cfg = {}
+
         payload: Dict[str, Any] = {
             "user": {"client_user_id": (user_client_id or "chronox-local-user")[:128]},
             "client_name": (client_name or "ChronoX Finance")[:30],
             "country_codes": [str(c).upper() for c in country_codes] or ["US"],
             "language": (language or "en").lower(),
             "transactions": {"days_requested": clamped_days},
-            "hosted_link": {} if hosted_link is None else dict(hosted_link),
+            "hosted_link": hosted_link_cfg,
         }
         if access_token:
             payload["access_token"] = access_token
@@ -409,7 +549,63 @@ class PlaidClient:
             if optional_products:
                 payload["optional_products"] = list(optional_products)
 
-        data = self._post("/link/token/create", payload)
+        retried_without_optional_products = False
+        retried_without_redirect_uri = False
+
+        while True:
+            try:
+                data = self._post("/link/token/create", payload)
+                break
+            except ConnectorAuthError:
+                raise
+            except ConnectorError as exc:
+                err_code = (exc.error_code or "").strip().upper()
+                err_text = str(exc).lower()
+                if (
+                    not retried_without_optional_products
+                    and "optional_products" in payload
+                    and (
+                        err_code in _OPTIONAL_PRODUCT_RETRY_CODES
+                        or (exc.status_code == 400 and "optional_products" in err_text)
+                    )
+                ):
+                    logger.info(
+                        "Plaid /link/token/create rejected optional_products (%s); retrying with core products only",
+                        err_code or exc.status_code,
+                    )
+                    payload = dict(payload)
+                    payload.pop("optional_products", None)
+                    retried_without_optional_products = True
+                    continue
+
+                current_hosted = payload.get("hosted_link")
+                if (
+                    not retried_without_redirect_uri
+                    and isinstance(current_hosted, dict)
+                    and current_hosted.get("completion_redirect_uri")
+                    and (
+                        err_code in _REDIRECT_URI_RETRY_CODES
+                        or (
+                            exc.status_code == 400
+                            and ("completion_redirect_uri" in err_text or "redirect_uri" in err_text)
+                        )
+                    )
+                ):
+                    logger.info(
+                        "Plaid /link/token/create rejected completion_redirect_uri (%s); retrying without redirect URI",
+                        err_code or exc.status_code,
+                    )
+                    payload = dict(payload)
+                    fallback_hosted = dict(current_hosted)
+                    fallback_hosted.pop("completion_redirect_uri", None)
+                    if "url_lifetime_seconds" not in fallback_hosted:
+                        fallback_hosted["url_lifetime_seconds"] = DEFAULT_HOSTED_LINK_URL_LIFETIME_SECONDS
+                    payload["hosted_link"] = fallback_hosted
+                    retried_without_redirect_uri = True
+                    continue
+
+                raise
+
         link_token = str(data.get("link_token") or "")
         if not link_token:
             raise ConnectorError("Plaid did not return a link_token", provider=self.provider_name)
@@ -424,49 +620,89 @@ class PlaidClient:
 
     def poll_link_token(self, link_token: str) -> PlaidLinkPollResult:
         """
-        Poll `POST /link/token/get` to retrieve `public_token` after Hosted Link completes
+        Poll `POST /link/token/get` to retrieve `public_token`(s) after Hosted Link completes
         in the user's system browser.
+
+        Two-pass multi-session parser:
+        - Pass 1 scans ALL `link_sessions` for completed `results.item_add_results[]` AND
+          legacy/single-item `on_success` entries, deduplicating by `public_token`. If >= 1
+          token exists across ANY session, returns `status="completed"` with all `items`.
+        - Pass 2 (only when 0 tokens exist) inspects ONLY the latest session (`sessions[-1]`),
+          preventing premature `status="exited"` kills from earlier OAuth handoff sessions
+          while the user is still completing bank login.
         """
         cleaned_token = (link_token or "").strip()
         if not cleaned_token:
             raise ConnectorError("link_token is required", provider=self.provider_name)
 
         data = self._post("/link/token/get", {"link_token": cleaned_token})
-        sessions = data.get("link_sessions") or []
+        raw_sessions = data.get("link_sessions") or []
+        valid_sessions = [s for s in raw_sessions if isinstance(s, dict)]
         req_id = str(data.get("request_id") or "")
 
-        # Scan sessions from most recent to oldest for a completed item_add_result
-        for session in reversed(sessions):
-            if not isinstance(session, dict):
-                continue
-            results = session.get("results") or {}
-            item_results = results.get("item_add_results") or []
-            for item_res in item_results:
-                if not isinstance(item_res, dict):
-                    continue
-                pub = str(item_res.get("public_token") or "").strip()
-                if pub:
-                    inst = item_res.get("institution") or {}
-                    return PlaidLinkPollResult(
-                        status="completed",
-                        link_token=cleaned_token,
-                        public_token=pub,
-                        institution_id=str(inst.get("institution_id") or ""),
-                        institution_name=sanitize_untrusted_text(str(inst.get("name") or ""), max_len=80),
-                        accounts=list(item_res.get("accounts") or []),
-                        request_id=req_id,
-                    )
+        # Pass 1: Collect ALL completed public_tokens across ALL sessions (deduplicated)
+        items_by_token: Dict[str, Dict[str, Any]] = {}
+        for session in valid_sessions:
+            for item in _extract_session_items(session):
+                pub = item["public_token"]
+                existing = items_by_token.get(pub)
+                if existing is None:
+                    items_by_token[pub] = item
+                else:
+                    if not existing["institution_id"] and item["institution_id"]:
+                        existing["institution_id"] = item["institution_id"]
+                    if not existing["institution_name"] and item["institution_name"]:
+                        existing["institution_name"] = item["institution_name"]
+                    if not existing["accounts"] and item["accounts"]:
+                        existing["accounts"] = list(item["accounts"])
 
-            exit_info = session.get("exit") or results.get("exit")
-            if exit_info and isinstance(exit_info, dict):
-                err = exit_info.get("error") or {}
-                err_msg = str(err.get("display_message") or err.get("error_message") or "Link exited")
-                return PlaidLinkPollResult(
-                    status="exited",
-                    link_token=cleaned_token,
-                    error_message=err_msg,
-                    request_id=req_id,
-                )
+        if items_by_token:
+            all_items = list(items_by_token.values())
+            primary = all_items[0]
+            return PlaidLinkPollResult(
+                status="completed",
+                link_token=cleaned_token,
+                public_token=primary["public_token"],
+                institution_id=primary["institution_id"],
+                institution_name=primary["institution_name"],
+                accounts=list(primary["accounts"]),
+                items=all_items,
+                request_id=req_id,
+            )
+
+        # Pass 2: No completed items yet — inspect ONLY the latest session (`sessions[-1]`)
+        if not valid_sessions:
+            return PlaidLinkPollResult(
+                status="pending",
+                link_token=cleaned_token,
+                request_id=req_id,
+            )
+
+        latest = valid_sessions[-1]
+        finished_at = latest.get("finished_at")
+        has_finished = bool(finished_at and str(finished_at).strip())
+        exit_info, err_code, err_msg = _extract_session_exit(latest)
+        has_error = bool(err_code or err_msg)
+
+        if exit_info is not None and (has_finished or has_error):
+            if not err_msg:
+                if err_code:
+                    err_msg = f"Link exited ({err_code})"
+                else:
+                    meta = exit_info.get("metadata") if isinstance(exit_info.get("metadata"), dict) else {}
+                    exit_status = str(meta.get("status") or "").strip()
+                    err_msg = (
+                        f"Link exited ({sanitize_untrusted_text(exit_status, max_len=80)})"
+                        if exit_status
+                        else "Link exited"
+                    )
+            return PlaidLinkPollResult(
+                status="exited",
+                link_token=cleaned_token,
+                error_message=err_msg,
+                error_code=err_code,
+                request_id=req_id,
+            )
 
         return PlaidLinkPollResult(
             status="pending",
