@@ -1940,27 +1940,6 @@ export async function initDesktopBridge() {
         }
       });
     }
-
-    const csvLink = $("btn-export-csv-link");
-    if (csvLink) {
-      csvLink.addEventListener("click", async (e) => {
-        e.preventDefault();
-        try {
-          const csvText = await api("/api/v1/export/csv");
-          const res = await desktop.saveFileDialog({
-            defaultName: `chronox-transactions-${isoDateOffset(0)}.csv`,
-            content: String(csvText ?? ""),
-            filters: [{ name: "CSV Spreadsheet", extensions: ["csv"] }],
-          });
-          if (res && !res.canceled) {
-            if (res.error) toast(res.error, true);
-            else toast(`Exported CSV${res.filePath ? ` to ${res.filePath}` : "."}`);
-          }
-        } catch (err) {
-          toast(err.message, true);
-        }
-      });
-    }
   }
 
   if (typeof desktop.onRefresh === "function") {

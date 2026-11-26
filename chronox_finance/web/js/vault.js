@@ -1597,9 +1597,18 @@ async function checkPlaidHostedLinkNow(triggerBtn = null, manualClick = false) {
           toast(exitMsg, true);
           return;
         }
-        if (st === "none") {
+        if (st === "none" || st === "idle") {
           stopPlaidPolling();
           _plaidPendingState = null;
+          if (res && res.last_status === "completed") {
+            const doneMsg = "Bank connected and synced.";
+            renderPlaidProgress({ tone: "done", message: doneMsg });
+            toast(doneMsg);
+            await loadPlaidConfig();
+            await loadConnections();
+            await refreshAll();
+            return;
+          }
           if (manualClick) {
             renderPlaidProgress({
               tone: "info",
@@ -1740,7 +1749,7 @@ export async function loadPlaidConfig() {
     if (idInput && !idInput.value && cfg.client_id_masked) {
       idInput.placeholder = `Saved (${cfg.client_id_masked})`;
     }
-    if (cfg.pending_link_active && !_plaidPollTimer) {
+    if (cfg.pending_link_active && !_plaidPollTimer && !_plaidPendingState) {
       _plaidPendingState = {
         hostedUrl: cfg.pending_hosted_link_url || "",
         linkToken: null,
@@ -2985,7 +2994,6 @@ export function initVaultAndShell() {
         }
 
         if ($("set-plaid-secret")) $("set-plaid-secret").value = "";
-        await loadPlaidConfig();
 
         const hostedUrl = (lt && lt.hosted_link_url) || "";
         const openRes = hostedUrl
@@ -3014,6 +3022,7 @@ export function initVaultAndShell() {
         });
 
         startPlaidPolling();
+        await loadPlaidConfig();
       } catch (err) {
         const msg = (err && err.message) || "Could not start Plaid bank connection.";
         renderPlaidProgress({ tone: "warn", message: msg });

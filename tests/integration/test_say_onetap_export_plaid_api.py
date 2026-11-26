@@ -1006,7 +1006,16 @@ class TestPlaidHostedLinkPollerCallbackAndRetry:
             accts = client.get("/api/v1/accounts").json()
             assert any("NFCU Everyday Checking" in a["name"] for a in accts)
 
-            # Subsequent /hosted-link/check returns clean idle status
+            # Subsequent /hosted-link/check with the completed link_token is idempotent (no duplicate exchange!)
+            r_chk_lt = client.post(
+                "/api/v1/plaid/hosted-link/check",
+                json={"link_token": "link-cb-777"},
+                headers=csrf,
+            )
+            assert r_chk_lt.status_code == 200
+            assert r_chk_lt.json()["status"] == "completed"
+
+            # Subsequent /hosted-link/check without link_token returns clean idle status
             r_chk = client.post("/api/v1/plaid/hosted-link/check", headers=csrf)
             assert r_chk.status_code == 200
             assert r_chk.json()["status"] == "idle"

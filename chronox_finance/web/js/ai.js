@@ -784,12 +784,10 @@ function renderSayResponseCard(res) {
     footerActions.push(dlBtn);
   }
 
-  card.replaceChildren(
-    headerRow,
-    msgNode,
-    proposedListNode,
-    footerActions.length ? el("div", { class: "row-gap wrap" }, footerActions) : null
-  );
+  const cardChildren = [headerRow, msgNode];
+  if (proposedListNode) cardChildren.push(proposedListNode);
+  if (footerActions.length) cardChildren.push(el("div", { class: "row-gap wrap" }, footerActions));
+  card.replaceChildren(...cardChildren);
 }
 
 async function triggerSayExport(res) {
@@ -918,7 +916,16 @@ function renderOneTapModal(plan) {
   const runway = (plan && plan.runway) || {};
   const diag = (plan && plan.diagnostics) || {};
   const actions = Array.isArray(plan && plan.actions) ? plan.actions : [];
-  const rationales = (plan && plan.action_rationales) || {};
+  const rationales = {};
+  if (Array.isArray(plan && plan.action_rationales)) {
+    for (const item of plan.action_rationales) {
+      if (item && item.action_id && item.rationale) {
+        rationales[String(item.action_id)] = String(item.rationale);
+      }
+    }
+  } else if (plan && plan.action_rationales && typeof plan.action_rationales === "object") {
+    Object.assign(rationales, plan.action_rationales);
+  }
   const horizon = Number(runway.horizon_days || aiState.oneTapHorizon || 30);
   const ruinPct = Number(runway.ruin_probability_pct || 0);
   const survivalPct = Math.max(0, Math.min(100, 100 - ruinPct));

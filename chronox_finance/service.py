@@ -378,6 +378,7 @@ class FinanceService:
         self._plaid_retry_timers: Dict[int, threading.Timer] = {}
         self._plaid_pending_state: Optional[Dict[str, Any]] = None
         self._plaid_completed_nonces: Dict[str, Dict[str, Any]] = {}
+        self._plaid_completed_link_tokens: Dict[str, Dict[str, Any]] = {}
         self._plaid_last_status: str = "idle"
         self._plaid_last_error: str = ""
 
@@ -424,6 +425,7 @@ class FinanceService:
             self._plaid_retry_timers.clear()
             self._plaid_pending_state = None
             self._plaid_completed_nonces.clear()
+            self._plaid_completed_link_tokens.clear()
         from contextlib import suppress
 
         for timer in timers:
@@ -2548,6 +2550,8 @@ class FinanceService:
         with self._plaid_bg_lock:
             pending = self._load_pending_plaid_link()
             target_lt = (link_token or "").strip() or str((pending or {}).get("link_token") or "").strip()
+            if target_lt and target_lt in self._plaid_completed_link_tokens:
+                return dict(self._plaid_completed_link_tokens[target_lt])
             already_exchanged = set((pending or {}).get("exchanged_tokens") or [])
 
             items_to_exchange: List[Dict[str, Any]] = []
@@ -2676,6 +2680,10 @@ class FinanceService:
                 if len(self._plaid_completed_nonces) >= 16:
                     self._plaid_completed_nonces.clear()
                 self._plaid_completed_nonces[nonce_done] = dict(summary)
+            if target_lt:
+                if len(self._plaid_completed_link_tokens) >= 16:
+                    self._plaid_completed_link_tokens.clear()
+                self._plaid_completed_link_tokens[target_lt] = dict(summary)
             self._plaid_last_status = "completed"
             self._plaid_last_error = "; ".join(sync_errors)[:240]
             self._clear_pending_plaid_link()
