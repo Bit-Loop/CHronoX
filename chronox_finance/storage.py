@@ -674,7 +674,24 @@ def _ensure_additive_columns(conn: sqlite3.Connection) -> None:
         [
             ("income_configured", "INTEGER NOT NULL DEFAULT 0"),
             ("payday_user_configured", "INTEGER NOT NULL DEFAULT 0"),
+            ("local_cli_auto_detect", "INTEGER NOT NULL DEFAULT 1"),
+            ("safe_invest_cap_cents", "INTEGER"),
         ],
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS onetap_batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            horizon_days INTEGER NOT NULL DEFAULT 30,
+            provider TEXT NOT NULL DEFAULT 'deterministic_local',
+            model TEXT NOT NULL DEFAULT '',
+            plan_json TEXT NOT NULL DEFAULT '{}',
+            undo_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'applied',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
     )
     _ensure_columns(
         conn,
@@ -1026,6 +1043,8 @@ class FinanceStorage:
             "wrapper_wire_api",
             "codex_cli_enabled",
             "codex_cli_model",
+            "local_cli_auto_detect",
+            "safe_invest_cap_cents",
             "email_scanner_enabled",
             "email_imap_host",
             "email_imap_port",
@@ -1045,6 +1064,7 @@ class FinanceStorage:
             "auto_rebalance_enabled",
             "onboarding_completed",
             "codex_cli_enabled",
+            "local_cli_auto_detect",
             "email_scanner_enabled",
             "income_configured",
             "payday_user_configured",
@@ -2880,6 +2900,65 @@ class FinanceStorage:
                 (max(1, min(200, int(limit))),),
             ).fetchall()
             return [self._decode_agent_batch(r) for r in rows]
+
+    @staticmethod
+    def _decode_onetap_batch(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        try:
+            item["plan"] = json.loads(item.pop("plan_json", "{}"))
+        except json.JSONDecodeError:
+            item["plan"] = {}
+        try:
+            item["undo_snapshot"] = json.loads(item.pop("undo_snapshot_json", "{}"))
+        except json.JSONDecodeError:
+            item["undo_snapshot"] = {}
+        return item
+
+    def create_onetap_batch(
+        self, data: Dict[str, Any], ctx: RequestContext = LOCAL_CONTEXT
+    ) -> Dict[str, Any]:
+        now = utc_now_iso()
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO onetap_batches (
+                    horizon_days, provider, model, plan_json, undo_snapshot_json, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(data.get("horizon_days", 30)),
+                    str(data.get("provider", "deterministic_local")),
+                    str(data.get("model", "")),
+                    json.dumps(data.get("plan", {})),
+                    json.dumps(data.get("undo_snapshot", {})),
+                    str(data.get("status", "applied")),
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM onetap_batches WHERE id = ?", (cur.lastrowid,)
+            ).fetchone()
+            return self._decode_onetap_batch(row)
+
+    def get_onetap_batch(
+        self, batch_id: int, ctx: RequestContext = LOCAL_CONTEXT
+    ) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM onetap_batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+            return self._decode_onetap_batch(row) if row else None
+
+    def list_onetap_batches(
+        self, limit: int = 50, ctx: RequestContext = LOCAL_CONTEXT
+    ) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM onetap_batches ORDER BY id DESC LIMIT ?",
+                (max(1, min(200, int(limit))),),
+            ).fetchall()
+            return [self._decode_onetap_batch(r) for r in rows]
 
     # --- Credit Lines, Reports, Inquiries & Derogatories ---
 

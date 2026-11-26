@@ -12,6 +12,7 @@ Security features (Proposal A + Gate 1 Amendments #53):
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 from pathlib import Path
@@ -30,7 +31,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -71,6 +72,7 @@ from chronox_finance.models import (
     ImpulseDecision,
     JarUpdate,
     OnboardingCompleteRequest,
+    OneTapOptimizeRequest,
     PlaidConfigRequest,
     PlaidExchangeRequest,
     PlaidLinkTokenRequest,
@@ -82,6 +84,7 @@ from chronox_finance.models import (
     RuleCreate,
     RuleGroupCreate,
     RuleUpdate,
+    SayRequest,
     ScenarioCreate,
     ScenarioSimRequest,
     SimpleFINClaimRequest,
@@ -160,6 +163,10 @@ class ZombieFlagRequest(BaseModel):
 class SyncTriggerRequest(BaseModel):
     connection_id: Optional[int] = None
     days: int = Field(730, ge=1, le=730)
+
+
+class PlaidHostedCheckRequest(BaseModel):
+    link_token: Optional[str] = Field(None, max_length=512)
 
 
 def create_app(
@@ -503,7 +510,8 @@ def create_app(
                 status_code=400,
                 detail=(
                     "Unsupported AI provider. Use 'auto', 'opencode_go', 'gemini', "
-                    "'openai_codex', 'chat_wrapper', or 'codex_cli'."
+                    "'openai_codex', 'chat_wrapper', 'codex_cli', 'opencode_cli', "
+                    "'claude_cli', or 'agy_cli'."
                 ),
             )
         return cleaned
@@ -802,11 +810,53 @@ def create_app(
     def import_csv_text(req: CsvTextImportRequest):
         return svc.import_csv(req.csv_text, account_id=req.account_id, flip_expense_sign=req.flip_expense_sign)
 
-    @v1.get("/export/csv", tags=["Transactions"], dependencies=[Depends(require_auth)])
-    def export_csv():
-        csv_body = svc.export_csv()
-        return PlainTextResponse(
-            content=csv_body,
+    @v1.get("/export/numbers", tags=["Exports"], dependencies=[Depends(require_auth)])
+    def export_numbers_workbook(days: int = 365, native: bool = False):
+        artifact = svc.export_apple_numbers_workbook(
+            days=max(30, min(730, int(days))),
+            native=bool(native),
+        )
+        return Response(
+            content=artifact.content,
+            media_type=artifact.media_type,
+            headers={"Content-Disposition": f'attachment; filename="{artifact.filename}"'},
+        )
+
+    @v1.get("/export/csv", tags=["Exports"], dependencies=[Depends(require_auth)])
+    def export_csv(pack: bool = False, days: int = 365):
+        if pack:
+            artifact = svc.export_executive_csv_pack_artifact(days=max(30, min(730, int(days))))
+            return Response(
+                content=artifact.content,
+                media_type=artifact.media_type,
+                headers={"Content-Disposition": f'attachment; filename="{artifact.filename}"'},
+            )
+        artifact = svc.export_transactions_csv_artifact()
+        return Response(
+            content=artifact.content,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="chronox-transactions.csv"'},
+        )
+
+    @v1.get("/export/csv-pack", tags=["Exports"], dependencies=[Depends(require_auth)])
+    def export_csv_pack(days: int = 365):
+        artifact = svc.export_executive_csv_pack_artifact(days=max(30, min(730, int(days))))
+        return Response(
+            content=artifact.content,
+            media_type=artifact.media_type,
+            headers={"Content-Disposition": f'attachment; filename="{artifact.filename}"'},
+        )
+
+    @v1.get(
+        "/export/transactions.csv",
+        tags=["Exports"],
+        include_in_schema=False,
+        dependencies=[Depends(require_auth)],
+    )
+    def export_transactions_csv_alias():
+        artifact = svc.export_transactions_csv_artifact()
+        return Response(
+            content=artifact.content,
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": 'attachment; filename="chronox-transactions.csv"'},
         )
@@ -852,20 +902,98 @@ def create_app(
 
     # --- Banking Connectors (Plaid Hosted Link BYOK, SimpleFIN, Connections) ---
 
+    def _plaid_callback_base(request: Request) -> Optional[str]:
+        netloc = (request.url.netloc or "").strip()
+        if not netloc or netloc.lower().startswith("testserver"):
+            return None
+        return f"{request.url.scheme}://{netloc}"
+
+    @v1.get("/plaid/config", tags=["Connectors"], dependencies=[Depends(require_auth)])
+    def get_plaid_config():
+        return svc.get_plaid_config()
+
     @v1.post("/plaid/config", tags=["Connectors"], dependencies=[Depends(require_auth)])
     def plaid_config(req: PlaidConfigRequest):
         return svc.configure_plaid(req)
 
+    @v1.post("/plaid/hosted-link", tags=["Connectors"], dependencies=[Depends(require_auth)])
+    def plaid_hosted_link(
+        request: Request,
+        req: Annotated[Optional[PlaidLinkTokenRequest], Body()] = None,
+    ):
+        return svc.create_plaid_link_token(
+            req or PlaidLinkTokenRequest(),
+            callback_base_url=_plaid_callback_base(request),
+        )
+
     @v1.post("/plaid/link-token", tags=["Connectors"], dependencies=[Depends(require_auth)])
-    def plaid_link_token(req: Annotated[Optional[PlaidLinkTokenRequest], Body()] = None):
-        return svc.create_plaid_link_token(req or PlaidLinkTokenRequest())
+    def plaid_link_token(
+        request: Request,
+        req: Annotated[Optional[PlaidLinkTokenRequest], Body()] = None,
+    ):
+        return svc.create_plaid_link_token(
+            req or PlaidLinkTokenRequest(),
+            callback_base_url=_plaid_callback_base(request),
+        )
+
+    @v1.post("/plaid/hosted-link/check", tags=["Connectors"], dependencies=[Depends(require_auth)])
+    def plaid_hosted_link_check(
+        req: Annotated[Optional[PlaidHostedCheckRequest], Body()] = None,
+    ):
+        lt = req.link_token if req else None
+        return svc.check_pending_plaid_link(link_token=lt)
+
+    @v1.get("/plaid/hosted-complete", tags=["Connectors"])
+    def plaid_hosted_complete(
+        state: str,
+        public_token: Optional[str] = None,
+    ):
+        # Validated via one-time cryptographic `state` nonce + unlocked vault check (top-level OAuth redirect)
+        res = svc.handle_plaid_hosted_complete(state=state, public_token=public_token)
+        count = int(res.get("exchanged_count", 0))
+        imported = int(res.get("imported_count", 0))
+        status_label = html.escape(str(res.get("status") or "completed"))
+        subtitle = (
+            f"Linked {count} institution(s) and imported {imported} transaction(s). You can close this tab and return to ChronoX."
+            if status_label == "completed"
+            else "Your bank sign-in update was received. Return to ChronoX to finish syncing."
+        )
+        body = (
+            "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+            "<title>Bank Connected — Return to ChronoX</title>"
+            "<style>body{background:#0b0e14;color:#e5e7eb;font-family:Inter,system-ui,sans-serif;"
+            "display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}"
+            ".card{background:#121722;border:1px solid #263042;border-radius:2px;padding:32px;max-width:460px}"
+            "h1{margin:0 0 12px;font-size:20px;color:#10b981}p{margin:0;color:#9ca3af;line-height:1.5}</style>"
+            f"</head><body><div class='card'><h1>Bank Connected — Return to ChronoX</h1>"
+            f"<p>{html.escape(subtitle)}</p></div></body></html>"
+        )
+        return HTMLResponse(content=body, status_code=200)
 
     @v1.post("/plaid/poll-link", tags=["Connectors"], dependencies=[Depends(require_auth)])
     def plaid_poll_link(req: PlaidPollLinkRequest):
         return svc.poll_plaid_link(req)
 
+    @v1.post(
+        "/plaid/hosted-link/status",
+        tags=["Connectors"],
+        include_in_schema=False,
+        dependencies=[Depends(require_auth)],
+    )
+    def plaid_hosted_link_status(req: PlaidPollLinkRequest):
+        return svc.poll_plaid_link(req)
+
     @v1.post("/plaid/exchange", tags=["Connectors"], dependencies=[Depends(require_auth)])
     def plaid_exchange(req: PlaidExchangeRequest):
+        return svc.exchange_plaid_token(req)
+
+    @v1.post(
+        "/plaid/hosted-link/exchange",
+        tags=["Connectors"],
+        include_in_schema=False,
+        dependencies=[Depends(require_auth)],
+    )
+    def plaid_hosted_link_exchange(req: PlaidExchangeRequest):
         return svc.exchange_plaid_token(req)
 
     @v1.post("/plaid/sync", tags=["Connectors"], dependencies=[Depends(require_auth)])
@@ -1236,7 +1364,42 @@ def create_app(
         effective = req or WeeklyResetCompleteRequest()
         return svc.complete_weekly_reset(apply_rebalances=effective.apply_rebalances)
 
-    # --- Multi-Mode Intelligence, AI Usage Telemetry & Agentic Tool Coach ---
+    # --- AI + Statistical Quant One-Tap Optimizer ---
+
+    @v1.post("/optimize/one-tap", tags=["One-Tap Optimization"], dependencies=[Depends(require_auth)])
+    def optimize_one_tap(
+        req: Annotated[Optional[OneTapOptimizeRequest], Body()] = None,
+        mode: Optional[str] = None,
+        provider: Optional[str] = None,
+    ):
+        effective = req or OneTapOptimizeRequest()
+        clean_provider = _validate_provider_param(provider) if provider is not None else None
+        return svc.run_onetap_optimization(
+            horizon_days=effective.horizon_days,
+            apply=effective.apply,
+            mode_override=mode,
+            provider_override=clean_provider,
+        )
+
+    @v1.post("/optimize/one-tap/undo/{batch_id}", tags=["One-Tap Optimization"], dependencies=[Depends(require_auth)])
+    def undo_one_tap(batch_id: int):
+        return svc.undo_onetap_batch(batch_id)
+
+    # --- Multi-Mode Intelligence, Local AI CLIs, Unified --say Harness & Agentic Coach ---
+
+    @v1.get("/ai/local-clis", tags=["AI Coach"], dependencies=[Depends(require_auth)])
+    def list_local_ai_clis(probe: bool = False):
+        return svc.get_local_clis(probe=probe)
+
+    @v1.post("/ai/say", tags=["AI Coach"], dependencies=[Depends(require_auth), Depends(check_ai_rate_limit)])
+    def ai_say(req: SayRequest):
+        clean_provider = _validate_provider_param(req.provider) if req.provider is not None else None
+        return svc.say(
+            req.text,
+            auto_commit=req.auto_commit,
+            mode_override=req.mode,
+            provider_override=clean_provider,
+        )
 
     @v1.get("/ai/usage", tags=["AI Coach"], dependencies=[Depends(require_auth)])
     def get_ai_usage(days: int = 30):
@@ -1263,6 +1426,10 @@ def create_app(
     @v1.post("/ai/agent/execute/{batch_id}", tags=["AI Coach"], dependencies=[Depends(require_auth)])
     def execute_agent_batch(batch_id: int):
         return svc.execute_agent_batch(batch_id)
+
+    @v1.post("/ai/agent/undo-last", tags=["AI Coach"], dependencies=[Depends(require_auth)])
+    def undo_last_agent_batch():
+        return svc.undo_last_agent_batch()
 
     @v1.post("/ai/agent/undo/{batch_id}", tags=["AI Coach"], dependencies=[Depends(require_auth)])
     def undo_agent_batch(batch_id: int):

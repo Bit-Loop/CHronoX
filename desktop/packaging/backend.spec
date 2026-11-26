@@ -90,9 +90,13 @@ hiddenimports = [
     "cryptography.hazmat.primitives.hashes",
     "cffi",
     "_cffi_backend",
+    "xml.etree.ElementTree",
+    "zipfile",
 ]
 hiddenimports += collect_submodules("chronox_finance")
+hiddenimports += collect_submodules("chronox_finance.ai")
 hiddenimports += collect_submodules("chronox_finance.connectors")
+hiddenimports += collect_submodules("chronox_finance.engines")
 
 # Exclude heavy optional trading / ML / test stacks not used by ChronoX Finance
 excludes = [

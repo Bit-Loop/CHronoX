@@ -1,16 +1,12 @@
 """
-Fast Terminal CLI for ChronoX Finance (Local-First Industrial Finance Command Center).
+Fast, Apple-Clean Terminal CLI for ChronoX Finance.
 
-Examples:
-    python main.py --action finance --port 8742
-    python -m chronox_finance.cli serve --port 8742
-    python -m chronox_finance.cli status
-    python -m chronox_finance.cli portfolio
-    python -m chronox_finance.cli usage --days 30
-    python -m chronox_finance.cli add "coffee 6.50"
-    python -m chronox_finance.cli add "impulse 199 mech keyboard"
-    python -m chronox_finance.cli ask "Can I afford an $80 dinner tonight?"
-    python -m chronox_finance.cli suggest
+Primary workflow:
+    chronox --say "I spent $5.75 on coffee because early flight"
+    chronox "put $100 in savings"
+    chronox --one-tap --apply
+    chronox --export numbers --out report.xlsx
+    chronox --undo
 """
 
 from __future__ import annotations
@@ -19,7 +15,8 @@ import argparse
 import os
 import sys
 from decimal import Decimal
-from typing import List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import uvicorn
 from dotenv import load_dotenv
@@ -34,6 +31,12 @@ from chronox_finance.models import (
     QuickAddRequest,
 )
 from chronox_finance.service import FinanceService
+
+_LEGACY_SUBCOMMANDS = frozenset(
+    {"serve", "status", "quant", "portfolio", "usage", "add", "ask", "suggest", "credit", "goal"}
+)
+_VALUE_FLAGS = frozenset({"--db", "--mode", "--provider", "--say", "-s", "--export", "--out", "--days"})
+_BOOL_FLAGS = frozenset({"--yes", "-y", "--one-tap", "--apply"})
 
 
 def _money(cents: int) -> str:
@@ -76,6 +79,9 @@ def _format_source(source: str, provider_used: Optional[str], model_used: Option
         "openai_codex": "OpenAI / Codex",
         "chat_wrapper": "Durable Chat-Wrapper",
         "codex_cli": "Codex CLI",
+        "opencode_cli": "OpenCode CLI",
+        "claude_cli": "Claude Code CLI",
+        "agy_cli": "Antigravity CLI",
     }
     if source == "deterministic_quant":
         return "Verified Local Engine | Quant Math"
@@ -87,6 +93,64 @@ def _format_source(source: str, provider_used: Optional[str], model_used: Option
         prov_label = labels.get(provider_used or "", provider_used or "AI")
         return f"AI Standalone | {prov_label} ({model_used or prov_label})"
     return f"{source} ({model_used})" if model_used else source
+
+
+def _normalize_cli_argv(argv: List[str]) -> List[str]:
+    """
+    Allow bare natural-language strings (`chronox-finance "I spent $5 on coffee"`)
+    whenever the first positional token is not a known legacy subcommand or flag.
+    """
+    if not argv or any(tok in ("-h", "--help") for tok in argv):
+        return argv
+    if any(tok in ("--say", "-s") or tok.startswith("--say=") for tok in argv):
+        return argv
+
+    prefix_flags: List[str] = []
+    utterance_parts: List[str] = []
+    i = 0
+    saw_positional = False
+    while i < len(argv):
+        tok = argv[i]
+        if tok in _VALUE_FLAGS:
+            prefix_flags.append(tok)
+            if i + 1 < len(argv):
+                prefix_flags.append(argv[i + 1])
+                i += 2
+            else:
+                i += 1
+            continue
+        if any(tok.startswith(f + "=") for f in _VALUE_FLAGS) or tok.startswith("--undo="):
+            prefix_flags.append(tok)
+            i += 1
+            continue
+        if tok == "--undo":
+            prefix_flags.append(tok)
+            if i + 1 < len(argv) and not argv[i + 1].startswith("-") and argv[i + 1].isdigit():
+                prefix_flags.append(argv[i + 1])
+                i += 2
+            else:
+                i += 1
+            continue
+        if tok in _BOOL_FLAGS:
+            prefix_flags.append(tok)
+            i += 1
+            continue
+        if tok.startswith("-"):
+            if not saw_positional:
+                return argv
+            prefix_flags.append(tok)
+            i += 1
+            continue
+
+        if not saw_positional and tok in _LEGACY_SUBCOMMANDS:
+            return argv
+        saw_positional = True
+        utterance_parts.append(tok)
+        i += 1
+
+    if utterance_parts:
+        return [*prefix_flags, "--say", " ".join(utterance_parts)]
+    return argv
 
 
 def _print_status(svc: FinanceService) -> None:
@@ -209,6 +273,161 @@ def _print_usage(svc: FinanceService, days: int = 30) -> None:
     print("=" * 76 + "\n")
 
 
+def _print_onetap_result(res: Dict[str, Any]) -> None:
+    runway = res.get("runway") or {}
+    ruin_pct = float(runway.get("ruin_probability_pct", 0.0) or 0.0)
+    survival_pct = max(0.0, min(100.0, 100.0 - ruin_pct))
+    cvar_cents = int(runway.get("cvar_95_buffer_cents", 0) or 0)
+    daily_safe_95 = int(runway.get("confidence_95_daily_safe_cents", 0) or 0)
+    savings_cents = int(res.get("total_expected_annual_savings_cents", 0) or 0)
+    horizon = int(res.get("horizon_days", 30) or 30)
+
+    print("\n" + "=" * 72)
+    print(f"  ChronoX One-Tap Optimization ({horizon}-Day Statistical Plan)")
+    print("=" * 72)
+    print(f"  {res.get('executive_summary', '')}")
+    print("-" * 72)
+    print(f"  CVaR 95% Cushion     : {_money(cvar_cents)}")
+    print(f"  Survival Probability : {survival_pct:.1f}% (overdraft risk {ruin_pct:.1f}%)")
+    print(f"  95%-Safe Daily Spend : {_money(daily_safe_95)} / day")
+    print(f"  Est. Annual Savings  : {_money(savings_cents)} / yr")
+    actions = list(res.get("actions") or [])
+    if actions:
+        print("-" * 72)
+        for idx, act in enumerate(actions, 1):
+            if act.get("is_advisory"):
+                tag = "ADVISORY"
+            elif res.get("applied"):
+                tag = "APPLIED"
+            else:
+                tag = "READY"
+            print(f"  {idx}. [{tag}] {act.get('title', act.get('action_type', 'Action'))}")
+            if act.get("summary"):
+                print(f"     {act['summary']}")
+    else:
+        print("-" * 72)
+        print("  No adjustments needed right now.")
+
+    print("-" * 72)
+    if res.get("applied") and res.get("batch_id") is not None:
+        print(f"  Applied One-Tap batch #{res['batch_id']}.")
+        print("  Undo anytime: chronox --undo")
+    elif not res.get("needs_setup") and any(a.get("executable") for a in actions):
+        print("  Preview only. Apply with: chronox --one-tap --apply")
+    print("=" * 72 + "\n")
+
+
+def _run_export(
+    svc: FinanceService,
+    *,
+    fmt: str,
+    out_path: Optional[str] = None,
+    days: int = 365,
+) -> Path:
+    norm = (fmt or "numbers").strip().lower().replace("_", "-")
+    if norm == "numbers":
+        artifact = svc.export_apple_numbers_workbook(days=days, native=False)
+        label = "Apple Numbers Graphical Workbook (.xlsx)"
+    elif norm == "csv":
+        artifact = svc.export_transactions_csv_artifact()
+        label = "Transactions CSV"
+    elif norm == "csv-pack":
+        artifact = svc.export_executive_csv_pack_artifact(days=days)
+        label = "Executive CSV Pack (.zip)"
+    else:
+        raise ValueError(f"Unsupported export format '{fmt}'. Choose numbers, csv, or csv-pack.")
+
+    target = Path(out_path) if out_path else (Path.cwd() / artifact.filename)
+    if target.parent and str(target.parent) not in ("", "."):
+        target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(artifact.content)
+    print(f"\nExported {label}")
+    print(f"  Path : {target.resolve()}")
+    print(f"  Size : {len(artifact.content):,} bytes\n")
+    return target
+
+
+def _run_say(
+    svc: FinanceService,
+    text: str,
+    *,
+    yes: bool = False,
+    mode: Optional[str] = None,
+    provider: Optional[str] = None,
+    out_path: Optional[str] = None,
+    days: int = 365,
+) -> int:
+    res = svc.say(
+        text,
+        auto_commit=True,
+        mode_override=mode,
+        provider_override=provider,
+    )
+    if res.get("requires_confirmation") and yes and res.get("batch_id") is not None:
+        exec_res = svc.execute_agent_batch(int(res["batch_id"]))
+        res["executed"] = True
+        res["requires_confirmation"] = False
+        res["undo_available"] = bool(exec_res.undo_available)
+        dash = svc.get_dashboard()
+        res["safe_to_spend_today_cents"] = dash.safe_to_spend.daily_safe_to_spend_cents
+        res["safe_to_spend_cents"] = dash.safe_to_spend.safe_to_spend_cents
+
+    src = _format_source(
+        str(res.get("source") or "deterministic_local"),
+        res.get("provider_used"),
+        res.get("model_used"),
+    )
+    print(f"\nChronoX [{src}]")
+    print(f"  {res.get('assistant_message', '')}")
+
+    actions = list(res.get("actions") or [])
+    if res.get("executed"):
+        for act in actions:
+            print(f"  + {act.get('summary', act.get('action_type', 'Action'))}")
+        print(
+            f"  Safe to spend today: {_money(int(res.get('safe_to_spend_today_cents', 0)))}/day "
+            f"({_money(int(res.get('safe_to_spend_cents', 0)))} until payday)"
+        )
+        if res.get("undo_available") and res.get("batch_id") is not None:
+            print(f"  Batch #{res['batch_id']} · Undo anytime: chronox --undo")
+    elif res.get("requires_confirmation") and actions:
+        print(f"  Proposed plan (batch #{res.get('batch_id')}):")
+        for idx, act in enumerate(actions, 1):
+            print(f"    {idx}. {act.get('summary', act.get('action_type', 'Action'))}")
+        print('  Confirm and apply by re-running with --yes.')
+
+    if res.get("export_format"):
+        _run_export(svc, fmt=str(res["export_format"]), out_path=out_path, days=days)
+
+    if res.get("onetap_plan"):
+        _print_onetap_result(res["onetap_plan"])
+    else:
+        print()
+    return 0
+
+
+def _run_undo(svc: FinanceService, batch_spec: str) -> int:
+    batch_id: Optional[int] = None
+    cleaned = (batch_spec or "").strip().lower()
+    if cleaned and cleaned != "latest":
+        try:
+            batch_id = int(cleaned)
+        except ValueError:
+            print(f"Error: invalid batch ID '{batch_spec}'. Pass an integer batch ID or omit for latest.", file=sys.stderr)
+            return 1
+    try:
+        res = svc.undo_last_action(batch_id=batch_id)
+    except ValueError as exc:
+        print(f"\n[Undo] {exc}\n", file=sys.stderr)
+        return 1
+    if res.get("kind") == "onetap":
+        print(f"\nUndid One-Tap batch #{res['batch_id']} cleanly ({res.get('restored_count', 0)} restored).\n")
+    else:
+        msg = res.get("message") or f"Undid batch #{res.get('batch_id')} cleanly."
+        print(f"\n{msg}\n")
+    return 0
+
+
 def run_cli(argv: Optional[List[str]] = None) -> int:
     load_dotenv()
     default_db = os.getenv("CHRONOX_FINANCE_DB_PATH", ".chronox/finance.sqlite3")
@@ -218,13 +437,57 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
     mode_choices = [m.value for m in IntelligenceMode]
     provider_choices = [p.value for p in AIProvider]
 
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    norm_argv = _normalize_cli_argv(raw_argv)
+
     parser = argparse.ArgumentParser(
         prog="chronox-finance",
-        description="ChronoX Finance -- Local-First Industrial Finance, Quant Math & Multi-Provider AI Coach",
+        description=(
+            "ChronoX Finance -- Local-First Personal Finance Command Center\n\n"
+            "Quick Examples:\n"
+            '  chronox --say "I spent $5.75 on coffee because early flight"\n'
+            '  chronox "put $100 in savings"\n'
+            "  chronox --one-tap --apply\n"
+            "  chronox --export numbers --out report.xlsx\n"
+            "  chronox --undo"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--db", default=default_db, help=f"SQLite DB path (default: {default_db})")
     parser.add_argument("--mode", choices=mode_choices, default=None, help="Intelligence mode override")
     parser.add_argument("--provider", choices=provider_choices, default=None, help="AI provider override")
+
+    # Front-and-center ChronoX flags
+    parser.add_argument(
+        "-s",
+        "--say",
+        type=str,
+        default=None,
+        help="Say anything in natural language (log expenses with reason, save, split, ask, export, optimize)",
+    )
+    parser.add_argument("-y", "--yes", action="store_true", help="Auto-confirm multi-action plans for --say")
+    parser.add_argument(
+        "--undo",
+        nargs="?",
+        const="latest",
+        default=None,
+        metavar="BATCH_ID",
+        help="Undo the latest (or specified) --say or --one-tap action",
+    )
+    parser.add_argument(
+        "--one-tap",
+        action="store_true",
+        help="Run the AI + Statistical Quant One-Tap Optimizer",
+    )
+    parser.add_argument("--apply", action="store_true", help="Atomically apply the One-Tap optimization plan")
+    parser.add_argument("--days", type=int, default=30, help="Horizon/lookback days (default: 30)")
+    parser.add_argument(
+        "--export",
+        choices=["numbers", "csv", "csv-pack"],
+        default=None,
+        help="Export Apple Numbers workbook (.xlsx), Transactions CSV, or Executive CSV Pack (.zip)",
+    )
+    parser.add_argument("--out", type=str, default=None, help="Output file path for --export")
 
     sub = parser.add_subparsers(dest="command")
 
@@ -265,10 +528,43 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
     p_goal.add_argument("name", help="Item or goal name")
     p_goal.add_argument("price", type=float, help="Target dollar amount")
 
-    args = parser.parse_args(argv)
-    cmd = args.command or "serve"
+    args = parser.parse_args(norm_argv)
     effective_mode = getattr(args, "sub_mode", None) or args.mode
     effective_provider = getattr(args, "sub_provider", None) or args.provider
+
+    # Direct front-and-center flags run before falling back to `serve`
+    if args.say is not None or args.undo is not None or args.one_tap or args.export is not None:
+        svc = FinanceService(db_path=args.db)
+        try:
+            if args.undo is not None:
+                return _run_undo(svc, args.undo)
+            if args.say is not None:
+                return _run_say(
+                    svc,
+                    args.say,
+                    yes=bool(args.yes),
+                    mode=effective_mode,
+                    provider=effective_provider,
+                    out_path=args.out,
+                    days=365 if args.days == 30 else int(args.days),
+                )
+            if args.one_tap:
+                res = svc.run_onetap_optimization(
+                    horizon_days=int(args.days),
+                    apply=bool(args.apply),
+                    mode_override=effective_mode,
+                    provider_override=effective_provider,
+                )
+                _print_onetap_result(res)
+                return 0
+            if args.export is not None:
+                exp_days = 365 if args.days == 30 else int(args.days)
+                _run_export(svc, fmt=args.export, out_path=args.out, days=exp_days)
+                return 0
+        finally:
+            svc.close()
+
+    cmd = args.command or "serve"
 
     if cmd == "serve":
         host = getattr(args, "host", default_host)

@@ -140,6 +140,9 @@ class AIProvider(str, Enum):
     OPENAI_CODEX = "openai_codex"
     CHAT_WRAPPER = "chat_wrapper"
     CODEX_CLI = "codex_cli"
+    OPENCODE_CLI = "opencode_cli"
+    CLAUDE_CLI = "claude_cli"
+    AGY_CLI = "agy_cli"
 
 
 ActiveProviderResolved = Literal[
@@ -148,6 +151,9 @@ ActiveProviderResolved = Literal[
     "openai_codex",
     "chat_wrapper",
     "codex_cli",
+    "opencode_cli",
+    "claude_cli",
+    "agy_cli",
     "none",
 ]
 
@@ -157,6 +163,9 @@ SuggestionSource = Literal[
     "openai_codex",
     "chat_wrapper",
     "codex_cli",
+    "opencode_cli",
+    "claude_cli",
+    "agy_cli",
     "deterministic_local",
     "deterministic_quant",
     "ai_standalone",
@@ -665,6 +674,7 @@ class AISettingsOut(BaseModel):
     wrapper_key_masked: str = ""
     codex_cli_enabled: bool = False
     codex_cli_model: str = ""
+    local_cli_auto_detect: bool = True
     requests_used_today: int = 0
     quota_remaining_today: int = 60
 
@@ -693,6 +703,39 @@ class AISettingsUpdate(BaseModel):
     clear_wrapper_key: bool = False
     codex_cli_enabled: Optional[bool] = None
     codex_cli_model: Optional[str] = None
+    local_cli_auto_detect: Optional[bool] = None
+
+
+class LocalCLIInfo(BaseModel):
+    provider_id: str
+    display_name: str
+    installed: bool = False
+    auth_ready: Optional[bool] = None
+    binary_path: str = ""
+    version: str = ""
+    status_detail: str = ""
+    is_active: bool = False
+    default_model: str = ""
+    in_cooldown: bool = False
+
+
+class LocalCLIListResponse(BaseModel):
+    auto_detect_enabled: bool = True
+    active_provider: str = "none"
+    active_provider_label: str = "Local Quant Engine"
+    clis: List[LocalCLIInfo] = Field(default_factory=list)
+
+
+class SayRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=1500)
+    auto_commit: bool = True
+    mode: Optional[str] = None
+    provider: Optional[str] = None
+
+
+class OneTapOptimizeRequest(BaseModel):
+    horizon_days: int = Field(30, ge=7, le=90)
+    apply: bool = False
 
 
 class AIUsageProviderBreakdown(BaseModel):
@@ -808,6 +851,7 @@ class ProfileSettings(BaseModel):
     wrapper_key_masked: str = ""
     codex_cli_enabled: bool = False
     codex_cli_model: str = ""
+    local_cli_auto_detect: bool = True
     auth_enabled: bool = False
 
 
@@ -847,6 +891,7 @@ class ProfileSettingsUpdate(BaseModel):
     clear_wrapper_key: bool = False
     codex_cli_enabled: Optional[bool] = None
     codex_cli_model: Optional[str] = None
+    local_cli_auto_detect: Optional[bool] = None
 
 
 class BillAnomaly(BaseModel):
@@ -890,6 +935,10 @@ class PlaidLinkTokenRequest(BaseModel):
     products: List[str] = Field(default_factory=lambda: ["transactions"])
     optional_products: List[str] = Field(default_factory=lambda: ["liabilities", "investments"])
     days_requested: int = Field(730, ge=30, le=730)
+    client_id: Optional[str] = Field(None, min_length=4, max_length=128)
+    secret: Optional[str] = Field(None, min_length=4, max_length=256)
+    env: Optional[Literal["sandbox", "production"]] = None
+    completion_redirect_uri: Optional[str] = Field(None, max_length=512)
 
 
 class PlaidLinkTokenResponse(BaseModel):
@@ -897,6 +946,9 @@ class PlaidLinkTokenResponse(BaseModel):
     hosted_link_url: Optional[str] = None
     expiration: Optional[str] = None
     days_requested: int = 730
+    state_nonce: Optional[str] = None
+    pending_status: str = "pending"
+    env: str = "production"
 
 
 class PlaidPollLinkRequest(BaseModel):

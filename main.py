@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """
-ChronoX -- Unified Entry Point (Local-First Industrial Personal Finance & Algorithmic Trading Platform).
+ChronoX -- Unified Local-First Personal Finance Command Center & CLI.
 
-Primary modes:
-    # Start the ChronoX Finance Command Center web app (default, fixed port 8742)
+Quick workflow:
+    # Say anything in plain English (auto-logs with reason, saves, splits, answers, or exports)
+    python main.py --say "I spent $5.75 on coffee because early flight"
+    python main.py "put $100 in savings"
+    python main.py --undo
+
+    # AI + Statistical Quant One-Tap Optimization
+    python main.py --one-tap
+    python main.py --one-tap --apply
+
+    # Apple Numbers Graphical Workbook (.xlsx) & Executive CSV Exports
+    python main.py --export numbers --out chronox-report.xlsx
+    python main.py --export csv --out transactions.csv
+    python main.py --export csv-pack --out chronox-pack.zip
+
+    # Launch the ChronoX Finance Web App (default, port 8742)
     python main.py
-    python main.py --action finance --port 8742
-
-    # Terminal quick-capture, portfolio, AI usage & coach
-    python main.py --action budget --quick "coffee 6.50"
-    python main.py --action budget --ask "Can I afford a $90 dinner tonight?"
-    python main.py --action budget --suggest
-    python main.py --action budget --portfolio
-    python main.py --action budget --usage
-
-    # ChronoX Market Data & Trading Core (TimescaleDB + Polygon.io)
-    python main.py --action backfill --tickers AAPL,MSFT,NVDA --start 2022-01-01
-    python main.py --action health
+    python main.py --action finance --host 0.0.0.0 --port 8742
 """
 
 from __future__ import annotations
@@ -34,6 +37,22 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from config.config_manager import ConfigManager  # noqa: E402
 from utils.logger import setup_logging  # noqa: E402
+
+_PROVIDER_CHOICES = [
+    "auto",
+    "opencode_go",
+    "gemini",
+    "openai_codex",
+    "chat_wrapper",
+    "codex_cli",
+    "opencode_cli",
+    "claude_cli",
+    "agy_cli",
+]
+
+_FINANCE_CLI_SUBCOMMANDS = frozenset(
+    {"serve", "status", "quant", "portfolio", "usage", "add", "ask", "suggest", "credit", "goal"}
+)
 
 
 class ChronoXOrchestrator:
@@ -196,6 +215,7 @@ class ChronoXOrchestrator:
                 "active_provider": health.active_provider,
                 "safe_to_spend_dollars": round(dash.safe_to_spend.safe_to_spend_cents / 100.0, 2),
                 "safe_to_invest_dollars": round(dash.safe_to_invest_cents / 100.0, 2),
+                "local_cli_auto_detect": ai_status["local_cli_auto_detect"],
                 "opencode_go_configured": ai_status["opencode_key_configured"],
                 "gemini_configured": ai_status["gemini_api_key_set"],
                 "codex_configured": ai_status["codex_key_configured"],
@@ -217,22 +237,63 @@ class ChronoXOrchestrator:
 
 def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="ChronoX -- Local-First Industrial Personal Finance, Multi-Provider AI Coach & Market Data Platform",
+        prog="chronox",
+        description=(
+            "ChronoX Finance -- Local-First Personal Finance Command Center\n\n"
+            "Everyday Commands:\n"
+            '  chronox --say "I spent $5.75 on coffee because early flight"\n'
+            '  chronox "put $100 in savings"\n'
+            "  chronox --one-tap [--apply] [--days 30]\n"
+            "  chronox --export numbers --out report.xlsx\n"
+            "  chronox --undo [BATCH_ID]\n"
+            "  chronox --action finance --port 8742"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+
+    # Primary consumer-grade commands
+    parser.add_argument(
+        "-s",
+        "--say",
+        type=str,
+        default=None,
+        help="Say anything in plain English (log expenses with reason, save, split, ask, optimize, or export)",
+    )
+    parser.add_argument("-y", "--yes", action="store_true", help="Auto-confirm multi-action plans for --say")
+    parser.add_argument(
+        "--undo",
+        nargs="?",
+        const="latest",
+        default=None,
+        metavar="BATCH_ID",
+        help="Undo the latest (or specified) --say or --one-tap batch",
+    )
+    parser.add_argument(
+        "--one-tap",
+        action="store_true",
+        help="Run the AI + Statistical Quant One-Tap Optimizer (CVaR 95%% + KKT)",
+    )
+    parser.add_argument("--apply", action="store_true", help="Atomically apply the One-Tap optimization plan")
+    parser.add_argument(
+        "--export",
+        choices=["numbers", "csv", "csv-pack"],
+        default=None,
+        help="Export Apple Numbers Graphical Workbook (.xlsx), Transactions CSV, or Executive CSV Pack (.zip)",
+    )
+    parser.add_argument("--out", type=str, default=None, help="Output file path for --export")
+
+    # Core runtime & AI options
     parser.add_argument(
         "--action",
         type=str,
         choices=["finance", "budget", "gui", "backfill", "health"],
         default="finance",
-        help="Action to perform (default: finance web app)",
+        help="Server/legacy action mode (default: finance web app)",
     )
     parser.add_argument("--config", type=str, help="Path to YAML/JSON configuration file")
     parser.add_argument("--host", type=str, help="Finance server host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, help="Fixed finance server port (default: 8742)")
     parser.add_argument("--db", type=str, help="Path to ChronoX Finance SQLite database")
-
-    # Quick CLI budget & intelligence options
     parser.add_argument(
         "--mode",
         choices=["deterministic_only", "hybrid", "ai_standalone"],
@@ -241,32 +302,90 @@ def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--provider",
-        choices=["auto", "opencode_go", "gemini", "openai_codex", "chat_wrapper", "codex_cli"],
+        choices=_PROVIDER_CHOICES,
         default=None,
-        help="AI provider (auto | opencode_go | gemini | openai_codex | chat_wrapper | codex_cli)",
+        help="AI provider override (default: auto with local CLI auto-detection)",
     )
+    parser.add_argument("--days", type=int, default=30, help="Lookback/forecast horizon in days (default: 30)")
+
+    # Legacy budget & market-data flags (100% backward-compatible)
     parser.add_argument("--quick", type=str, help="Quick-add phrase, e.g. 'coffee 6.50' or 'impulse 180 keyboard'")
     parser.add_argument("--ask", type=str, help="Ask the ChronoX Financial Coach a question")
     parser.add_argument("--suggest", action="store_true", help="Print verified AI/quant auto-budget suggestions")
     parser.add_argument("--quant", action="store_true", help="Show cashflow runway & optimal marginal-ROI allocation")
     parser.add_argument("--portfolio", action="store_true", help="Show Stocks & Crypto portfolio holdings")
     parser.add_argument("--usage", action="store_true", help="Show AI token usage, cache hit rate & verified savings")
-    parser.add_argument("--days", type=int, default=30, help="Lookback/forecast horizon in days (default: 30)")
     parser.add_argument("--credit", action="store_true", help="Show Credit Factor Analysis, Chase 5/24 & AZEO debt plan")
     parser.add_argument("--extra", type=float, default=250.0, help="Extra monthly dollars toward debt for --credit (default: 250)")
     parser.add_argument("--goal", nargs=2, metavar=("NAME", "PRICE"), help="Plan a credit-safe goal purchase")
-
-    # Market data backfill options
     parser.add_argument("--tickers", type=str, help="Comma-separated tickers for backfill (e.g., AAPL,MSFT)")
     parser.add_argument("--start", type=str, help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", type=str, help="End date (YYYY-MM-DD)")
     parser.add_argument("--skip-minute", action="store_true", help="Skip 1-minute bars during backfill")
     parser.add_argument("--flatfiles", action="store_true", help="Use Polygon S3 flat files")
+    parser.add_argument(
+        "utterance",
+        nargs="*",
+        help="Natural-language utterance shorthand for --say (e.g. chronox \"I spent $5 on coffee\")",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_arguments(argv)
+
+    # Front-and-center fast path: --say, bare natural-language utterance, --undo, --one-tap, --export
+    has_utterance = bool(args.utterance)
+    if args.say is not None or args.undo is not None or args.one_tap or args.export is not None or has_utterance:
+        from chronox_finance.cli import run_cli
+
+        cli_args: List[str] = []
+        if args.db:
+            cli_args.extend(["--db", args.db])
+        if args.mode:
+            cli_args.extend(["--mode", args.mode])
+        if args.provider:
+            cli_args.extend(["--provider", args.provider])
+
+        if args.undo is not None:
+            cli_args.append("--undo")
+            if args.undo != "latest":
+                cli_args.append(str(args.undo))
+            return run_cli(cli_args)
+
+        if args.one_tap:
+            cli_args.extend(["--one-tap", "--days", str(args.days)])
+            if args.apply:
+                cli_args.append("--apply")
+            return run_cli(cli_args)
+
+        if args.export is not None:
+            cli_args.extend(["--export", args.export])
+            if args.out:
+                cli_args.extend(["--out", args.out])
+            if args.days != 30:
+                cli_args.extend(["--days", str(args.days)])
+            return run_cli(cli_args)
+
+        if args.say is not None:
+            cli_args.extend(["--say", args.say])
+            if args.yes:
+                cli_args.append("--yes")
+            if args.out:
+                cli_args.extend(["--out", args.out])
+            return run_cli(cli_args)
+
+        if has_utterance:
+            if args.utterance[0] in _FINANCE_CLI_SUBCOMMANDS:
+                cli_args.extend(args.utterance)
+                return run_cli(cli_args)
+            cli_args.extend(["--say", " ".join(args.utterance)])
+            if args.yes:
+                cli_args.append("--yes")
+            if args.out:
+                cli_args.extend(["--out", args.out])
+            return run_cli(cli_args)
+
     orchestrator = ChronoXOrchestrator(config_path=args.config)
     try:
         if args.action in ("finance", "gui"):
@@ -282,7 +401,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.action == "budget":
             from chronox_finance.cli import run_cli
 
-            cli_args: List[str] = []
+            cli_args = []
             if args.db:
                 cli_args.extend(["--db", args.db])
             if args.mode:
