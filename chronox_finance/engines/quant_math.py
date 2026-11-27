@@ -923,6 +923,9 @@ class QuantMathEngine:
 
         # --- C. Credit Line Minimum Payments on `payment_due_day` ---
         # Track scheduled minimums per credit line so AZEO pre-close paydowns never double-count them!
+        # Also skip any credit/collection line already covered by an active recurring_bill (e.g. biweekly payment plan).
+        from chronox_finance.engines.recurring import credit_line_covered_by_recurring_bill
+
         min_events_by_line: Dict[int, List[Tuple[date, int, str]]] = defaultdict(list)
         line_meta: Dict[int, Dict[str, Any]] = {}
         if credit_lines:
@@ -947,6 +950,8 @@ class QuantMathEngine:
                     )
                 eff_min = max(0, int(eff_min))
                 if eff_min <= 0:
+                    continue
+                if credit_line_covered_by_recurring_bill(cl, recurring_bills, effective_min_cents=eff_min):
                     continue
 
                 due_day = int(_get(cl, "payment_due_day", 10))

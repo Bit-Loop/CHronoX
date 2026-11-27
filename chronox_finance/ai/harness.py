@@ -100,6 +100,9 @@ ELEVATED_CONFIRMATION_ACTION_TYPES: FrozenSet[str] = frozenset(
         "update_rule",
         "create_credit_line",
         "update_credit_line",
+        "create_bill",
+        "update_bill",
+        "delete_bill",
     }
 )
 
@@ -274,10 +277,11 @@ Interpret ANY natural human utterance into a single strict JSON object covering 
 savings transfers, exact-sum splits, financial advice, one-tap optimization, or report exports.
 
 HARD RULES (NEVER VIOLATE):
-1. Emit ONLY actions from the 12 allowlisted `action_type` values:
+1. Emit ONLY actions from the 15 allowlisted `action_type` values:
    `create_transaction`, `update_transaction`, `add_tx_comment`, `split_transaction`,
    `create_goal`, `update_goal`, `delete_goal`, `create_rule`, `update_rule`,
-   `create_credit_line`, `update_credit_line`, `analyze_portfolio`.
+   `create_credit_line`, `update_credit_line`, `analyze_portfolio`,
+   `create_bill`, `update_bill`, `delete_bill`.
 2. NEVER emit `delete_credit_line`, `delete_rule`, external money wires/ACH, or stock/crypto trade orders.
 3. ALL monetary amounts MUST be exact positive integer cents (`amount_cents`, `target_cents`, `saved_cents`, `balance_cents`, `credit_limit_cents`).
 4. CAUSAL REASON PRESERVATION: Whenever the user states a reason (`because ...`, `for ...`, `since ...`, `due to ...`), ALWAYS extract and preserve the clean reason in `memo` (e.g., `"I spent $18.40 on Uber because pouring rain"` -> `merchant: "Uber"`, `amount_cents: 1840`, `tx_type: "expense"`, `memo: "Pouring rain"`).

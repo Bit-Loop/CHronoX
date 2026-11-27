@@ -272,8 +272,8 @@ class TestHelpersAndAgentToolsExtensions:
         assert "boost your fico score by 25" not in cleaned.lower()
         assert len(violations) >= 4
 
-    def test_agent_tools_extensions_preserve_12_allowlist_and_support_aliases_transfers_splits_and_goal_delta(self):
-        assert len(ALLOWED_AGENT_ACTION_TYPES) == 12
+    def test_agent_tools_extensions_preserve_15_allowlist_and_support_aliases_transfers_splits_and_goal_delta(self):
+        assert len(ALLOWED_AGENT_ACTION_TYPES) == 15
         ctx = _sample_context(include_savings_account=True)
 
         # Bills snapshot wrapping

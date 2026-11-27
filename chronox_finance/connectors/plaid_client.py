@@ -213,7 +213,11 @@ def _normalize_plaid_transaction(raw: Dict[str, Any]) -> NormalizedTransaction:
     detailed_cat = str(pfc.get("detailed") or "").strip().upper()
 
     xfer_dir = ""
-    if primary_cat in ("TRANSFER_IN", "TRANSFER_OUT") or detailed_cat == "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT":
+    if (
+        primary_cat in ("TRANSFER_IN", "TRANSFER_OUT")
+        or detailed_cat == "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT"
+        or (primary_cat == "LOAN_PAYMENTS" and amt_dec < Decimal(0))
+    ):
         tx_type = "transfer"
         xfer_dir = "in" if (primary_cat == "TRANSFER_IN" or amt_dec < Decimal(0)) else "out"
     elif amt_dec < Decimal(0):
@@ -249,6 +253,7 @@ def _normalize_plaid_transaction(raw: Dict[str, Any]) -> NormalizedTransaction:
         memo=memo,
         subcategory=subcategory,
         pending=bool(raw.get("pending", False)),
+        pending_transaction_id=str(raw.get("pending_transaction_id") or "").strip(),
         currency=str(currency).upper(),
         source="plaid",
         raw_category=detailed_cat or primary_cat,

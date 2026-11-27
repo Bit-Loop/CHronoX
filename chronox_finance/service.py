@@ -129,6 +129,7 @@ from chronox_finance.engines.nlp_parser import parse_quick_add
 from chronox_finance.engines.onetap_quant import OneTapQuantEngine
 from chronox_finance.engines.quant_math import QuantMathEngine
 from chronox_finance.engines.recurring import (
+    advance_due_date,
     detect_bill_anomalies,
     detect_payday_schedule,
     detect_recurring_bills,
@@ -218,7 +219,9 @@ from chronox_finance.models import (
     RebalanceTransferRequest,
     ReclassifyTransactionsOut,
     ReclassifyTransactionsRequest,
+    RecurrenceCadence,
     RecurringBillCreate,
+    RecurringBillUpdate,
     RuleCreate,
     RuleGroupCreate,
     RuleGroupOut,
@@ -3443,6 +3446,11 @@ class FinanceService:
             if ntx.pending:
                 continue
             acct_id = acct_map.get(ntx.external_account_id, default_acct_id)
+            if ntx.pending_transaction_id:
+                self.storage.delete_provider_transactions(
+                    external_ids=[ntx.pending_transaction_id],
+                    account_ids=[acct_id],
+                )
             if acct_id not in tx_indexes:
                 tx_indexes[acct_id] = self._load_account_tx_index(acct_id)
             norm = normalize_merchant(ntx.merchant)
@@ -3738,7 +3746,16 @@ class FinanceService:
             # Commit accounts, added/modified/removed transactions, liabilities, holdings, and cursor atomically
             with self.storage.transaction(immediate=True):
                 acct_map: Dict[str, int] = {}
-                for na in bal_accounts or sync_res.accounts:
+                # Merge accounts from BOTH /transactions/sync AND /accounts/balance/get so credit cards
+                # and depository accounts present in either payload are never dropped (preferring balance payload).
+                merged_accounts: Dict[str, NormalizedAccount] = {}
+                for na in sync_res.accounts or []:
+                    if na.external_account_id:
+                        merged_accounts[na.external_account_id] = na
+                for na in bal_accounts or []:
+                    if na.external_account_id:
+                        merged_accounts[na.external_account_id] = na
+                for na in merged_accounts.values():
                     acct_map[na.external_account_id] = self._ensure_local_account_for_normalized(
                         na, connection_id=cid
                     )
@@ -4185,7 +4202,7 @@ class FinanceService:
                 continue
             if ex_amt != amount_cents or ex_type != tx_type:
                 continue
-            if abs((cand_dt - ex_dt).days) <= 2 and self._merchants_semantically_match(norm_merchant, ex_norm):
+            if abs((cand_dt - ex_dt).days) <= 3 and self._merchants_semantically_match(norm_merchant, ex_norm):
                 if consume:
                     existing_index.pop(idx)
                 return True
@@ -6017,6 +6034,12 @@ class FinanceService:
         self.run_self_updating_sync(reason=f"Reconciled {acct['name']} balance")
         return AccountOut(**acct)
 
+    def delete_account(self, account_id: int, *, force: bool = False) -> Dict[str, Any]:
+        res = self.storage.delete_account(account_id, force=force)
+        if res.get("deleted"):
+            self.run_self_updating_sync(reason=f"Removed unused account {res.get('name', account_id)}")
+        return res
+
     def update_jar(self, jar_id: int, req: JarUpdate) -> Optional[Dict[str, Any]]:
         updates = req.model_dump(exclude_none=True)
         for bool_k in ("rollover_enabled", "is_locked"):
@@ -6084,6 +6107,40 @@ class FinanceService:
         )
         self.run_self_updating_sync(reason=f"Added recurring bill {saved['name']}")
         return saved
+
+    def update_recurring_bill(self, bill_id: int, req: RecurringBillUpdate) -> Optional[Dict[str, Any]]:
+        updates = req.model_dump(exclude_none=True)
+        if "cadence" in updates and isinstance(updates["cadence"], RecurrenceCadence):
+            updates["cadence"] = updates["cadence"].value
+        if "name" in updates:
+            updates["name"] = str(updates["name"]).strip()
+            updates["normalized_merchant"] = normalize_merchant(updates["name"])
+        updated = self.storage.update_recurring_bill(bill_id, updates)
+        if not updated:
+            return None
+        self.run_self_updating_sync(reason=f"Updated recurring bill {updated['name']}")
+        return updated
+
+    def mark_recurring_bill_paid(
+        self, bill_id: int, paid_date: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        existing = self.storage.get_recurring_bill(bill_id)
+        if not existing:
+            return None
+        ref_paid = date.fromisoformat(paid_date) if paid_date else date.today()
+        cur_due = date.fromisoformat(str(existing["next_due_date"]))
+        anchor = max(ref_paid, cur_due)
+        try:
+            cadence = RecurrenceCadence(str(existing.get("cadence") or "monthly"))
+        except ValueError:
+            cadence = RecurrenceCadence.MONTHLY
+        next_due = advance_due_date(anchor, cadence, today=anchor + timedelta(days=1))
+        updated = self.storage.update_recurring_bill(bill_id, {"next_due_date": next_due.isoformat()})
+        if updated:
+            self.run_self_updating_sync(
+                reason=f"Marked recurring bill {updated['name']} paid; next due {next_due.isoformat()}"
+            )
+        return updated
 
     def deactivate_recurring_bill(self, bill_id: int) -> bool:
         ok = self.storage.deactivate_recurring_bill(bill_id)
@@ -6270,16 +6327,20 @@ class FinanceService:
         settings = self.storage.get_settings()
         b = budget if budget is not None else self._compute_budget()
         qf = quant_forecast if quant_forecast is not None else self.get_quant_forecast(days=30, budget=b)
+        txs = self.storage.list_transactions(limit=250, include_splits=True, include_tags=True)
+        bills = self.storage.list_recurring_bills(active_only=True)
+        anomalies = detect_bill_anomalies(txs, bills)
         return AgentLedgerContext.from_objects(
             accounts=self.storage.list_accounts(),
             jars=self.storage.list_jars(),
-            transactions=self.storage.list_transactions(limit=250, include_splits=True, include_tags=True),
+            transactions=txs,
             goals=self.storage.list_goals(include_completed=True),
             rules=self.storage.list_rules(active_only=False),
             credit_lines=self.storage.list_credit_lines(active_only=True),
             holdings=self.storage.list_holdings(),
             email_queue=self.storage.list_email_queue(status="pending", limit=25),
-            bills=self.storage.list_recurring_bills(active_only=True),
+            bills=bills,
+            bill_anomalies=anomalies,
             safe_to_spend_cents=b.safe_to_spend.safe_to_spend_cents,
             safe_to_invest_cents=b.safe_to_invest_cents,
             monthly_surplus_cents=qf.monthly_surplus_cents,
@@ -6395,6 +6456,19 @@ class FinanceService:
             "autopay_mode",
             "rewards_note",
             "is_authorized_user",
+        )
+        bill_fp_fields = (
+            "name",
+            "normalized_merchant",
+            "amount_cents",
+            "cadence",
+            "next_due_date",
+            "jar_id",
+            "is_subscription",
+            "is_essential",
+            "auto_pay",
+            "active",
+            "flagged_zombie",
         )
         results: List[Dict[str, Any]] = []
         undo_entries: List[Dict[str, Any]] = []
@@ -6650,6 +6724,95 @@ class FinanceService:
                     )
                     results.append({"action_type": atype, "analysis": analysis, "summary": act.summary})
 
+                elif atype == "create_bill":
+                    b_name = str(pl["name"]).strip()
+                    b_norm = normalize_merchant(b_name)
+                    existing_same = conn.execute(
+                        "SELECT * FROM recurring_bills WHERE normalized_merchant = ?", (b_norm,)
+                    ).fetchone()
+                    before_same = dict(existing_same) if existing_same else None
+                    jar_id = int(pl["jar_id"]) if pl.get("jar_id") is not None else None
+                    if jar_id is None:
+                        bills_j = self.storage.get_jar_by_slug("bills")
+                        jar_id = int(bills_j["id"]) if bills_j else None
+                    created_b = self.storage.upsert_recurring_bill(
+                        name=b_name,
+                        normalized_merchant=b_norm,
+                        amount_cents=int(pl["amount_cents"]),
+                        cadence=str(pl.get("cadence") or "monthly"),
+                        next_due_date=str(pl["next_due_date"]),
+                        jar_id=jar_id,
+                        due_window_days=int(pl.get("due_window_days", 4)),
+                        is_subscription=bool(pl.get("is_subscription", False)),
+                        is_essential=bool(pl.get("is_essential", True)),
+                        auto_pay=bool(pl.get("auto_pay", False)),
+                        confidence=1.0,
+                    )
+                    if before_same is not None:
+                        undo_entries.append(
+                            {
+                                "op": "restore_bill",
+                                "table": "recurring_bills",
+                                "id": int(created_b["id"]),
+                                "before_row": {k: before_same.get(k) for k in bill_fp_fields},
+                                "after_updated_at": str(created_b["updated_at"]),
+                                "after_hash": _row_fingerprint(created_b, bill_fp_fields),
+                            }
+                        )
+                    else:
+                        undo_entries.append(
+                            {
+                                "op": "delete_bill",
+                                "table": "recurring_bills",
+                                "id": int(created_b["id"]),
+                                "after_updated_at": str(created_b["updated_at"]),
+                                "after_hash": _row_fingerprint(created_b, bill_fp_fields),
+                            }
+                        )
+                    results.append({"action_type": atype, "bill_id": int(created_b["id"]), "summary": act.summary})
+
+                elif atype == "update_bill":
+                    bid = int(pl["bill_id"])
+                    before_b = self.storage.get_recurring_bill(bid)
+                    if not before_b:
+                        raise ValueError(f"Recurring bill #{bid} not found")
+                    upd_b = {k: v for k, v in pl.items() if k != "bill_id" and v is not None}
+                    if "name" in upd_b:
+                        upd_b["name"] = str(upd_b["name"]).strip()
+                        upd_b["normalized_merchant"] = normalize_merchant(upd_b["name"])
+                    after_b = self.storage.update_recurring_bill(bid, upd_b)
+                    assert after_b is not None
+                    undo_entries.append(
+                        {
+                            "op": "restore_bill",
+                            "table": "recurring_bills",
+                            "id": bid,
+                            "before_row": {k: before_b.get(k) for k in bill_fp_fields},
+                            "after_updated_at": str(after_b["updated_at"]),
+                            "after_hash": _row_fingerprint(after_b, bill_fp_fields),
+                        }
+                    )
+                    results.append({"action_type": atype, "bill_id": bid, "summary": act.summary})
+
+                elif atype == "delete_bill":
+                    bid = int(pl["bill_id"])
+                    before_b = self.storage.get_recurring_bill(bid)
+                    if not before_b or not before_b.get("active", 1):
+                        raise ValueError(f"Recurring bill #{bid} not found or already archived")
+                    after_b = self.storage.update_recurring_bill(bid, {"active": False})
+                    assert after_b is not None
+                    undo_entries.append(
+                        {
+                            "op": "restore_bill",
+                            "table": "recurring_bills",
+                            "id": bid,
+                            "before_row": {k: before_b.get(k) for k in bill_fp_fields},
+                            "after_updated_at": str(after_b["updated_at"]),
+                            "after_hash": _row_fingerprint(after_b, bill_fp_fields),
+                        }
+                    )
+                    results.append({"action_type": atype, "bill_id": bid, "summary": act.summary})
+
             # Persist executed status + undo pre-images inside the same atomic transaction
             conn.execute(
                 "UPDATE agent_action_batches SET status = 'executed', undo_snapshot_json = ?, updated_at = ? WHERE id = ?",
@@ -6732,6 +6895,19 @@ class FinanceService:
             "autopay_mode",
             "rewards_note",
             "is_authorized_user",
+        )
+        bill_fp_fields = (
+            "name",
+            "normalized_merchant",
+            "amount_cents",
+            "cadence",
+            "next_due_date",
+            "jar_id",
+            "is_subscription",
+            "is_essential",
+            "auto_pay",
+            "active",
+            "flagged_zombie",
         )
 
         with self.storage.transaction(immediate=True) as conn:
@@ -6862,6 +7038,25 @@ class FinanceService:
                             }
                         )
 
+                elif op in ("delete_bill", "restore_bill"):
+                    curr = self.storage.get_recurring_bill(row_id)
+                    curr_hash = _row_fingerprint(curr, bill_fp_fields)
+                    expected_hash = entry.get("after_hash")
+                    if (
+                        not curr
+                        or str(curr.get("updated_at", "")) != str(entry["after_updated_at"])
+                        or (expected_hash and curr_hash != expected_hash)
+                    ):
+                        conflicts.append(
+                            {
+                                "table": "recurring_bills",
+                                "id": row_id,
+                                "reason": f"Recurring bill #{row_id} was modified or deleted after execution.",
+                                "expected_updated_at": entry["after_updated_at"],
+                                "actual_updated_at": curr.get("updated_at") if curr else None,
+                            }
+                        )
+
             if conflicts:
                 return AgentUndoResponse(
                     batch_id=batch_id,
@@ -6913,6 +7108,12 @@ class FinanceService:
                     restored_count += 1
                 elif op == "restore_credit_line":
                     self.storage.update_credit_line(row_id, dict(entry["before_row"]))
+                    restored_count += 1
+                elif op == "delete_bill":
+                    self.storage.delete_recurring_bill_hard(row_id)
+                    restored_count += 1
+                elif op == "restore_bill":
+                    self.storage.update_recurring_bill(row_id, dict(entry["before_row"]))
                     restored_count += 1
 
             conn.execute(

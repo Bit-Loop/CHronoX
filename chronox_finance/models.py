@@ -213,6 +213,9 @@ AgentActionType = Literal[
     "create_credit_line",
     "update_credit_line",
     "analyze_portfolio",
+    "create_bill",
+    "update_bill",
+    "delete_bill",
 ]
 
 
@@ -496,6 +499,39 @@ class RecurringBillCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_amount_range(self) -> "RecurringBillCreate":
+        if (
+            self.amount_min_cents is not None
+            and self.amount_max_cents is not None
+            and self.amount_min_cents > self.amount_max_cents
+        ):
+            raise ValueError("amount_min_cents cannot exceed amount_max_cents")
+        return self
+
+
+class RecurringBillUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    amount_cents: Optional[int] = Field(None, gt=0, le=100_000_000_00)
+    amount_min_cents: Optional[int] = Field(None, ge=0, le=100_000_000_00)
+    amount_max_cents: Optional[int] = Field(None, ge=0, le=100_000_000_00)
+    due_window_days: Optional[int] = Field(None, ge=0, le=30)
+    cadence: Optional[RecurrenceCadence] = None
+    next_due_date: Optional[str] = None
+    jar_id: Optional[int] = None
+    is_subscription: Optional[bool] = None
+    is_essential: Optional[bool] = None
+    auto_pay: Optional[bool] = None
+    active: Optional[bool] = None
+    flagged_zombie: Optional[bool] = None
+
+    @field_validator("next_due_date")
+    @classmethod
+    def validate_due_date(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            date.fromisoformat(v)
+        return v
+
+    @model_validator(mode="after")
+    def validate_amount_range(self) -> "RecurringBillUpdate":
         if (
             self.amount_min_cents is not None
             and self.amount_max_cents is not None
@@ -965,6 +1001,10 @@ class BillAnomaly(BaseModel):
     amount_cents: int
     summary: str
     dates: List[str] = Field(default_factory=list)
+    bill_id: Optional[int] = None
+    severity: Literal["high", "medium", "low"] = "high"
+    auto_pay: bool = False
+    days_overdue: int = 0
 
 
 # --- Banking, Broker & Email Connector Models ---

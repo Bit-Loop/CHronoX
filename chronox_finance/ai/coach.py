@@ -764,12 +764,28 @@ class FinancialCoach:
                     "name": sanitize_untrusted_text(b.name, 50),
                     "amount_dollars": round(b.amount_cents / 100.0, 2),
                     "amount_cents": b.amount_cents,
+                    "cadence": b.cadence.value if hasattr(b.cadence, "value") else str(b.cadence),
+                    "next_due_date": b.next_due_date,
                     "days_until_due": b.days_until_due,
+                    "auto_pay": bool(b.auto_pay),
                     "is_subscription": b.is_subscription,
                     "is_essential": b.is_essential,
                     "price_hike_dollars": round(b.price_hike_cents / 100.0, 2),
                 }
-                for b in budget.upcoming_bills[:8]
+                for b in budget.upcoming_bills[:12]
+            ],
+            "bill_anomalies": [
+                {
+                    "kind": a.kind,
+                    "bill_id": a.bill_id,
+                    "merchant": sanitize_untrusted_text(a.merchant, 50),
+                    "amount_dollars": round(a.amount_cents / 100.0, 2),
+                    "severity": a.severity,
+                    "auto_pay": bool(a.auto_pay),
+                    "days_overdue": int(a.days_overdue or 0),
+                    "summary": sanitize_untrusted_text(a.summary, 180),
+                }
+                for a in (getattr(budget, "bill_anomalies", None) or [])[:8]
             ],
             "cooling_impulses": [
                 {

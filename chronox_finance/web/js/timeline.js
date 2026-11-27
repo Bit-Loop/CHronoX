@@ -477,8 +477,41 @@ function renderCashflowTimeline(sim) {
   const yFor = (val) => padT + (1 - (val - yMin) / Math.max(1, yMax - yMin)) * plotH;
   const baselineY = padT + plotH;
 
-  const buildPath = (vals) =>
-    vals.map((v, i) => `${i === 0 ? "M" : "L"}${xForIdx(i).toFixed(1)},${yFor(v).toFixed(1)}`).join(" ");
+  const buildPath = (vals) => {
+    if (!vals.length) return "";
+    const coords = vals.map((v, i) => [xForIdx(i), yFor(v)]);
+    if (coords.length <= 2) {
+      return coords.map((c, i) => `${i === 0 ? "M" : "L"}${c[0].toFixed(1)},${c[1].toFixed(1)}`).join(" ");
+    }
+    const n = coords.length;
+    const dx = new Array(n - 1);
+    const slope = new Array(n - 1);
+    for (let i = 0; i < n - 1; i++) {
+      dx[i] = Math.max(0.0001, coords[i + 1][0] - coords[i][0]);
+      slope[i] = (coords[i + 1][1] - coords[i][1]) / dx[i];
+    }
+    const tangents = new Array(n);
+    tangents[0] = slope[0];
+    tangents[n - 1] = slope[n - 2];
+    for (let i = 1; i < n - 1; i++) {
+      if (slope[i - 1] * slope[i] <= 0) {
+        tangents[i] = 0;
+      } else {
+        const common = dx[i - 1] + dx[i];
+        tangents[i] = (3 * common) / ((common + dx[i]) / slope[i - 1] + (common + dx[i - 1]) / slope[i]);
+      }
+    }
+    let d = `M${coords[0][0].toFixed(1)},${coords[0][1].toFixed(1)}`;
+    for (let i = 0; i < n - 1; i++) {
+      const h = dx[i] / 3;
+      const cp1x = coords[i][0] + h;
+      const cp1y = coords[i][1] + tangents[i] * h;
+      const cp2x = coords[i + 1][0] - h;
+      const cp2y = coords[i + 1][1] - tangents[i + 1] * h;
+      d += ` C${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${coords[i + 1][0].toFixed(1)},${coords[i + 1][1].toFixed(1)}`;
+    }
+    return d;
+  };
 
   const baseVals = basePts.map((p) => Number(p.balance_cents || 0));
   const basePathD = buildPath(baseVals);
@@ -596,13 +629,120 @@ function renderCashflowTimeline(sim) {
     fill: "none",
     stroke: "#64748b",
     "stroke-width": "1.7",
+    "stroke-linecap": "round",
+    "stroke-linejoin": "round",
     "stroke-dasharray": "6 4",
   });
   const scenLinePath = svgEl("path", {
     d: scenPathD,
     fill: "none",
     stroke: scenStrokeColor,
-    "stroke-width": "2.4",
+    "stroke-width": "2.6",
+    "stroke-linecap": "round",
+    "stroke-linejoin": "round",
+  });
+
+  // Clickable Event Markers on days with scheduled bills, paydays, or debt payments
+  const dayBreakdownBox = $("timeline-day-breakdown");
+  const renderDayBreakdown = (idx) => {
+    if (!dayBreakdownBox) return;
+    const safeIdx = Math.max(0, Math.min(basePts.length - 1, idx));
+    const p = scenPts[safeIdx] || basePts[safeIdx];
+    const val = liveBalances[safeIdx];
+    const baseVal = baseVals[safeIdx];
+    const cushionMargin = val - floorCents;
+    const evs = Array.isArray(p.events) ? p.events : [];
+
+    const closeBtn = el("button", { type: "button", class: "btn btn-ghost btn-xs", text: "Close" });
+    closeBtn.addEventListener("click", () => {
+      tlState.pinnedDayIdx = null;
+      dayBreakdownBox.classList.add("hidden");
+      dayBreakdownBox.replaceChildren();
+    });
+
+    const eventRows = evs.length
+      ? evs.map((evText) => {
+          const isInflow = /payday|income|deposit|\+/i.test(String(evText));
+          const isBill = /bill|debt|credit|autopay|minimum/i.test(String(evText));
+          const badgeClass = isInflow ? "pill pill-calm" : isBill ? "pill pill-watch" : "pill pill-soft";
+          const badgeText = isInflow ? "Inflow" : isBill ? "Scheduled" : "Event";
+          return el("div", { class: "timeline-event-row" }, [
+            el("span", { class: "row-gap", style: { gap: "8px" } }, [
+              el("span", { class: badgeClass, text: badgeText }),
+              el("span", { text: String(evText) }),
+            ]),
+          ]);
+        })
+      : [
+          el("p", {
+            class: "muted small",
+            text: "No scheduled bills or paydays on this date — only steady daily living pace.",
+          }),
+        ];
+
+    dayBreakdownBox.classList.remove("hidden");
+    dayBreakdownBox.replaceChildren(
+      el("div", { class: "item-row wrap", style: { gap: "8px" } }, [
+        el("div", { class: "row-gap wrap", style: { gap: "8px" } }, [
+          el("strong", { text: fmtDayDate(p.date) }),
+          el("span", {
+            class: `pill ${val < floorCents ? "pill-watch" : "pill-calm"}`,
+            text: `Projected: ${fmtMoney(val)}`,
+          }),
+          el("span", {
+            class: "pill pill-soft",
+            text: `Baseline: ${fmtMoney(baseVal)}`,
+          }),
+          floorCents > 0
+            ? el("span", {
+                class: `pill ${cushionMargin >= 0 ? "pill-soft" : "pill-danger"}`,
+                text: `${cushionMargin >= 0 ? "+" : ""}${fmtMoney(cushionMargin)} vs Cushion`,
+              })
+            : null,
+        ]),
+        closeBtn,
+      ]),
+      el("div", { class: "timeline-day-events" }, eventRows)
+    );
+  };
+
+  const eventDotGroup = svgEl("g");
+  scenPts.forEach((pt, idx) => {
+    const evs = Array.isArray(pt.events) ? pt.events : [];
+    if (!evs.length) return;
+    const hasInflow = evs.some((s) => /payday|income|deposit|\+/i.test(String(s)));
+    const dotColor = hasInflow ? "var(--chart-inc-stroke)" : "var(--chart-exp-stroke)";
+    const dot = svgEl(
+      "circle",
+      {
+        cx: xForIdx(idx).toFixed(1),
+        cy: yFor(liveBalances[idx]).toFixed(1),
+        r: "4.2",
+        fill: dotColor,
+        stroke: "var(--bg)",
+        "stroke-width": "1.4",
+        tabindex: "0",
+        role: "button",
+        "aria-label": `${fmtDayDate(pt.date)}: ${evs.join("; ")} — click for breakdown`,
+        style: "cursor: pointer;",
+      },
+      [svgEl("title", { text: `${fmtDayDate(pt.date)} · ${evs.join(" · ")} (Click for breakdown)` })]
+    );
+    dot.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      tlState.pinnedDayIdx = idx;
+      updateScrub(idx);
+      renderDayBreakdown(idx);
+    });
+    dot.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        tlState.pinnedDayIdx = idx;
+        updateScrub(idx);
+        renderDayBreakdown(idx);
+      }
+    });
+    eventDotGroup.appendChild(dot);
   });
 
   // Crosshair Scrubber
@@ -935,9 +1075,10 @@ function renderCashflowTimeline(sim) {
     {
       viewBox: `0 0 ${W} ${H}`,
       role: "img",
-      "aria-label": "Interactive cashflow and scenario forecast chart with draggable goal markers",
+      style: "cursor: crosshair;",
+      "aria-label": "Interactive cashflow and scenario forecast chart with clickable day breakdown and draggable goal markers",
     },
-    [defs, ...gridNodes, ...floorNodes, scenAreaPath, baseLinePath, scenLinePath, crosshair, activeDot, markerGroup]
+    [defs, ...gridNodes, ...floorNodes, scenAreaPath, baseLinePath, scenLinePath, eventDotGroup, crosshair, activeDot, markerGroup]
   );
 
   // Smooth continuous hover scrub (paused while dragging a goal handle)
@@ -951,8 +1092,28 @@ function renderCashflowTimeline(sim) {
     if (idx !== tlState.scrubIdx) updateScrub(idx);
   });
 
+  // Click anywhere in plot area to inspect exact day-by-day bill/payday breakdown
+  svg.addEventListener("click", (ev) => {
+    if (tlState.drag) return;
+    if (ev.target && ev.target.closest && ev.target.closest(".timeline-goal-marker")) return;
+    const rect = svg.getBoundingClientRect();
+    if (!rect.width) return;
+    const relX = ((ev.clientX - rect.left) / rect.width) * W;
+    const frac = Math.max(0, Math.min(1, (relX - padL) / Math.max(1, plotW)));
+    const idx = Math.round(frac * (basePts.length - 1));
+    tlState.pinnedDayIdx = idx;
+    updateScrub(idx);
+    renderDayBreakdown(idx);
+  });
+
   wrap.replaceChildren(svg);
   updateScrub(initIdx);
+  if (tlState.pinnedDayIdx != null && tlState.pinnedDayIdx < basePts.length) {
+    renderDayBreakdown(tlState.pinnedDayIdx);
+  } else if (dayBreakdownBox) {
+    dayBreakdownBox.classList.add("hidden");
+    dayBreakdownBox.replaceChildren();
+  }
 }
 
 /* ============================================================================

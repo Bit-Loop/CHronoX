@@ -548,36 +548,148 @@ export function renderJars(jars) {
   );
 }
 
+function buildBillInlineEditor(b) {
+  const cadenceOpts = [
+    ["weekly", "Weekly"],
+    ["biweekly", "Biweekly"],
+    ["semimonthly", "Semi-Monthly"],
+    ["monthly", "Monthly"],
+    ["bimonthly", "Every 2 Months"],
+    ["quarterly", "Quarterly"],
+    ["semiannual", "Semi-Annual"],
+    ["annual", "Annual"],
+  ];
+  return el("form", { class: "inline-editor", "data-bill-edit-form": String(b.id) }, [
+    el("div", { class: "form-grid-compact" }, [
+      el("input", {
+        type: "text",
+        name: "name",
+        value: b.name || "",
+        placeholder: "Bill name",
+        required: "true",
+      }),
+      el("input", {
+        type: "number",
+        name: "amount",
+        step: "0.01",
+        min: "0.01",
+        value: ((b.amount_cents || 0) / 100).toFixed(2),
+        placeholder: "Amount ($)",
+        required: "true",
+      }),
+      el(
+        "select",
+        { name: "cadence", "aria-label": "Cadence" },
+        cadenceOpts.map(([val, lbl]) => {
+          const opt = el("option", { value: val, text: lbl });
+          if (String(b.cadence || "monthly") === val) opt.selected = true;
+          return opt;
+        })
+      ),
+      el("input", {
+        type: "date",
+        name: "next_due_date",
+        value: b.next_due_date || "",
+        required: "true",
+      }),
+    ]),
+    el("div", { class: "row-gap wrap details-spacer" }, [
+      el("label", { class: "checkbox-row" }, [
+        el("input", { type: "checkbox", name: "auto_pay", checked: Boolean(b.auto_pay) }),
+        el("span", { text: "Autopay ON" }),
+      ]),
+      el("label", { class: "checkbox-row" }, [
+        el("input", { type: "checkbox", name: "is_essential", checked: b.is_essential !== false }),
+        el("span", { text: "Essential" }),
+      ]),
+      el("button", { type: "submit", class: "btn btn-primary btn-xs", text: "Save Bill" }),
+      el("button", {
+        type: "button",
+        class: "btn btn-ghost btn-xs",
+        text: "Cancel",
+        "data-edit-bill-toggle": "",
+      }),
+    ]),
+  ]);
+}
+
 function renderBillRadar(upcomingBills) {
+  const showAll = Boolean(state.billRadarShowAll);
   const bills14 = upcomingBills.filter((b) => b.days_until_due <= 14);
-  const dueSum = bills14.reduce((acc, b) => acc + (b.amount_cents || 0), 0);
+  const shown = showAll ? upcomingBills : bills14;
+  const dueSum = shown.reduce((acc, b) => acc + (b.amount_cents || 0), 0);
   const pill = $("bills-total-pill");
-  if (pill) pill.textContent = `${fmtMoney(dueSum)} due in 14d`;
+  if (pill) {
+    pill.textContent = showAll ? `${fmtMoney(dueSum)} (${shown.length} bills)` : `${fmtMoney(dueSum)} due in 14d`;
+  }
+
+  const btn14 = $("btn-bills-scope-14d");
+  const btnAll = $("btn-bills-scope-all");
+  if (btn14) {
+    btn14.classList.toggle("active", !showAll);
+    btn14.setAttribute("aria-pressed", String(!showAll));
+  }
+  if (btnAll) {
+    btnAll.classList.toggle("active", showAll);
+    btnAll.setAttribute("aria-pressed", String(showAll));
+  }
+
+  const quickForm = $("overview-bill-quick-form");
+  if (quickForm) {
+    quickForm.classList.toggle("hidden", !state.billQuickAddOpen);
+  }
 
   const radar = $("bill-radar-list");
   if (!radar) return;
-  if (!bills14.length) {
+  if (!shown.length) {
     radar.replaceChildren(
       renderEmptyState({
         icon: "calendar",
-        title: "No bills due in the next 14 days",
-        subtitle: "Add recurring bills in Activity or import statements so ChronoX reserves them automatically.",
-        actionLabel: "Manage Bills",
-        onAction: () => switchTab("activity"),
+        title: showAll ? "No recurring bills tracked yet" : "No bills due in the next 14 days",
+        subtitle: "Click + Add Bill above or switch to All to edit recurring bills and autopay settings.",
+        actionLabel: showAll ? "+ Add Bill" : "Show All Bills",
+        onAction: () => {
+          if (showAll) {
+            state.billQuickAddOpen = true;
+            if (state.dashboard) renderBillRadar(state.dashboard.upcoming_bills || []);
+          } else {
+            state.billRadarShowAll = true;
+            if (state.dashboard) renderBillRadar(state.dashboard.upcoming_bills || []);
+          }
+        },
         compact: true,
       })
     );
     return;
   }
   radar.replaceChildren(
-    ...bills14.map((b) => {
+    ...shown.map((b) => {
+      const isEditing = state.editingBillId === b.id;
       const dueLabel =
-        b.days_until_due <= 0 ? "Due today" : `In ${b.days_until_due}d (${fmtShortDate(b.next_due_date)})`;
+        b.days_until_due < 0
+          ? `${Math.abs(b.days_until_due)}d overdue (${fmtShortDate(b.next_due_date)})`
+          : b.days_until_due === 0
+          ? "Due today"
+          : `In ${b.days_until_due}d (${fmtShortDate(b.next_due_date)})`;
       const rangeStr =
-        b.amount_min_cents != null && b.amount_max_cents != null
+        b.amount_min_cents != null && b.amount_max_cents != null && b.amount_min_cents !== b.amount_max_cents
           ? ` (${fmtMoney(b.amount_min_cents)}-${fmtMoney(b.amount_max_cents)})`
           : "";
-      const pills = [el("span", { class: "pill pill-soft", text: dueLabel })];
+      const pills = [
+        el("span", {
+          class: `pill ${b.days_until_due < 0 ? "pill-danger" : "pill-soft"}`,
+          text: dueLabel,
+        }),
+        el("span", { class: "pill pill-soft", text: String(b.cadence || "monthly") }),
+        el("button", {
+          type: "button",
+          class: `bill-autopay-pill${b.auto_pay ? " is-on" : ""}`,
+          text: b.auto_pay ? "Autopay ON" : "Manual Pay",
+          title: b.auto_pay ? "Click to switch to Manual Pay" : "Click to turn Autopay ON",
+          "data-toggle-bill-autopay": String(b.id),
+          "data-autopay-next": String(!b.auto_pay),
+        }),
+      ];
       if (b.price_hike_cents > 0) {
         pills.push(el("span", { class: "pill pill-watch", text: `+${fmtMoney(b.price_hike_cents)} hike` }));
       }
@@ -586,7 +698,31 @@ function renderBillRadar(upcomingBills) {
           el("strong", { text: b.name }),
           el("strong", { class: "num", text: `${fmtMoney(b.amount_cents)}${rangeStr}` }),
         ]),
-        el("div", { class: "item-row" }, pills),
+        el("div", { class: "item-row wrap", style: { gap: "6px" } }, [
+          el("div", { class: "row-gap wrap", style: { gap: "5px" } }, pills),
+          el("div", { class: "row-gap", style: { gap: "4px" } }, [
+            el("button", {
+              type: "button",
+              class: "btn btn-ghost btn-xs",
+              text: "Paid",
+              title: "Mark current cycle paid and advance due date",
+              "data-mark-bill-paid": String(b.id),
+            }),
+            el("button", {
+              type: "button",
+              class: "btn btn-ghost btn-xs",
+              text: isEditing ? "Close" : "Edit",
+              "data-edit-bill-toggle": String(b.id),
+            }),
+            el("button", {
+              type: "button",
+              class: "btn btn-ghost btn-xs",
+              text: "Remove",
+              "data-archive-bill": String(b.id),
+            }),
+          ]),
+        ]),
+        isEditing ? buildBillInlineEditor(b) : null,
       ]);
     })
   );
@@ -870,6 +1006,16 @@ export function renderAccounts(accounts) {
               text: "Adjust",
               "data-reconcile-toggle": String(a.id),
             }),
+            !a.connection_id
+              ? el("button", {
+                  type: "button",
+                  class: "btn btn-ghost btn-xs",
+                  text: "Remove",
+                  title: `Remove unused local account ${a.name}`,
+                  "data-remove-account": String(a.id),
+                  "data-account-name": String(a.name || ""),
+                })
+              : null,
           ]),
         ]),
         reconcileForm,
@@ -878,21 +1024,75 @@ export function renderAccounts(accounts) {
   );
 }
 
+function buildBillAnomalyCard(a) {
+  const kindMap = {
+    missed_bill: "Missed Bill",
+    double_charge: "Double Charge",
+    price_hike: "Price Hike",
+  };
+  const pillClass =
+    a.kind === "missed_bill"
+      ? a.severity === "high"
+        ? "pill pill-danger"
+        : "pill pill-watch"
+      : a.kind === "double_charge"
+      ? "pill pill-watch"
+      : "pill pill-soft";
+  const actions = [];
+  if (a.bill_id != null && a.kind === "missed_bill") {
+    actions.push(
+      el("button", {
+        type: "button",
+        class: "btn btn-soft btn-xs",
+        text: "Mark Paid",
+        "data-mark-bill-paid": String(a.bill_id),
+      }),
+      el("button", {
+        type: "button",
+        class: "btn btn-ghost btn-xs",
+        text: "Remove Bill",
+        "data-archive-bill": String(a.bill_id),
+      })
+    );
+  }
+  return el(
+    "div",
+    { class: `bill-anomaly-card${a.severity === "high" ? " severity-high" : ""}` },
+    [
+      el("div", { class: "item-row wrap", style: { gap: "6px" } }, [
+        el("div", { class: "row-gap wrap", style: { gap: "6px" } }, [
+          makeIcon("alert", "ui-icon-sm"),
+          el("span", { class: pillClass, text: kindMap[a.kind] || "Bill Alert" }),
+          el("strong", { text: a.merchant || "Bill" }),
+          a.days_overdue > 0 ? el("span", { class: "muted small", text: `${a.days_overdue}d ago` }) : null,
+        ]),
+        el("strong", { class: "num", text: fmtMoney(a.amount_cents || 0) }),
+      ]),
+      el("div", { class: "small muted", text: a.summary }),
+      actions.length ? el("div", { class: "row-gap wrap", style: { gap: "6px" } }, actions) : null,
+    ]
+  );
+}
+
 function renderBillAnomalies(anomalies) {
+  const items = Array.isArray(anomalies) ? anomalies : [];
+  const overviewBox = $("bill-anomalies-overview");
+  if (overviewBox) {
+    const missedOrDup = items.filter((a) => a.kind === "missed_bill" || a.kind === "double_charge");
+    overviewBox.classList.toggle("hidden", !missedOrDup.length);
+    if (missedOrDup.length) {
+      overviewBox.replaceChildren(...missedOrDup.map(buildBillAnomalyCard));
+    } else {
+      overviewBox.replaceChildren();
+    }
+  }
   const box = $("bill-anomalies-list");
   if (!box) return;
-  if (!anomalies.length) {
+  if (!items.length) {
     box.replaceChildren();
     return;
   }
-  box.replaceChildren(
-    ...anomalies.map((a) =>
-      el("div", { class: "notice-bar notice-warn" }, [
-        makeIcon("alert", "ui-icon-sm"),
-        el("span", { text: a.summary }),
-      ])
-    )
-  );
+  box.replaceChildren(...items.map(buildBillAnomalyCard));
 }
 
 function renderAllBills(bills) {
@@ -906,9 +1106,15 @@ function renderAllBills(bills) {
   }
   box.replaceChildren(
     ...bills.map((b) => {
-      const dueStr = b.days_until_due <= 0 ? "Due today" : `Due in ${b.days_until_due}d (${b.next_due_date})`;
+      const isEditing = state.editingBillId === b.id;
+      const dueStr =
+        b.days_until_due < 0
+          ? `${Math.abs(b.days_until_due)}d overdue (${b.next_due_date})`
+          : b.days_until_due === 0
+          ? "Due today"
+          : `Due in ${b.days_until_due}d (${b.next_due_date})`;
       const rangeStr =
-        b.amount_min_cents != null && b.amount_max_cents != null
+        b.amount_min_cents != null && b.amount_max_cents != null && b.amount_min_cents !== b.amount_max_cents
           ? ` · range ${fmtMoney(b.amount_min_cents)}-${fmtMoney(b.amount_max_cents)}`
           : "";
       const winStr = b.due_window_days ? ` · +/-${b.due_window_days}d` : "";
@@ -920,12 +1126,31 @@ function renderAllBills(bills) {
           ]),
           el("strong", { class: "num", text: fmtMoney(b.amount_cents) }),
         ]),
-        el("div", { class: "item-row" }, [
-          el("div", { class: "row-gap wrap" }, [
+        el("div", { class: "item-row wrap", style: { gap: "6px" } }, [
+          el("div", { class: "row-gap wrap", style: { gap: "5px" } }, [
+            el("button", {
+              type: "button",
+              class: `bill-autopay-pill${b.auto_pay ? " is-on" : ""}`,
+              text: b.auto_pay ? "Autopay ON" : "Manual Pay",
+              "data-toggle-bill-autopay": String(b.id),
+              "data-autopay-next": String(!b.auto_pay),
+            }),
             b.price_hike_cents > 0 ? el("span", { class: "pill pill-watch", text: `+${fmtMoney(b.price_hike_cents)} hike` }) : null,
             b.flagged_zombie ? el("span", { class: "pill pill-rebalance", text: "Flagged" }) : null,
           ]),
-          el("div", { class: "row-gap" }, [
+          el("div", { class: "row-gap wrap", style: { gap: "4px" } }, [
+            el("button", {
+              type: "button",
+              class: "btn btn-ghost btn-xs",
+              text: "Paid",
+              "data-mark-bill-paid": String(b.id),
+            }),
+            el("button", {
+              type: "button",
+              class: "btn btn-ghost btn-xs",
+              text: isEditing ? "Close" : "Edit",
+              "data-edit-bill-toggle": String(b.id),
+            }),
             el("button", {
               type: "button",
               class: "btn btn-ghost btn-xs",
@@ -936,11 +1161,12 @@ function renderAllBills(bills) {
             el("button", {
               type: "button",
               class: "btn btn-ghost btn-xs",
-              text: "Archive",
+              text: "Remove",
               "data-archive-bill": String(b.id),
             }),
           ]),
         ]),
+        isEditing ? buildBillInlineEditor(b) : null,
       ]);
     })
   );
@@ -3644,6 +3870,58 @@ export function initVaultAndShell() {
       return;
     }
 
+    const billEditForm = e.target.closest("form[data-bill-edit-form]");
+    if (billEditForm) {
+      e.preventDefault();
+      const billId = Number(billEditForm.dataset.billEditForm);
+      try {
+        const payload = {
+          name: billEditForm.elements.name.value.trim(),
+          amount_cents: dollarsToCents(billEditForm.elements.amount.value),
+          cadence: billEditForm.elements.cadence.value,
+          next_due_date: billEditForm.elements.next_due_date.value,
+          auto_pay: Boolean(billEditForm.elements.auto_pay.checked),
+          is_essential: Boolean(billEditForm.elements.is_essential.checked),
+        };
+        await api(`/api/v1/bills/${billId}`, { method: "PATCH", body: JSON.stringify(payload) });
+        state.editingBillId = null;
+        toast("Recurring bill updated.");
+        await refreshAll();
+      } catch (err) {
+        toast(err.message, true);
+      }
+      return;
+    }
+
+    if (e.target && e.target.id === "overview-bill-quick-form") {
+      e.preventDefault();
+      const nameEl = $("ov-bill-name");
+      const amtEl = $("ov-bill-amount");
+      const cadEl = $("ov-bill-cadence");
+      const dueEl = $("ov-bill-due");
+      const apEl = $("ov-bill-autopay");
+      const essEl = $("ov-bill-essential");
+      try {
+        const payload = {
+          name: nameEl ? nameEl.value.trim() : "",
+          amount_cents: dollarsToCents(amtEl ? amtEl.value : ""),
+          cadence: cadEl ? cadEl.value : "monthly",
+          next_due_date: dueEl ? dueEl.value : "",
+          auto_pay: Boolean(apEl && apEl.checked),
+          is_essential: Boolean(essEl && essEl.checked),
+        };
+        await api("/api/v1/bills", { method: "POST", body: JSON.stringify(payload) });
+        if (nameEl) nameEl.value = "";
+        if (amtEl) amtEl.value = "";
+        state.billQuickAddOpen = false;
+        toast(`Added recurring bill "${payload.name}".`);
+        await refreshAll();
+      } catch (err) {
+        toast(err.message, true);
+      }
+      return;
+    }
+
     const txEditForm = e.target.closest("form[data-tx-edit-form]");
     if (txEditForm) {
       e.preventDefault();
@@ -3678,6 +3956,82 @@ export function initVaultAndShell() {
       const nextId = btn.dataset.editJarToggle ? Number(btn.dataset.editJarToggle) : null;
       state.editingJarId = state.editingJarId === nextId ? null : nextId;
       if (state.dashboard) renderJars(state.dashboard.jars);
+      return;
+    }
+    if (btn.id === "btn-bills-scope-14d") {
+      state.billRadarShowAll = false;
+      if (state.dashboard) renderBillRadar(state.dashboard.upcoming_bills || []);
+      return;
+    }
+    if (btn.id === "btn-bills-scope-all") {
+      state.billRadarShowAll = true;
+      if (state.dashboard) renderBillRadar(state.dashboard.upcoming_bills || []);
+      return;
+    }
+    if (btn.id === "btn-overview-add-bill") {
+      state.billQuickAddOpen = !state.billQuickAddOpen;
+      const dueEl = $("ov-bill-due");
+      if (dueEl && !dueEl.value) {
+        const d = new Date();
+        d.setDate(d.getDate() + 14);
+        dueEl.value = d.toISOString().slice(0, 10);
+      }
+      if (state.dashboard) renderBillRadar(state.dashboard.upcoming_bills || []);
+      return;
+    }
+    if (btn.id === "btn-overview-add-bill-cancel") {
+      state.billQuickAddOpen = false;
+      if (state.dashboard) renderBillRadar(state.dashboard.upcoming_bills || []);
+      return;
+    }
+    if (btn.dataset.editBillToggle !== undefined) {
+      const nextId = btn.dataset.editBillToggle ? Number(btn.dataset.editBillToggle) : null;
+      state.editingBillId = state.editingBillId === nextId ? null : nextId;
+      if (state.dashboard) {
+        renderBillRadar(state.dashboard.upcoming_bills || []);
+        renderAllBills(state.dashboard.upcoming_bills || []);
+      }
+      return;
+    }
+    if (btn.dataset.toggleBillAutopay) {
+      await withBusy(btn, async () => {
+        try {
+          const nextAuto = btn.dataset.autopayNext === "true";
+          await api(`/api/v1/bills/${btn.dataset.toggleBillAutopay}`, {
+            method: "PATCH",
+            body: JSON.stringify({ auto_pay: nextAuto }),
+          });
+          toast(`Autopay turned ${nextAuto ? "ON" : "OFF"}.`);
+          await refreshAll();
+        } catch (err) {
+          toast(err.message, true);
+        }
+      });
+      return;
+    }
+    if (btn.dataset.markBillPaid) {
+      await withBusy(btn, async () => {
+        try {
+          const updated = await api(`/api/v1/bills/${btn.dataset.markBillPaid}/mark-paid`, { method: "POST" });
+          toast(`Marked "${updated.name}" paid · next due ${updated.next_due_date}.`);
+          await refreshAll();
+        } catch (err) {
+          toast(err.message, true);
+        }
+      });
+      return;
+    }
+    if (btn.dataset.removeAccount) {
+      await withBusy(btn, async () => {
+        try {
+          const name = btn.dataset.accountName || `Account #${btn.dataset.removeAccount}`;
+          await api(`/api/v1/accounts/${btn.dataset.removeAccount}`, { method: "DELETE" });
+          toast(`Removed account "${name}".`);
+          await refreshAll();
+        } catch (err) {
+          toast(err.message, true);
+        }
+      });
       return;
     }
     if (btn.dataset.reconcileToggle !== undefined) {

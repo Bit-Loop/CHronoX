@@ -223,20 +223,138 @@ function renderAnalyticsOverview(data) {
   renderCategoryBreakdown(data);
 }
 
+function buildMonotoneSplinePath(coords) {
+  // Fritsch-Carlson monotone cubic Hermite interpolation (smooth Apple Stocks curves, zero overshoot)
+  if (!coords || !coords.length) return "";
+  if (coords.length === 1) return `M${coords[0][0].toFixed(1)},${coords[0][1].toFixed(1)}`;
+  if (coords.length === 2) {
+    return `M${coords[0][0].toFixed(1)},${coords[0][1].toFixed(1)} L${coords[1][0].toFixed(1)},${coords[1][1].toFixed(1)}`;
+  }
+  const n = coords.length;
+  const dx = new Array(n - 1);
+  const dy = new Array(n - 1);
+  const slope = new Array(n - 1);
+  for (let i = 0; i < n - 1; i++) {
+    dx[i] = Math.max(0.0001, coords[i + 1][0] - coords[i][0]);
+    dy[i] = coords[i + 1][1] - coords[i][1];
+    slope[i] = dy[i] / dx[i];
+  }
+  const tangents = new Array(n);
+  tangents[0] = slope[0];
+  tangents[n - 1] = slope[n - 2];
+  for (let i = 1; i < n - 1; i++) {
+    if (slope[i - 1] * slope[i] <= 0) {
+      tangents[i] = 0;
+    } else {
+      const common = dx[i - 1] + dx[i];
+      tangents[i] = (3 * common) / ((common + dx[i]) / slope[i - 1] + (common + dx[i - 1]) / slope[i]);
+    }
+  }
+  let d = `M${coords[0][0].toFixed(1)},${coords[0][1].toFixed(1)}`;
+  for (let i = 0; i < n - 1; i++) {
+    const h = dx[i] / 3;
+    const cp1x = coords[i][0] + h;
+    const cp1y = coords[i][1] + tangents[i] * h;
+    const cp2x = coords[i + 1][0] - h;
+    const cp2y = coords[i + 1][1] - tangents[i + 1] * h;
+    d += ` C${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${coords[i + 1][0].toFixed(1)},${coords[i + 1][1].toFixed(1)}`;
+  }
+  return d;
+}
+
 function selectBreakdownCategory(label, { scroll = false } = {}) {
-  if (!label || !chartState.data) return;
+  if (!label || !chartState.data) return false;
   const breakdown = Array.isArray(chartState.data.category_breakdown)
     ? chartState.data.category_breakdown
     : [];
-  const exact = breakdown.find((it) => it.label === label);
-  if (!exact) return;
+  const low = String(label).trim().toLowerCase();
+  const exact = breakdown.find((it) => String(it.label || "").trim().toLowerCase() === low);
+  if (!exact) return false;
   chartState.selectedCategoryLabel =
-    chartState.selectedCategoryLabel === label ? null : label;
+    chartState.selectedCategoryLabel === exact.label ? null : exact.label;
+  const sankeyDrill = $("analytics-sankey-drilldown");
+  if (sankeyDrill) {
+    sankeyDrill.classList.add("hidden");
+    sankeyDrill.replaceChildren();
+  }
   renderCategoryBreakdown(chartState.data);
+  renderExpenseDonut(chartState.data);
   if (scroll && chartState.selectedCategoryLabel) {
     const card = $("analytics-breakdown-card");
     if (card) card.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "nearest" });
   }
+  return true;
+}
+
+function openSankeyNodeDrilldown(node, links, nodeMap, pctDenomLabel) {
+  const host = $("analytics-sankey-drilldown");
+  if (!host || !node) return;
+  const related = links.filter((l) => l.source === node.id || l.target === node.id);
+  const roleLabel =
+    node.col === 0 ? "Inflow Source" : node.col === 1 ? "Cash Flow Hub" : "Outflow / Allocation";
+
+  const closeBtn = el("button", { type: "button", class: "btn btn-ghost btn-xs", text: "Close" });
+  closeBtn.addEventListener("click", () => {
+    host.classList.add("hidden");
+    host.replaceChildren();
+  });
+
+  const activityBtn = el("button", {
+    type: "button",
+    class: "btn btn-soft btn-xs",
+    text: "Inspect in Activity ->",
+  });
+  activityBtn.addEventListener("click", () => switchTab("activity"));
+
+  const flowRows = related.slice(0, 8).map((lnk) => {
+    const src = nodeMap.get(lnk.source);
+    const tgt = nodeMap.get(lnk.target);
+    const other = lnk.source === node.id ? tgt : src;
+    const arrow = lnk.source === node.id ? "to" : "from";
+    const rowBtn = el("button", {
+      type: "button",
+      class: "timeline-event-row",
+      style: { width: "100%", textAlign: "left", cursor: "pointer", color: "var(--text)" },
+    }, [
+      el("span", { class: "row-gap", style: { gap: "8px" } }, [
+        el("span", { class: "legend-swatch", style: { backgroundColor: (other && other.color) || node.color } }),
+        el("span", { text: `${arrow === "to" ? "Flow to" : "Flow from"} ${(other && other.label) || "Ledger"}` }),
+      ]),
+      el("strong", {
+        class: "tabular-nums",
+        text: `${fmtMoney(lnk.value_cents)} (${Number(lnk.pct_of_income || 0).toFixed(1)}%)`,
+      }),
+    ]);
+    rowBtn.addEventListener("click", () => {
+      if (other && other.col === 2) {
+        if (!selectBreakdownCategory(other.label, { scroll: true })) {
+          openSankeyNodeDrilldown(other, links, nodeMap, pctDenomLabel);
+        }
+      } else if (other) {
+        openSankeyNodeDrilldown(other, links, nodeMap, pctDenomLabel);
+      }
+    });
+    return rowBtn;
+  });
+
+  host.classList.remove("hidden");
+  host.replaceChildren(
+    el("div", { class: "item-row wrap", style: { gap: "8px" } }, [
+      el("div", { class: "row-gap wrap", style: { gap: "8px" } }, [
+        el("span", { class: "legend-swatch", style: { backgroundColor: node.color } }),
+        el("strong", { text: node.label }),
+        el("span", { class: "pill pill-soft", text: roleLabel }),
+        el("strong", {
+          class: "tabular-nums",
+          text: `${fmtMoney(node.amount_cents)} (${Number(node.pct_of_income || 0).toFixed(1)}% ${pctDenomLabel})`,
+        }),
+      ]),
+      el("div", { class: "row-gap", style: { gap: "6px" } }, [activityBtn, closeBtn]),
+    ]),
+    flowRows.length
+      ? el("div", { class: "timeline-day-events" }, flowRows)
+      : el("p", { class: "muted small", text: "No sub-flows recorded for this node in the selected range." })
+  );
 }
 
 /* ============================================================================
@@ -724,16 +842,17 @@ function renderCashflowSankey(data) {
         y: n.y.toFixed(1),
         width: n.w,
         height: n.h.toFixed(1),
-        rx: "0",
+        rx: "5",
+        ry: "5",
         fill: n.color,
         stroke: "var(--bg)",
-        "stroke-width": "1",
+        "stroke-width": "1.2",
         tabindex: "0",
         role: "graphics-symbol",
-        "aria-label": `${n.label}: ${fmtMoney(n.amount_cents)} (${pctStr})`,
-        style: "cursor: pointer; transition: opacity 120ms ease;",
+        "aria-label": `${n.label}: ${fmtMoney(n.amount_cents)} (${pctStr}) — click to inspect breakdown`,
+        style: "cursor: pointer; transition: opacity 140ms ease;",
       },
-      [svgEl("title", { text: `${n.label}: ${fmtMoney(n.amount_cents)} (${pctStr})` })]
+      [svgEl("title", { text: `${n.label}: ${fmtMoney(n.amount_cents)} (${pctStr}) · Click to inspect` })]
     );
     nodeGroup.appendChild(rect);
     nodeElMap.set(n.id, rect);
@@ -878,14 +997,36 @@ function renderCashflowSankey(data) {
     }
   };
 
+  const activateSankeyNode = (node) => {
+    if (!node) return;
+    if (node.col === 2 && selectBreakdownCategory(node.label, { scroll: true })) {
+      return;
+    }
+    openSankeyNodeDrilldown(node, links, nodeMap, pctDenomLabel);
+  };
+
   for (const p of linkEls) {
     p.addEventListener("pointerenter", () => isolateLink(p));
     p.addEventListener("focus", () => isolateLink(p));
     p.addEventListener("pointerleave", resetIsolation);
     p.addEventListener("blur", resetIsolation);
-    p.addEventListener("click", () => {
+    const onLinkActivate = () => {
       const tgt = nodeMap.get(p._sankeyMeta.target);
-      if (tgt && tgt.col === 2) selectBreakdownCategory(tgt.label, { scroll: true });
+      const src = nodeMap.get(p._sankeyMeta.source);
+      if (tgt && tgt.col === 2) {
+        activateSankeyNode(tgt);
+      } else if (src && src.col === 0) {
+        activateSankeyNode(src);
+      } else {
+        activateSankeyNode(tgt || src);
+      }
+    };
+    p.addEventListener("click", onLinkActivate);
+    p.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        onLinkActivate();
+      }
     });
   }
 
@@ -894,9 +1035,12 @@ function renderCashflowSankey(data) {
     r.addEventListener("focus", () => isolateNode(id));
     r.addEventListener("pointerleave", resetIsolation);
     r.addEventListener("blur", resetIsolation);
-    r.addEventListener("click", () => {
-      const n = nodeMap.get(id);
-      if (n && n.col === 2) selectBreakdownCategory(n.label, { scroll: true });
+    r.addEventListener("click", () => activateSankeyNode(nodeMap.get(id)));
+    r.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        activateSankeyNode(nodeMap.get(id));
+      }
     });
   }
 
@@ -911,29 +1055,39 @@ function renderCashflowSankey(data) {
     [defs, svgEl("g", {}, linkEls), nodeGroup, labelGroup]
   );
 
-  // Mobile Stacked Flow Layout (guaranteed >= 12-13px readable typography on phone screens)
+  // Mobile Stacked Flow Layout (guaranteed >= 12-13px readable typography on phone screens, clickable)
   const makeMobileGroup = (heading, nodes) =>
     el("div", { class: "sankey-mobile-group" }, [
       el("span", { class: "eyebrow", text: heading }),
       ...nodes.map((n) => {
         const pct = Math.max(2, Math.min(100, Number(n.pct_of_income || 0)));
         const barColor = n.color || COLOR_INCOME;
-        return el("div", { class: "sankey-mobile-row", style: { borderLeftColor: barColor } }, [
-          el("div", { class: "item-row" }, [
-            el("strong", { text: n.label }),
-            el("span", {
-              class: "tabular-nums",
-              style: { fontWeight: "700" },
-              text: `${fmtMoney(n.amount_cents)} (${Number(n.pct_of_income || 0).toFixed(1)}%)`,
-            }),
-          ]),
-          el("div", { class: "progress-track", style: { height: "5px" } }, [
-            el("div", {
-              class: "progress-fill",
-              style: { width: `${pct.toFixed(1)}%`, backgroundColor: barColor },
-            }),
-          ]),
-        ]);
+        const row = el(
+          "button",
+          {
+            type: "button",
+            class: "sankey-mobile-row",
+            style: { borderLeftColor: barColor, width: "100%", textAlign: "left", color: "var(--text)" },
+          },
+          [
+            el("div", { class: "item-row" }, [
+              el("strong", { text: n.label }),
+              el("span", {
+                class: "tabular-nums",
+                style: { fontWeight: "700" },
+                text: `${fmtMoney(n.amount_cents)} (${Number(n.pct_of_income || 0).toFixed(1)}%)`,
+              }),
+            ]),
+            el("div", { class: "progress-track", style: { height: "5px" } }, [
+              el("div", {
+                class: "progress-fill",
+                style: { width: `${pct.toFixed(1)}%`, backgroundColor: barColor },
+              }),
+            ]),
+          ]
+        );
+        row.addEventListener("click", () => activateSankeyNode(n));
+        return row;
       }),
     ]);
 
@@ -1092,23 +1246,32 @@ function renderExpenseDonut(data) {
 
     const color = it.color || EXPENSE_PALETTE[idx % EXPENSE_PALETTE.length];
     const pctVal = Number(it.pct_of_expenses || (val / Math.max(1, totalSpend)) * 100);
+    const isSelected = chartState.selectedCategoryLabel === it.label;
     const path = svgEl(
       "path",
       {
-        d: buildRingSegmentPath(cx, cy, rInner, rOuter, startDeg, Math.max(startDeg + 0.8, endDeg)),
+        d: buildRingSegmentPath(cx, cy, rInner, isSelected ? rOuterHover : rOuter, startDeg, Math.max(startDeg + 0.8, endDeg)),
         fill: color,
+        stroke: isSelected ? "var(--text)" : "var(--bg)",
+        "stroke-width": isSelected ? "1.6" : "0.8",
         tabindex: "0",
         role: "graphics-symbol",
-        "aria-label": `${it.label}: ${fmtMoney(val)} (${pctVal.toFixed(1)}%)`,
-        style: "cursor: pointer; transition: fill-opacity 120ms ease;",
+        "aria-label": `${it.label}: ${fmtMoney(val)} (${pctVal.toFixed(1)}%) — click to inspect transactions`,
+        style: "cursor: pointer; transition: fill-opacity 140ms ease;",
       },
-      [svgEl("title", { text: `${it.label}: ${fmtMoney(val)} (${pctVal.toFixed(1)}%)` })]
+      [svgEl("title", { text: `${it.label}: ${fmtMoney(val)} (${pctVal.toFixed(1)}%) · Click to drill down` })]
     );
     path.addEventListener("pointerenter", () => highlightIdx(idx));
     path.addEventListener("focus", () => highlightIdx(idx));
     path.addEventListener("pointerleave", () => highlightIdx(null));
     path.addEventListener("blur", () => highlightIdx(null));
     path.addEventListener("click", () => selectBreakdownCategory(it.label, { scroll: true }));
+    path.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        selectBreakdownCategory(it.label, { scroll: true });
+      }
+    });
 
     segPaths.push({ path, startDeg, endDeg: Math.max(startDeg + 0.8, endDeg), idx });
 
@@ -1116,7 +1279,7 @@ function renderExpenseDonut(data) {
       "button",
       {
         type: "button",
-        class: "donut-legend-item",
+        class: `donut-legend-item${isSelected ? " is-selected" : ""}`,
         style: { cursor: "pointer", textAlign: "left", color: "var(--text)", width: "100%" },
       },
       [
@@ -1220,10 +1383,30 @@ function renderTrendChart(data) {
   const yFor = (val) => padT + (1 - (val - yMin) / Math.max(1, yMax - yMin)) * plotH;
   const zeroY = yFor(0);
 
+  const filterBar = $("analytics-trend-filter-bar");
+  if (filterBar) {
+    if (chartState.month) {
+      const clearBtn = el("button", {
+        type: "button",
+        class: "pill pill-blue",
+        style: { cursor: "pointer" },
+        text: `Viewing ${fmtMonthShort(chartState.month)} · Clear x`,
+      });
+      clearBtn.addEventListener("click", () => loadAnalyticsOverview({ month: null }));
+      filterBar.replaceChildren(clearBtn);
+    } else {
+      filterBar.replaceChildren();
+    }
+  }
+
   const defs = svgEl("defs", {}, [
     svgEl("linearGradient", { id: "trendSurplusGrad", x1: "0", y1: "0", x2: "0", y2: "1" }, [
-      svgEl("stop", { offset: "0%", "stop-color": COLOR_INCOME, "stop-opacity": "0.32" }),
-      svgEl("stop", { offset: "100%", "stop-color": COLOR_INCOME, "stop-opacity": "0.02" }),
+      svgEl("stop", { offset: "0%", "stop-color": COLOR_SAVINGS, "stop-opacity": "0.24" }),
+      svgEl("stop", { offset: "100%", "stop-color": COLOR_SAVINGS, "stop-opacity": "0.01" }),
+    ]),
+    svgEl("linearGradient", { id: "trendIncomeGrad", x1: "0", y1: "0", x2: "0", y2: "1" }, [
+      svgEl("stop", { offset: "0%", "stop-color": COLOR_INCOME, "stop-opacity": "0.18" }),
+      svgEl("stop", { offset: "100%", "stop-color": COLOR_INCOME, "stop-opacity": "0.01" }),
     ]),
   ]);
 
@@ -1309,10 +1492,10 @@ function renderTrendChart(data) {
     );
   }
 
-  // Build series paths (distinct line dash patterns + point marker shapes for non-color-only meaning)
+  // Build smooth 1st-party iOS monotone cubic series paths + subtle area fills
   const seriesNodes = [];
   const makeLinePath = (key) =>
-    pts.map((p, i) => `${i === 0 ? "M" : "L"}${xFor(i).toFixed(1)},${yFor(Number(p[key] || 0)).toFixed(1)}`).join(" ");
+    buildMonotoneSplinePath(pts.map((p, i) => [xFor(i), yFor(Number(p[key] || 0))]));
 
   if (showSur && pts.length > 0) {
     const surLine = makeLinePath("surplus_cents");
@@ -1323,37 +1506,49 @@ function renderTrendChart(data) {
         d: surLine,
         fill: "none",
         stroke: COLOR_SAVINGS,
-        "stroke-width": "1.8",
-        "stroke-dasharray": "2.5 2.5",
+        "stroke-width": "2.0",
+        "stroke-linecap": "round",
+        "stroke-linejoin": "round",
+        "stroke-dasharray": "3 3",
       })
     );
     pts.forEach((p, i) => {
       const cx = xFor(i);
       const cy = yFor(Number(p.surplus_cents || 0));
-      const r = selectedIdx === i ? 4.2 : 2.8;
+      const r = selectedIdx === i ? 4.4 : 2.9;
       seriesNodes.push(
         svgEl("polygon", {
           points: `${cx.toFixed(1)},${(cy - r).toFixed(1)} ${(cx + r).toFixed(1)},${cy.toFixed(1)} ${cx.toFixed(1)},${(cy + r).toFixed(1)} ${(cx - r).toFixed(1)},${cy.toFixed(1)}`,
           fill: COLOR_SAVINGS,
           stroke: "var(--bg)",
-          "stroke-width": "1",
+          "stroke-width": "1.2",
         })
       );
     });
   }
   if (showInc) {
+    const incLine = makeLinePath("income_cents");
+    const incAreaD = `${incLine} L${xFor(pts.length - 1).toFixed(1)},${zeroY.toFixed(1)} L${xFor(0).toFixed(1)},${zeroY.toFixed(1)} Z`;
+    seriesNodes.push(svgEl("path", { d: incAreaD, fill: "url(#trendIncomeGrad)" }));
     seriesNodes.push(
-      svgEl("path", { d: makeLinePath("income_cents"), fill: "none", stroke: COLOR_INCOME, "stroke-width": "2.3" })
+      svgEl("path", {
+        d: incLine,
+        fill: "none",
+        stroke: COLOR_INCOME,
+        "stroke-width": "2.6",
+        "stroke-linecap": "round",
+        "stroke-linejoin": "round",
+      })
     );
     pts.forEach((p, i) => {
       seriesNodes.push(
         svgEl("circle", {
           cx: xFor(i).toFixed(1),
           cy: yFor(Number(p.income_cents || 0)).toFixed(1),
-          r: selectedIdx === i ? "4.5" : "2.8",
+          r: selectedIdx === i ? "4.8" : "3.0",
           fill: COLOR_INCOME,
           stroke: "var(--bg)",
-          "stroke-width": "1",
+          "stroke-width": "1.2",
         })
       );
     });
@@ -1364,21 +1559,25 @@ function renderTrendChart(data) {
         d: makeLinePath("expense_cents"),
         fill: "none",
         stroke: COLOR_EXPENSE,
-        "stroke-width": "2.2",
+        "stroke-width": "2.4",
+        "stroke-linecap": "round",
+        "stroke-linejoin": "round",
         "stroke-dasharray": "7 3",
       })
     );
     pts.forEach((p, i) => {
-      const sz = selectedIdx === i ? 7.6 : 5.2;
+      const sz = selectedIdx === i ? 7.8 : 5.4;
       seriesNodes.push(
         svgEl("rect", {
           x: (xFor(i) - sz / 2).toFixed(1),
           y: (yFor(Number(p.expense_cents || 0)) - sz / 2).toFixed(1),
           width: sz.toFixed(1),
           height: sz.toFixed(1),
+          rx: "2",
+          ry: "2",
           fill: COLOR_EXPENSE,
           stroke: "var(--bg)",
-          "stroke-width": "1",
+          "stroke-width": "1.2",
         })
       );
     });
@@ -1415,17 +1614,20 @@ function renderTrendChart(data) {
     opacity: showExp ? "1" : "0",
   });
 
-  // Floating tooltip inside SVG
-  const tipW = 176;
-  const tipH = 68;
+  // Floating rounded iOS tooltip inside SVG
+  const tipW = 184;
+  const tipH = 72;
   const tipRect = svgEl("rect", {
     x: "0",
     y: "0",
     width: tipW,
     height: tipH,
+    rx: "10",
+    ry: "10",
     fill: "var(--surface)",
+    "fill-opacity": "0.95",
     stroke: "var(--border-strong)",
-    "stroke-width": "1",
+    "stroke-width": "1.1",
   });
   const tipHead = svgEl("text", {
     x: "8",

@@ -329,6 +329,7 @@ class NormalizedTransaction:
     memo: str = ""
     subcategory: str = ""
     pending: bool = False
+    pending_transaction_id: str = ""
     currency: str = "USD"
     source: str = ""
     raw_category: str = ""

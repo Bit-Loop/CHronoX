@@ -460,6 +460,7 @@ class AutoBudgetEngine:
                 compute_effective_min_payment,
                 next_occurrence_of_day,
             )
+            from chronox_finance.engines.recurring import credit_line_covered_by_recurring_bill
             from chronox_finance.models import DebtKind
 
             linked_credit_acct_ids = {
@@ -470,13 +471,18 @@ class AutoBudgetEngine:
                     continue
                 if cl.get("account_id") is not None and int(cl["account_id"]) in linked_credit_acct_ids:
                     continue
-                kind = DebtKind(cl.get("kind", DebtKind.CREDIT_CARD.value))
+                try:
+                    kind = DebtKind(cl.get("kind", DebtKind.CREDIT_CARD.value))
+                except ValueError:
+                    kind = DebtKind.PERSONAL_LOAN
                 min_pay = compute_effective_min_payment(
                     int(cl["balance_cents"]),
                     int(cl.get("min_payment_cents", 0)),
                     kind,
                     int(cl.get("apr_bps", 0)),
                 )
+                if credit_line_covered_by_recurring_bill(cl, recurring_bills, effective_min_cents=min_pay):
+                    continue
                 monthly_bills_obligation_cents += min_pay
                 due_dt = next_occurrence_of_day(int(cl.get("payment_due_day", 10)), ref)
                 if due_dt <= next_payday_dt:

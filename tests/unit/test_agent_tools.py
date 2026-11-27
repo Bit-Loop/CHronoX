@@ -146,6 +146,34 @@ def _sample_context() -> AgentLedgerContext:
                 "due_date": "2026-12-01",
             }
         ],
+        bills=[
+            {
+                "id": 1,
+                "name": "City Electric",
+                "normalized_merchant": "city electric",
+                "amount_cents": 11_400,
+                "cadence": "monthly",
+                "next_due_date": "2026-12-01",
+                "jar_id": 10,
+                "auto_pay": False,
+                "is_essential": True,
+                "is_subscription": False,
+                "active": 1,
+            },
+            {
+                "id": 2,
+                "name": "Legacy Telecom",
+                "normalized_merchant": "legacy telecom",
+                "amount_cents": 12_000,
+                "cadence": "monthly",
+                "next_due_date": "2026-12-05",
+                "jar_id": 10,
+                "auto_pay": False,
+                "is_essential": True,
+                "is_subscription": False,
+                "active": 1,
+            },
+        ],
         safe_to_spend_cents=95_000,
         safe_to_invest_cents=40_000,
         monthly_surplus_cents=72_000,
@@ -153,10 +181,11 @@ def _sample_context() -> AgentLedgerContext:
 
 
 class TestAllowlistAndSafetyGuardrails:
-    def test_exact_12_allowlisted_action_types_and_forbidden_actions_blocked(self):
-        assert len(ALLOWED_AGENT_ACTION_TYPES) == 12
+    def test_exact_15_allowlisted_action_types_and_forbidden_actions_blocked(self):
+        assert len(ALLOWED_AGENT_ACTION_TYPES) == 15
         assert "delete_credit_line" not in ALLOWED_AGENT_ACTION_TYPES
         assert "delete_rule" not in ALLOWED_AGENT_ACTION_TYPES
+        assert {"create_bill", "update_bill", "delete_bill"}.issubset(ALLOWED_AGENT_ACTION_TYPES)
 
         ctx = _sample_context()
         forbidden_batch = [
@@ -236,11 +265,29 @@ class TestAllowlistAndSafetyGuardrails:
                 "action_type": "analyze_portfolio",
                 "payload": {"focus": "full"},
             },
+            {
+                "action_type": "create_bill",
+                "payload": {
+                    "name": "Fiber Internet",
+                    "amount_cents": 5_500,
+                    "cadence": "monthly",
+                    "next_due_date": "2026-12-15",
+                    "auto_pay": True,
+                },
+            },
+            {
+                "action_type": "update_bill",
+                "payload": {"bill_id": 1, "auto_pay": True},
+            },
+            {
+                "action_type": "delete_bill",
+                "payload": {"bill_id": 2},
+            },
         ]
 
         report = validate_agent_batch(raw_actions, ctx)
         assert report.rejected_count == 0
-        assert len(report.actions) == 12
+        assert len(report.actions) == 15
         assert {a.action_type for a in report.actions} == ALLOWED_AGENT_ACTION_TYPES
 
         # Verify RSD-safe tone scrubbed in comment

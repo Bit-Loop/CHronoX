@@ -282,6 +282,138 @@ def step_bill_due_date(dt: date, cadence: RecurrenceCadence, anchor_day: int) ->
     return _step_cycle_forward(dt, cadence, anchor_day)
 
 
+def step_bill_due_date_backward(dt: date, cadence: RecurrenceCadence, anchor_day: int) -> date:
+    """Public calendar-accurate backward cycle stepper for missed-bill lookback."""
+    return _step_cycle_back(dt, cadence, anchor_day)
+
+
+_DEBT_MATCH_STOPWORDS = frozenset(
+    {
+        "the",
+        "and",
+        "for",
+        "from",
+        "with",
+        "plan",
+        "payment",
+        "payments",
+        "bill",
+        "bills",
+        "autopay",
+        "auto",
+        "pay",
+        "monthly",
+        "biweekly",
+        "weekly",
+        "annual",
+        "credit",
+        "card",
+        "cards",
+        "account",
+        "bank",
+        "mgmt",
+        "management",
+        "resource",
+        "resources",
+        "group",
+        "service",
+        "services",
+        "inc",
+        "llc",
+        "corp",
+        "company",
+        "financial",
+        "collection",
+        "collections",
+        "debt",
+        "loan",
+        "min",
+        "minimum",
+        "agency",
+    }
+)
+
+
+def _significant_entity_tokens(text: str) -> set[str]:
+    cleaned = re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+    return {tok for tok in cleaned.split() if len(tok) >= 3 and tok not in _DEBT_MATCH_STOPWORDS}
+
+
+def _bill_monthly_equivalent_cents(amount_cents: int, cadence: Any) -> int:
+    c_str = str(cadence.value if hasattr(cadence, "value") else (cadence or "monthly")).strip().lower()
+    factors = {
+        "weekly": 52.0 / 12.0,
+        "biweekly": 26.0 / 12.0,
+        "semimonthly": 2.0,
+        "monthly": 1.0,
+        "bimonthly": 0.5,
+        "quarterly": 1.0 / 3.0,
+        "semiannual": 1.0 / 6.0,
+        "annual": 1.0 / 12.0,
+    }
+    return int(round(max(0, int(amount_cents)) * factors.get(c_str, 1.0)))
+
+
+def credit_line_covered_by_recurring_bill(
+    credit_line: Any,
+    recurring_bills: Optional[List[Dict[str, Any]]],
+    *,
+    effective_min_cents: Optional[int] = None,
+) -> bool:
+    """
+    Return True when an active recurring_bill already tracks the scheduled payment
+    for `credit_line` (e.g., a biweekly collection payment plan bill matching a
+    collection debt line), preventing forecast and Safe-to-Spend double-counting.
+
+    Requires BOTH semantic entity match AND meaningful payment coverage (>= 50%
+    of the credit line's effective monthly minimum) so unrelated small subscriptions
+    at the same brand/issuer never mask a real card minimum.
+    """
+    if not recurring_bills:
+        return False
+
+    def _g(obj: Any, key: str, default: Any = None) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    cl_name = str(_g(credit_line, "name", "") or "")
+    cl_issuer = str(_g(credit_line, "issuer", "") or "")
+    cl_kind = str(
+        _g(credit_line, "kind").value
+        if hasattr(_g(credit_line, "kind"), "value")
+        else (_g(credit_line, "kind", "") or "")
+    ).strip().lower()
+    cl_tokens = _significant_entity_tokens(f"{cl_name} {cl_issuer}")
+
+    eff_min = int(effective_min_cents) if effective_min_cents is not None else int(_g(credit_line, "min_payment_cents", 0) or 0)
+    min_floor = int(round(eff_min * 0.50)) if eff_min > 0 else 0
+
+    for b in recurring_bills:
+        if not _g(b, "active", 1):
+            continue
+        b_name = str(_g(b, "name", "") or "")
+        b_norm = str(_g(b, "normalized_merchant", "") or "")
+        b_amt = forecast_bill_amount_cents(b) if isinstance(b, dict) else int(_g(b, "amount_cents", 0) or 0)
+        if b_amt <= 0:
+            continue
+        b_monthly = _bill_monthly_equivalent_cents(b_amt, _g(b, "cadence", "monthly"))
+        if min_floor > 0 and b_monthly < min_floor:
+            continue
+
+        b_tokens = _significant_entity_tokens(f"{b_name} {b_norm}")
+        if cl_tokens and b_tokens and (cl_tokens & b_tokens):
+            return True
+
+        # Generic collection-plan fallback when bill & debt both indicate collection and match monthly min within ±15%
+        is_collection_line = cl_kind == "collection" or "collection" in f"{cl_name} {cl_issuer}".lower()
+        if is_collection_line and "collection" in f"{b_name} {b_norm}".lower() and eff_min > 0:
+            if abs(b_monthly - eff_min) <= max(500, int(round(eff_min * 0.15))):
+                return True
+
+    return False
+
+
 def forecast_bill_amount_cents(
     bill: Dict[str, Any],
     recent_matched_amounts: Optional[List[int]] = None,
@@ -590,7 +722,8 @@ def detect_bill_anomalies(
 
     # 1. Double-charge scan over last 45 days
     recent_cutoff = (ref - timedelta(days=45)).isoformat()
-    recent_txs = [t for t in transactions if t.get("tx_type") == "expense" and t["tx_date"] >= recent_cutoff]
+    all_expense_txs = [t for t in transactions if t.get("tx_type") == "expense"]
+    recent_txs = [t for t in all_expense_txs if t["tx_date"] >= recent_cutoff]
     clusters = cluster_merchants(recent_txs)
     for _key, items in clusters.items():
         if len(items) < 2:
@@ -602,6 +735,9 @@ def detect_bill_anomalies(
             d2 = date.fromisoformat(t2["tx_date"])
             if int(t1["amount_cents"]) == int(t2["amount_cents"]) and 0 <= (d2 - d1).days <= 3:
                 amt = int(t1["amount_cents"])
+                m_low = str(t2.get("merchant") or "").lower()
+                if amt < 200 or any(tok in m_low for tok in ("intl transaction fee", "international transaction fee", "foreign transaction fee")):
+                    continue
                 anomalies.append(
                     BillAnomaly(
                         kind="double_charge",
@@ -612,11 +748,12 @@ def detect_bill_anomalies(
                             f"${amt / 100:,.2f} appeared twice ({t1['tx_date']} & {t2['tx_date']})."
                         ),
                         dates=[t1["tx_date"], t2["tx_date"]],
+                        severity="medium",
                     )
                 )
                 break
 
-    # 2. Missed / overdue bills & silent price hikes
+    # 2. Missed / overdue bills (both current overdue due date AND stepped-past previous cycle) & price hikes
     for b in recurring_bills:
         if not b.get("active", 1):
             continue
@@ -624,14 +761,24 @@ def detect_bill_anomalies(
         overdue_days = (ref - due_dt).days
         amt = forecast_bill_amount_cents(b)
         due_window = max(3, int(b.get("due_window_days") or 3))
+        is_autopay = bool(b.get("auto_pay", 0))
+        bill_id = int(b["id"]) if b.get("id") is not None else None
+        raw_cad = b.get("cadence") or RecurrenceCadence.MONTHLY.value
+        try:
+            cadence_enum = raw_cad if isinstance(raw_cad, RecurrenceCadence) else RecurrenceCadence(str(raw_cad))
+        except ValueError:
+            cadence_enum = RecurrenceCadence.MONTHLY
+
+        missed_recorded = False
         if overdue_days >= due_window:
             # Skip false alarm if a transaction matching [min, max] & due window already posted
             already_paid = any(
                 match_transaction_to_bill(t, b, require_date_window=True)
-                for t in recent_txs
+                for t in all_expense_txs
                 if abs((date.fromisoformat(t["tx_date"]) - due_dt).days) <= max(due_window, 5)
             )
             if not already_paid:
+                missed_recorded = True
                 anomalies.append(
                     BillAnomaly(
                         kind="missed_bill",
@@ -639,11 +786,64 @@ def detect_bill_anomalies(
                         amount_cents=amt,
                         summary=(
                             f"{b['name']} (${amt / 100:,.2f}) was expected {overdue_days} days ago "
-                            f"({b['next_due_date']}) — verify autopay or mark paid so you don't get a late fee."
+                            f"({b['next_due_date']}) — "
+                            + (
+                                "autopay did not post as expected; verify payment or remove if cancelled."
+                                if is_autopay
+                                else "verify payment, mark paid, or remove if cancelled."
+                            )
                         ),
                         dates=[b["next_due_date"]],
+                        bill_id=bill_id,
+                        severity="medium" if is_autopay else "high",
+                        auto_pay=is_autopay,
+                        days_overdue=overdue_days,
                     )
                 )
+
+        # Previous-cycle missed-bill lookback: catches bills whose next_due_date already stepped forward
+        # (e.g., last paid Oct 2, next_due_date advanced to Dec 2, while Nov 2 cycle never posted).
+        if not missed_recorded and overdue_days < due_window:
+            prev_due_dt = step_bill_due_date_backward(due_dt, cadence_enum, due_dt.day)
+            prev_overdue_days = (ref - prev_due_dt).days
+            prev_window = max(due_window, 6)
+            if max(due_window, 4) <= prev_overdue_days <= 45:
+                # Only alert if historical payments exist BEFORE the missed cycle so brand-new bills never false-alarm
+                prior_cutoff = prev_due_dt - timedelta(days=prev_window)
+                has_prior_history = any(
+                    date.fromisoformat(t["tx_date"]) < prior_cutoff
+                    and match_transaction_to_bill(t, b, require_date_window=False)
+                    for t in all_expense_txs
+                )
+                if has_prior_history:
+                    paid_in_prev_cycle = any(
+                        abs((date.fromisoformat(t["tx_date"]) - prev_due_dt).days) <= prev_window
+                        and match_transaction_to_bill(t, b, require_date_window=False)
+                        for t in all_expense_txs
+                    )
+                    if not paid_in_prev_cycle:
+                        anomalies.append(
+                            BillAnomaly(
+                                kind="missed_bill",
+                                merchant=b["name"],
+                                amount_cents=amt,
+                                summary=(
+                                    f"Missed cycle for {b['name']} (${amt / 100:,.2f}): no payment posted around "
+                                    f"{prev_due_dt.isoformat()} ({prev_overdue_days}d ago) — "
+                                    + (
+                                        "check autopay or remove if you switched providers."
+                                        if is_autopay
+                                        else "verify payment, mark paid, or remove if you switched providers."
+                                    )
+                                ),
+                                dates=[prev_due_dt.isoformat()],
+                                bill_id=bill_id,
+                                severity="medium" if is_autopay else "high",
+                                auto_pay=is_autopay,
+                                days_overdue=prev_overdue_days,
+                            )
+                        )
+
         prev = b.get("previous_amount_cents")
         if prev is not None and amt > int(prev):
             hike = amt - int(prev)
@@ -657,9 +857,15 @@ def detect_bill_anomalies(
                         f"(${int(prev) / 100:,.2f} → ${amt / 100:,.2f}, +${(hike * 12) / 100:,.2f}/yr)."
                     ),
                     dates=[b["next_due_date"]],
+                    bill_id=bill_id,
+                    severity="low",
+                    auto_pay=is_autopay,
                 )
             )
 
+    kind_rank = {"missed_bill": 0, "double_charge": 1, "price_hike": 2}
+    sev_rank = {"high": 0, "medium": 1, "low": 2}
+    anomalies.sort(key=lambda a: (kind_rank.get(a.kind, 9), sev_rank.get(a.severity, 9), -a.days_overdue, -a.amount_cents))
     return anomalies[:12]
 
 

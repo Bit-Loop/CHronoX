@@ -1256,6 +1256,44 @@ class FinanceStorage:
             row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
             return dict(row) if row else None
 
+    def delete_account(
+        self,
+        account_id: int,
+        *,
+        force: bool = False,
+        ctx: RequestContext = LOCAL_CONTEXT,
+    ) -> Dict[str, Any]:
+        """Safely remove an unused/unlinked account (blocks connected bank accounts and last account)."""
+        with self.transaction() as conn:
+            row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
+            if not row:
+                return {"deleted": False, "reason": "not_found"}
+            if row["connection_id"] is not None:
+                raise ValueError(
+                    f"Account '{row['name']}' is synced to a live bank connection. "
+                    "Disconnect the bank link in Settings before removing it."
+                )
+            total_accts = int(conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0])
+            if total_accts <= 1:
+                raise ValueError("Cannot remove your last remaining account.")
+            tx_count = int(
+                conn.execute("SELECT COUNT(*) FROM transactions WHERE account_id = ?", (account_id,)).fetchone()[0]
+            )
+            if tx_count > 0 and not force:
+                raise ValueError(
+                    f"Account '{row['name']}' has {tx_count} transaction(s). "
+                    "Reassign or pass force=true to permanently remove it with its transactions."
+                )
+            conn.execute("UPDATE credit_lines SET account_id = NULL WHERE account_id = ?", (account_id,))
+            conn.execute("UPDATE holdings SET account_id = NULL WHERE account_id = ?", (account_id,))
+            conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+            return {
+                "deleted": True,
+                "id": int(account_id),
+                "name": str(row["name"]),
+                "removed_transactions": tx_count,
+            }
+
     # --- Jars ---
 
     def list_jars(self, ctx: RequestContext = LOCAL_CONTEXT) -> List[Dict[str, Any]]:
@@ -1506,6 +1544,13 @@ class FinanceStorage:
                     "SELECT id FROM transactions WHERE fingerprint = ?", (fingerprint,)
                 ).fetchone()
                 if existing:
+                    return None
+            if ext_id:
+                existing_ext = conn.execute(
+                    "SELECT id FROM transactions WHERE account_id = ? AND external_id = ? LIMIT 1",
+                    (account_id, ext_id),
+                ).fetchone()
+                if existing_ext:
                     return None
 
             cur = conn.execute(
@@ -2059,6 +2104,85 @@ class FinanceStorage:
         sql += " ORDER BY next_due_date ASC, amount_cents DESC"
         with self._lock:
             return [dict(r) for r in self._conn.execute(sql).fetchall()]
+
+    def get_recurring_bill(
+        self, bill_id: int, ctx: RequestContext = LOCAL_CONTEXT
+    ) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM recurring_bills WHERE id = ?", (int(bill_id),)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def update_recurring_bill(
+        self,
+        bill_id: int,
+        updates: Dict[str, Any],
+        ctx: RequestContext = LOCAL_CONTEXT,
+    ) -> Optional[Dict[str, Any]]:
+        allowed = {
+            "name",
+            "normalized_merchant",
+            "amount_cents",
+            "previous_amount_cents",
+            "amount_min_cents",
+            "amount_max_cents",
+            "due_window_days",
+            "cadence",
+            "next_due_date",
+            "jar_id",
+            "is_subscription",
+            "is_essential",
+            "auto_pay",
+            "active",
+            "confidence",
+            "flagged_zombie",
+        }
+        bool_cols = {"is_subscription", "is_essential", "auto_pay", "active", "flagged_zombie"}
+        int_cols = {"amount_cents", "previous_amount_cents", "amount_min_cents", "amount_max_cents", "due_window_days", "jar_id"}
+        with self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT * FROM recurring_bills WHERE id = ?", (int(bill_id),)
+            ).fetchone()
+            if not existing:
+                return None
+            clean: Dict[str, Any] = {}
+            for k, v in updates.items():
+                if k not in allowed:
+                    continue
+                if k in bool_cols and v is not None:
+                    clean[k] = int(bool(v))
+                elif k in int_cols:
+                    clean[k] = int(v) if v is not None else None
+                else:
+                    clean[k] = v
+            if (
+                "amount_cents" in clean
+                and clean["amount_cents"] is not None
+                and "previous_amount_cents" not in clean
+                and int(clean["amount_cents"]) != int(existing["amount_cents"])
+            ):
+                clean["previous_amount_cents"] = int(existing["amount_cents"])
+            if not clean:
+                return dict(existing)
+            clean["updated_at"] = utc_now_iso()
+            cols = ", ".join(f"{k} = ?" for k in clean)
+            conn.execute(
+                f"UPDATE recurring_bills SET {cols} WHERE id = ?",
+                [*clean.values(), int(bill_id)],
+            )
+            row = conn.execute(
+                "SELECT * FROM recurring_bills WHERE id = ?", (int(bill_id),)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def delete_recurring_bill_hard(
+        self, bill_id: int, ctx: RequestContext = LOCAL_CONTEXT
+    ) -> bool:
+        """Permanently delete a bill row (used exclusively for atomic agent Undo of create_bill)."""
+        with self.transaction() as conn:
+            cur = conn.execute("DELETE FROM recurring_bills WHERE id = ?", (int(bill_id),))
+            return cur.rowcount > 0
 
     def upsert_recurring_bill(
         self,

@@ -82,6 +82,7 @@ from chronox_finance.models import (
     RebalanceTransferRequest,
     ReclassifyTransactionsRequest,
     RecurringBillCreate,
+    RecurringBillUpdate,
     RuleCreate,
     RuleGroupCreate,
     RuleUpdate,
@@ -704,6 +705,16 @@ def create_app(
         if not updated:
             raise HTTPException(status_code=404, detail="Account not found")
         return updated
+
+    @v1.delete("/accounts/{account_id}", tags=["Accounts"], dependencies=[Depends(require_auth)])
+    def delete_account(account_id: int, force: bool = False):
+        try:
+            res = svc.delete_account(account_id, force=force)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not res.get("deleted"):
+            raise HTTPException(status_code=404, detail="Account not found")
+        return res
 
     @v1.patch("/jars/{jar_id}", tags=["Accounts"], dependencies=[Depends(require_auth)])
     def patch_jar(jar_id: int, req: JarUpdate):
@@ -1404,6 +1415,23 @@ def create_app(
     @v1.post("/bills", tags=["Bills"], dependencies=[Depends(require_auth)])
     def create_bill(req: RecurringBillCreate):
         return svc.create_recurring_bill(req)
+
+    @v1.patch("/bills/{bill_id}", tags=["Bills"], dependencies=[Depends(require_auth)])
+    def patch_bill(bill_id: int, req: RecurringBillUpdate):
+        updated = svc.update_recurring_bill(bill_id, req)
+        if not updated:
+            raise HTTPException(status_code=404, detail="Bill not found")
+        return updated
+
+    @v1.post("/bills/{bill_id}/mark-paid", tags=["Bills"], dependencies=[Depends(require_auth)])
+    def mark_bill_paid(bill_id: int, paid_date: Optional[str] = None):
+        try:
+            updated = svc.mark_recurring_bill_paid(bill_id, paid_date=paid_date)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not updated:
+            raise HTTPException(status_code=404, detail="Bill not found")
+        return updated
 
     @v1.delete("/bills/{bill_id}", tags=["Bills"], dependencies=[Depends(require_auth)])
     def delete_bill(bill_id: int):
